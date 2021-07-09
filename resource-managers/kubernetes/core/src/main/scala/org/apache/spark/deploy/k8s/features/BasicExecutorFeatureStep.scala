@@ -129,7 +129,14 @@ private[spark] class BasicExecutorFeatureStep(
           .withNewFieldRef("v1", "status.podIP")
           .build())
         .build()
-    ) ++ executorExtraJavaOptionsEnv ++ executorExtraClasspathEnv.toSeq
+      ) ++ Seq(
+      new EnvVarBuilder()
+        .withName(ENV_EXECUTOR_POD_NAME)
+        .withValueFrom(new EnvVarSourceBuilder()
+          .withNewFieldRef("v1", "metadata.name")
+          .build())
+        .build()
+      ) ++ executorExtraJavaOptionsEnv ++ executorExtraClasspathEnv.toSeq
     val requiredPorts = Seq(
       (BLOCK_MANAGER_PORT_NAME, blockManagerPort))
       .map { case (name, port) =>
@@ -187,6 +194,12 @@ private[spark] class BasicExecutorFeatureStep(
         .withName(pod.getMetadata.getName)
         .withUid(pod.getMetadata.getUid)
         .build())
+
+    val policy = kubernetesConf.get(KUBERNETES_ALLOCATION_PODSALLOCATOR) match {
+      case "statefulset" => "Always"
+      case _ => "Never"
+    }
+
     val executorPod = new PodBuilder(pod.pod)
       .editOrNewMetadata()
         .withName(name)
@@ -196,7 +209,7 @@ private[spark] class BasicExecutorFeatureStep(
         .endMetadata()
       .editOrNewSpec()
         .withHostname(hostname)
-        .withRestartPolicy("Never")
+        .withRestartPolicy(policy)
         .withNodeSelector(kubernetesConf.nodeSelector().asJava)
         .addToImagePullSecrets(kubernetesConf.imagePullSecrets(): _*)
         .endSpec()

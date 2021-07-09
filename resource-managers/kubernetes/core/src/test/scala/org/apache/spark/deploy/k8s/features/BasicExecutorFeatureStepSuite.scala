@@ -201,7 +201,9 @@ class BasicExecutorFeatureStepSuite
       ENV_EXECUTOR_MEMORY -> "1g",
       ENV_APPLICATION_ID -> APP_ID,
       ENV_SPARK_CONF_DIR -> SPARK_CONF_DIR_INTERNAL,
-      ENV_EXECUTOR_POD_IP -> null) ++ additionalEnvVars
+      // These are populated by K8s on scheduling
+      ENV_EXECUTOR_POD_IP -> null,
+      ENV_EXECUTOR_POD_NAME -> null) ++ additionalEnvVars
 
     assert(executorPod.container.getEnv.size() === defaultEnvs.size)
     val mapEnvs = executorPod.container.getEnv.asScala.map {

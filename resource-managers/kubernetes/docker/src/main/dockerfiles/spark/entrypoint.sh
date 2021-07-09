@@ -30,9 +30,9 @@ set -e
 # If there is no passwd entry for the container UID, attempt to create one
 if [ -z "$uidentry" ] ; then
     if [ -w /etc/passwd ] ; then
-        echo "$myuid:x:$myuid:$mygid:anonymous uid:$SPARK_HOME:/bin/false" >> /etc/passwd
+	echo "$myuid:x:$myuid:$mygid:anonymous uid:$SPARK_HOME:/bin/false" >> /etc/passwd
     else
-        echo "Container ENTRYPOINT failed to add passwd entry for anonymous UID"
+	echo "Container ENTRYPOINT failed to add passwd entry for anonymous UID"
     fi
 fi
 
@@ -109,6 +109,15 @@ case "$SPARK_K8S_CMD" in
     )
     ;;
   executor)
+    shift 1
+    # If the execid is set to the generic EXECID parse the pod name
+    if [ "${SPARK_EXECUTOR_ID}" == "EXECID" ]; then
+      POD_NAME_SPLIT=(${SPARK_EXECUTOR_POD_NAME//-/ })
+      EID=${POD_NAME_SPLIT[-1]}
+      # POD names start with 0, always add 1 so that executor ids start from 1
+      EID=$((EID+1))
+      export SPARK_EXECUTOR_ID=${EID}
+    fi
     CMD=(
       ${JAVA_HOME}/bin/java
       "${SPARK_EXECUTOR_JAVA_OPTS[@]}"

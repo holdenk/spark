@@ -117,7 +117,7 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     verify(eventQueue).stop()
     verify(watchEvents).stop()
     verify(pollEvents).stop()
-    verify(labeledPods).delete()
+    verify(podAllocator).stop(TEST_SPARK_APP_ID)
     verify(kubernetesClient).close()
   }
 

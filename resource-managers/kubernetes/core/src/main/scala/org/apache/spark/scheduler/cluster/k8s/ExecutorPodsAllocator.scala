@@ -34,7 +34,7 @@ private[spark] class ExecutorPodsAllocator(
     executorBuilder: KubernetesExecutorBuilder,
     kubernetesClient: KubernetesClient,
     snapshotsStore: ExecutorPodsSnapshotsStore,
-    clock: Clock) extends Logging {
+    clock: Clock) extends AbstractPodsAllocator() with Logging {
 
   private val EXECUTOR_ID_COUNTER = new AtomicLong(0L)
 
@@ -51,7 +51,7 @@ private[spark] class ExecutorPodsAllocator(
   private val kubernetesDriverPodName = conf
     .get(KUBERNETES_DRIVER_POD_NAME)
 
-  private val driverPod = kubernetesDriverPodName
+  val driverPod = kubernetesDriverPodName
     .map(name => Option(kubernetesClient.pods()
       .withName(name)
       .get())
@@ -69,7 +69,10 @@ private[spark] class ExecutorPodsAllocator(
     }
   }
 
-  def setTotalExpectedExecutors(total: Int): Unit = totalExpectedExecutors.set(total)
+
+  def setTotalExpectedExecutors(total: Int): Unit = {
+    totalExpectedExecutors.set(total)
+  }
 
   private def onNewSnapshots(applicationId: String, snapshots: Seq[ExecutorPodsSnapshot]): Unit = {
     newlyCreatedExecutors --= snapshots.flatMap(_.executorPods.keys)
@@ -151,6 +154,16 @@ private[spark] class ExecutorPodsAllocator(
           s" created but we have not observed as being present in the cluster yet:" +
           s" ${newlyCreatedExecutors.size}.")
       }
+    }
+  }
+
+  override def stop(applicationId: String): Unit = {
+    Utils.tryLogNonFatalError {
+      kubernetesClient
+        .pods()
+        .withLabel(SPARK_APP_ID_LABEL, applicationId)
+        .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+        .delete()
     }
   }
 }

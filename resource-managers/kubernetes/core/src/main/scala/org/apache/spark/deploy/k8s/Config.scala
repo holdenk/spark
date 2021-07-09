@@ -158,6 +158,14 @@ private[spark] object Config extends Logging {
       .stringConf
       .createOptional
 
+  val KUBERNETES_ALLOCATION_PODSALLOCATOR =
+    ConfigBuilder("spark.kubernetes.allocation.podsallocator")
+      .doc("Allocator to use for pods. Possible values are direct (the default) and statefulset." +
+        "Future version may add Job or replicaset.")
+      .stringConf
+      .checkValues(Set("direct", "statefulset"))
+      .createWithDefault("direct")
+
   val KUBERNETES_ALLOCATION_BATCH_SIZE =
     ConfigBuilder("spark.kubernetes.allocation.batch.size")
       .doc("Number of pods to launch at once in each round of executor allocation.")

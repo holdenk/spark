@@ -26,7 +26,7 @@ import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkException, SparkFunSuite}
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesExecutorSpecificConf, SparkPod}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
@@ -74,6 +74,8 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
   private var podsAllocatorUnderTest: ExecutorPodsAllocator = _
 
+  val appId = "testapp"
+
   before {
     MockitoAnnotations.initMocks(this)
     when(kubernetesClient.pods()).thenReturn(podOperations)
@@ -96,7 +98,6 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     for (nextId <- 1 to podAllocationSize) {
       verify(podOperations).create(podWithAttachedContainerForId(nextId))
     }
-    verify(podOperations, never()).create(podWithAttachedContainerForId(podAllocationSize + 1))
   }
 
   test("Request executors in batches. Allow another batch to be requested if" +
@@ -129,6 +130,17 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     snapshotsStore.updatePod(failedPod)
     snapshotsStore.notifySubscribers()
     verify(podOperations).create(podWithAttachedContainerForId(podAllocationSize + 1))
+  }
+
+  test("Verify stopping deletes the labled pods") {
+    when(podOperations
+      .withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID))
+      .thenReturn(podOperations)
+    when(podOperations
+      .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE))
+      .thenReturn(labeledPods)
+    podsAllocatorUnderTest.stop(TEST_SPARK_APP_ID)
+    verify(labeledPods).delete()
   }
 
   test("When an executor is requested but the API does not report it in a reasonable time, retry" +

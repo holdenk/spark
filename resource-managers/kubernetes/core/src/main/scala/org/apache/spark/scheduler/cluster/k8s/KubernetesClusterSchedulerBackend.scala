@@ -35,7 +35,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
     kubernetesClient: KubernetesClient,
     requestExecutorsService: ExecutorService,
     snapshotsStore: ExecutorPodsSnapshotsStore,
-    podAllocator: ExecutorPodsAllocator,
+    podAllocator: AbstractPodsAllocator,
     lifecycleEventHandler: ExecutorPodsLifecycleManager,
     watchEvents: ExecutorPodsWatchSnapshotSource,
     pollEvents: ExecutorPodsPollingSnapshotSource)
@@ -102,6 +102,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
         .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
         .delete()
     }
+
+    podAllocator.stop(applicationId())
 
     Utils.tryLogNonFatalError {
       ThreadUtils.shutdown(requestExecutorsService)
