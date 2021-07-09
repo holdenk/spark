@@ -284,6 +284,16 @@ private[spark] object Config extends Logging {
       .toSequence
       .createWithDefault(Nil)
 
+  // TODO: Holden - do we want this to be a flag or maybe specify a class
+  // to use in place of ExecutorPodsAllocator or just a "setTarget" class?
+  // for now it's a flag so my life is simpler.
+  val KUBERNETES_ALLOCATION_REPLICASET =
+    ConfigBuilder("spark.kubernetes.allocation.replicasets")
+      .doc("Instead of directly allocating pods allocate replicasets")
+      .version("3.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val KUBERNETES_ALLOCATION_BATCH_SIZE =
     ConfigBuilder("spark.kubernetes.allocation.batch.size")
       .doc("Number of pods to launch at once in each round of executor allocation.")
