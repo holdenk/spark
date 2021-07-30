@@ -120,4 +120,20 @@ object ExecutorLifecycleTestUtils {
       .build()
     SparkPod(pod, container)
   }
+
+  def executorPodWithId(executorId: String): SparkPod = {
+    val pod = new PodBuilder()
+      .withNewMetadata()
+        .withName(s"spark-executor-$executorId")
+        .addToLabels(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)
+        .addToLabels(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+        .addToLabels(SPARK_EXECUTOR_ID_LABEL, executorId)
+        .endMetadata()
+      .build()
+    val container = new ContainerBuilder()
+      .withName("spark-executor")
+      .withImage("k8s-spark")
+      .build()
+    SparkPod(pod, container)
+  }
 }

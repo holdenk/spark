@@ -96,7 +96,11 @@ private[spark] class StatefulsetPodsAllocator(
         driverPod)
       val resolvedExecutorSpec = executorBuilder.buildFromFeatures(executorConf)
       val executorPod = resolvedExecutorSpec.pod
-      val podWithAttachedContainer: PodSpec = new PodSpecBuilder(executorPod.getSpec())
+      val podSpecBuilder = executorPod.getSpec() match {
+        case null => new PodSpecBuilder()
+        case s => new PodSpecBuilder(s)
+      }
+      val podWithAttachedContainer: PodSpec = podSpecBuilder
         .addToContainers(resolvedExecutorSpec.container)
         .build()
 

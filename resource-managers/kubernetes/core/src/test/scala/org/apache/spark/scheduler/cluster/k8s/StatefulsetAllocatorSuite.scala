@@ -91,7 +91,7 @@ class StatefulSetAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       override def answer(invocation: InvocationOnMock): SparkPod = {
         val k8sConf = invocation.getArgumentAt(
           0, classOf[KubernetesConf[KubernetesExecutorSpecificConf]])
-        executorPodWithId(k8sConf.roleSpecificConf.executorId.toInt)
+        executorPodWithId(k8sConf.roleSpecificConf.executorId)
       }
     }
   }
@@ -105,7 +105,7 @@ class StatefulSetAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     when(podOperations.withName(driverPodName)).thenReturn(driverPodOperations)
     when(driverPodOperations.get).thenReturn(driverPod)
     when(driverPodOperations.waitUntilReady(any(), any())).thenReturn(driverPod)
-    when(executorBuilder.buildFromFeatures(kubernetesConfWithCorrectFields())).thenAnswer(
+    when(executorBuilder.buildFromFeatures(any())).thenAnswer(
       executorPodAnswer())
     snapshotsStore = new DeterministicExecutorPodsSnapshotsStore()
     podsAllocatorUnderTest = new StatefulsetPodsAllocator(
@@ -140,37 +140,4 @@ class StatefulSetAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     podsAllocatorUnderTest.setTotalExpectedExecutors(20)
     verify(editableSet, times(1)).scale(any(), any())
   }
-
-  private def kubernetesConfWithCorrectFields(): KubernetesConf[KubernetesExecutorSpecificConf] =
-    Matchers.argThat(new ArgumentMatcher[KubernetesConf[KubernetesExecutorSpecificConf]] {
-      override def matches(argument: scala.Any): Boolean = {
-        if (!argument.isInstanceOf[KubernetesConf[KubernetesExecutorSpecificConf]]) {
-          false
-        } else {
-          val k8sConf = argument.asInstanceOf[KubernetesConf[KubernetesExecutorSpecificConf]]
-          val executorSpecificConf = k8sConf.roleSpecificConf
-          val expectedK8sConf = KubernetesConf.createExecutorConf(
-            conf,
-            executorSpecificConf.executorId,
-            TEST_SPARK_APP_ID,
-            Some(driverPod))
-
-          // Set prefixes to a common string since KUBERNETES_EXECUTOR_POD_NAME_PREFIX
-          // has not be set for the tests and thus KubernetesConf will use a random
-          // string for the prefix, based on the app name, and this comparison here will fail.
-          val k8sConfCopy = k8sConf
-            .copy(appResourceNamePrefix = "")
-            .copy(sparkConf = conf)
-          val expectedK8sConfCopy = expectedK8sConf
-            .copy(appResourceNamePrefix = "")
-            .copy(sparkConf = conf)
-
-            k8sConf.sparkConf.getAll.toMap == conf.getAll.toMap &&
-            // Since KubernetesConf.createExecutorConf clones the SparkConf object, force
-            // deep equality comparison for the SparkConf object and use object equality
-            // comparison on all other fields.
-            k8sConfCopy == expectedK8sConfCopy
-        }
-      }
-    })
 }
