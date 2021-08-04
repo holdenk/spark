@@ -20,11 +20,11 @@ import scala.collection.JavaConverters._
 
 import io.fabric8.kubernetes.api.model.Pod
 import org.scalatest.concurrent.Eventually
-import org.scalatest.matchers.should.Matchers._
+import org.scalatest.Matchers
 
 import org.apache.spark.launcher.SparkLauncher
 
-private[spark] trait BasicTestsSuite { k8sSuite: KubernetesSuite =>
+private[spark] trait BasicTestsSuite extends Matchers { k8sSuite: KubernetesSuite =>
 
   import BasicTestsSuite._
   import KubernetesSuite.k8sTestTag

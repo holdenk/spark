@@ -37,8 +37,8 @@ import org.apache.spark.deploy.k8s.integrationtest.backend.{IntegrationTestBacke
 import org.apache.spark.internal.Logging
 
 private[spark] class KubernetesSuite extends SparkFunSuite
-  with BeforeAndAfterAll with BeforeAndAfter /* with BasicTestsSuite with SecretsTestsSuite
-  with PythonTestsSuite with ClientModeTestsSuite */ with DecommissionSuite
+  with BeforeAndAfterAll with BeforeAndAfter with BasicTestsSuite /* with SecretsTestsSuite
+  with PythonTestsSuite with ClientModeTestsSuite with DecommissionSuite */
   with Logging with Eventually with Matchers {
 
   import KubernetesSuite._
@@ -141,50 +141,6 @@ private[spark] class KubernetesSuite extends SparkFunSuite
       executorPodChecker,
       appLocator,
       isJVM)
-  }
-
-  protected def runDFSReadWriteAndVerifyCompletion(
-      wordCount: Int,
-      appResource: String = containerLocalSparkDistroExamplesJar,
-      driverPodChecker: Pod => Unit = doBasicDriverPodCheck,
-      executorPodChecker: Pod => Unit = doBasicExecutorPodCheck,
-      appArgs: Array[String] = Array.empty[String],
-      isJVM: Boolean = true,
-      interval: Option[PatienceConfiguration.Interval] = None): Unit = {
-    runSparkApplicationAndVerifyCompletion(
-      appResource,
-      SPARK_DFS_READ_WRITE_TEST,
-      Seq(s"Success! Local Word Count $wordCount and " +
-    s"DFS Word Count $wordCount agree."),
-      Seq(),
-      appArgs,
-      driverPodChecker,
-      executorPodChecker,
-      isJVM,
-      None,
-      Option((interval, None)))
-  }
-
-  protected def runMiniReadWriteAndVerifyCompletion(
-      wordCount: Int,
-      appResource: String = containerLocalSparkDistroExamplesJar,
-      driverPodChecker: Pod => Unit = doBasicDriverPodCheck,
-      executorPodChecker: Pod => Unit = doBasicExecutorPodCheck,
-      appArgs: Array[String] = Array.empty[String],
-      isJVM: Boolean = true,
-      interval: Option[PatienceConfiguration.Interval] = None): Unit = {
-    runSparkApplicationAndVerifyCompletion(
-      appResource,
-      SPARK_MINI_READ_WRITE_TEST,
-      Seq(s"Success! Local Word Count $wordCount and " +
-    s"D Word Count $wordCount agree."),
-      Seq(),
-      appArgs,
-      driverPodChecker,
-      executorPodChecker,
-      isJVM,
-      None,
-      Option((interval, None)))
   }
 
   protected def runSparkRemoteCheckAndVerifyCompletion(

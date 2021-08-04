@@ -109,7 +109,6 @@ case "$SPARK_K8S_CMD" in
     )
     ;;
   executor)
-    shift 1
     # If the execid is set to the generic EXECID parse the pod name
     if [ "${SPARK_EXECUTOR_ID}" == "EXECID" ]; then
       POD_NAME_SPLIT=(${SPARK_EXECUTOR_POD_NAME//-/ })
