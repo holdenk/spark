@@ -38,10 +38,10 @@ private[spark] trait BasicTestsSuite extends Matchers { k8sSuite: KubernetesSuit
     sparkAppConf.set("spark.kubernetes.allocation.podsallocator", "statefulset")
     runSparkPiAndVerifyCompletion()
     // Verify there is no dangling statefulset
-    val sets = kubernetesTestComponents.kubernetesClient.apps().statefulSets().list().getItems
-    val scalaSets = sets.asScala
     // This depends on the garbage collection happening inside of K8s so give it some time.
     Eventually.eventually(TIMEOUT, INTERVAL) {
+      val sets = kubernetesTestComponents.kubernetesClient.apps().statefulSets().list().getItems
+      val scalaSets = sets.asScala
       scalaSets.size shouldBe (0)
     }
   }
