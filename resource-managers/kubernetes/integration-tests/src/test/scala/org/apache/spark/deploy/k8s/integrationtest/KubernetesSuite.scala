@@ -37,8 +37,8 @@ import org.apache.spark.deploy.k8s.integrationtest.backend.{IntegrationTestBacke
 import org.apache.spark.internal.Logging
 
 private[spark] class KubernetesSuite extends SparkFunSuite
-  with BeforeAndAfterAll with BeforeAndAfter with BasicTestsSuite /* with SecretsTestsSuite
-  with PythonTestsSuite with ClientModeTestsSuite with DecommissionSuite */
+  with BeforeAndAfterAll with BeforeAndAfter with BasicTestsSuite with SecretsTestsSuite
+  with PythonTestsSuite with ClientModeTestsSuite  with DecommissionSuite
   with Logging with Eventually with Matchers {
 
   import KubernetesSuite._
