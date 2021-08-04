@@ -17,8 +17,36 @@
 package org.apache.spark.scheduler.cluster.k8s
 
 import io.fabric8.kubernetes.api.model.Pod
+import io.fabric8.kubernetes.client.KubernetesClient
 
-private[spark] abstract class AbstractPodsAllocator {
+import org.apache.spark.{SecurityManager, SparkConf}
+import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.resource.ResourceProfile
+import org.apache.spark.util.Clock
+
+
+/**
+ * :: DeveloperApi ::
+ * A abstract interface for allowing different types of pods allocation.
+ *
+ * The internal Spark implementations are [[StatefulsetPodsAllocator]]
+ * and [[ExecutorPodsAllocator]]. This may be useful for folks integrating with custom schedulers
+ * such as Volcano, Yunikorn, etc.
+ *
+ * This API may change or be removed at anytime.
+ *
+ * @since 3.3.0
+ */
+@DeveloperApi
+abstract class AbstractPodsAllocator {
+
+  def this(conf: SparkConf,
+    secMgr: SecurityManager,
+    executorBuilder: KubernetesExecutorBuilder,
+    kubernetesClient: KubernetesClient,
+    snapshotsStore: ExecutorPodsSnapshotsStore,
+    clock: Clock) = this
+
   /*
    * Set the total expected executors for an application
    */
