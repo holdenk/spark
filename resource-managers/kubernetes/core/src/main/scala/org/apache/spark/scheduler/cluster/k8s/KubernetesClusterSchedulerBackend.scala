@@ -17,6 +17,7 @@
 package org.apache.spark.scheduler.cluster.k8s
 
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -143,8 +144,37 @@ private[spark] class KubernetesClusterSchedulerBackend(
     new KubernetesDriverEndpoint(rpcEnv, properties)
   }
 
+
+  val execId = new AtomicInteger(1)
+
   private class KubernetesDriverEndpoint(rpcEnv: RpcEnv, sparkProperties: Seq[(String, String)])
       extends DriverEndpoint(rpcEnv, sparkProperties) {
+
+    private def generateExecID(context: RpcCallContext): PartialFunction[Any, Unit] = {
+      case x: GenerateExecID =>
+        val newId = execId.incrementAndGet().toString
+        context.reply(newId)
+        // Generally this should complete quickly but safer to not block in-case we're in the
+        // middle of an etcd fail over or otherwise slower writes.
+        val labelTask = new Runnable() {
+          override def run(): Unit = Utils.tryLogNonFatalError {
+            // Label the pod with it's exec ID
+            kubernetesClient.pods()
+              .withName(x.podName)
+              .edit({p: Pod => new PodBuilder(p).editMetadata()
+                .addToLabels(SPARK_EXECUTOR_ID_LABEL, newId.toString)
+                .endMetadata()
+                .build()})
+          }
+        }
+        executorService.execute(labelTask)
+    }
+    private def ignoreRegisterExecutorAtStoppedContext: PartialFunction[Any, Unit] = {
+      case _: RegisterExecutor if sc.isStopped => // No-op
+    }
+
+    override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] =
+      ignoreRegisterExecutorAtStoppedContext.orElse(super.receiveAndReply(context))
 
     override def onDisconnected(rpcAddress: RpcAddress): Unit = {
       // Don't do anything besides disabling the executor - allow the Kubernetes API events to
