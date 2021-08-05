@@ -22,8 +22,8 @@ import java.util.concurrent.TimeUnit
 import com.google.common.cache.CacheBuilder
 import io.fabric8.kubernetes.client.Config
 
-import org.apache.spark.SparkContext
-import org.apache.spark.deploy.k8s.{KubernetesUtils, SparkKubernetesClientFactory}
+import org.apache.spark.{SparkContext, SparkConf}
+import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.internal.Logging
@@ -88,14 +88,18 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
 
     val executorPodsAllocator = sc.conf.get(KUBERNETES_ALLOCATION_PODSALLOCATOR) match {
       case "statefulset" =>
-        new StatefulsetPodsAllocator(
-          sc.conf,
-          new KubernetesExecutorBuilder(),
-          kubernetesClient,
-          snapshotsStore,
-          new SystemClock())
+        "org.apache.spark.scheduler.cluster.k8s.StatefulsetPodsAllocator"
       case "direct" =>
-        new ExecutorPodsAllocator(
+        "org.apache.spark.scheduler.cluster.k8s.ExecutorPodsAllocator"
+    }
+
+    val executorPodsAllocator = {
+      val cls = Utils.classForName[AbstractPodsAllocator](executorPodsAllocatorName)
+      val cstr = cls.getConstructor(
+        classOf[SparkConf], classOf[SecurityManager],
+        classOf[KubernetesExecutorBuilder], classOf[KubernetesClient],
+        classOf[ExecutorPodsSnapshotsStore], classOf[Clock])
+      cstr.newInstance(
           sc.conf,
           new KubernetesExecutorBuilder(),
           kubernetesClient,
