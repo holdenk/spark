@@ -26,7 +26,7 @@ import org.scalatest.BeforeAndAfter
 import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.Fabric8Aliases._
-import org.apache.spark.rpc.{RpcEndpoint, RpcEndpointRef, RpcEnv}
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.{ExecutorKilled, TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RemoveExecutor
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
@@ -74,6 +74,9 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
 
   @Mock
   private var pollEvents: ExecutorPodsPollingSnapshotSource = _
+
+  @Mock
+  private var context: RpcCallContext = _
 
   private var driverEndpoint: ArgumentCaptor[RpcEndpoint] = _
   private var schedulerBackendUnderTest: KubernetesClusterSchedulerBackend = _
@@ -147,4 +150,10 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     verify(podAllocator).setTotalExpectedExecutors(5)
   }
 
+
+  test("Dynamically fetch an executor ID") {
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    endpoint.receiveAndReply(context).apply(GenerateExecID("cheeseBurger"))
+    verify(context).reply("1")
+  }
 }

@@ -145,7 +145,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
 
-  val execId = new AtomicInteger(1)
+  val execId = new AtomicInteger(0)
 
   private class KubernetesDriverEndpoint(rpcEnv: RpcEnv, sparkProperties: Seq[(String, String)])
       extends DriverEndpoint(rpcEnv, sparkProperties) {
@@ -174,7 +174,9 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
 
     override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] =
-      ignoreRegisterExecutorAtStoppedContext.orElse(super.receiveAndReply(context))
+      generateExecID(context).orElse(
+        ignoreRegisterExecutorAtStoppedContext.orElse(
+          super.receiveAndReply(context)))
 
     override def onDisconnected(rpcAddress: RpcAddress): Unit = {
       // Don't do anything besides disabling the executor - allow the Kubernetes API events to

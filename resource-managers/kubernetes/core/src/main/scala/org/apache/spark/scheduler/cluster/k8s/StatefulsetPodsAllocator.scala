@@ -32,7 +32,7 @@ import org.apache.spark.deploy.k8s.KubernetesUtils.addOwnerReference
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.{Clock, Utils}
 
-private[spark] class StatefulsetPodsAllocator(
+class StatefulsetPodsAllocator(
     conf: SparkConf,
     executorBuilder: KubernetesExecutorBuilder,
     kubernetesClient: KubernetesClient,

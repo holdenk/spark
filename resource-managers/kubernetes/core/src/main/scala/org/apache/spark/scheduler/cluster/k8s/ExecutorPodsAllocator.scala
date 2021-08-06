@@ -29,7 +29,7 @@ import org.apache.spark.deploy.k8s.KubernetesConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.{Clock, Utils}
 
-private[spark] class ExecutorPodsAllocator(
+class ExecutorPodsAllocator(
     conf: SparkConf,
     executorBuilder: KubernetesExecutorBuilder,
     kubernetesClient: KubernetesClient,
