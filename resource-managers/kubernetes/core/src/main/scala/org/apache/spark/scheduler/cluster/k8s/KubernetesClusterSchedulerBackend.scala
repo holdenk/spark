@@ -25,7 +25,7 @@ import io.fabric8.kubernetes.client.KubernetesClient
 
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.rpc.{RpcAddress, RpcEnv}
+import org.apache.spark.rpc.{RpcAddress, RpcCallContext, RpcEnv}
 import org.apache.spark.scheduler.{ExecutorLossReason, TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.{CoarseGrainedSchedulerBackend, SchedulerBackendUtils}
 import org.apache.spark.util.{ThreadUtils, Utils}
@@ -44,6 +44,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
 
   private implicit val requestExecutorContext =
     ExecutionContext.fromExecutorService(requestExecutorsService)
+
+  private val executorService = ThreadUtils.newDaemonSingleThreadExecutor("executorService")
 
   protected override val minRegisteredRatio =
     if (conf.getOption("spark.scheduler.minRegisteredResourcesRatio").isEmpty) {
@@ -111,6 +113,10 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
 
     Utils.tryLogNonFatalError {
+      ThreadUtils.shutdown(executorService)
+    }
+
+    Utils.tryLogNonFatalError {
       kubernetesClient.close()
     }
   }
@@ -161,22 +167,19 @@ private[spark] class KubernetesClusterSchedulerBackend(
             // Label the pod with it's exec ID
             kubernetesClient.pods()
               .withName(x.podName)
-              .edit({p: Pod => new PodBuilder(p).editMetadata()
+              .edit()
+              .editMetadata()
                 .addToLabels(SPARK_EXECUTOR_ID_LABEL, newId.toString)
-                .endMetadata()
-                .build()})
+              .endMetadata()
+              .done()
           }
         }
         executorService.execute(labelTask)
     }
-    private def ignoreRegisterExecutorAtStoppedContext: PartialFunction[Any, Unit] = {
-      case _: RegisterExecutor if sc.isStopped => // No-op
-    }
 
     override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] =
       generateExecID(context).orElse(
-        ignoreRegisterExecutorAtStoppedContext.orElse(
-          super.receiveAndReply(context)))
+        super.receiveAndReply(context))
 
     override def onDisconnected(rpcAddress: RpcAddress): Unit = {
       // Don't do anything besides disabling the executor - allow the Kubernetes API events to

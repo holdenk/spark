@@ -21,14 +21,16 @@ import java.util.concurrent.TimeUnit
 
 import com.google.common.cache.CacheBuilder
 import io.fabric8.kubernetes.client.Config
+import io.fabric8.kubernetes.client.KubernetesClient
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.internal.Logging
+import org.apache.spark.rpc.RpcCallContext
 import org.apache.spark.scheduler.{ExternalClusterManager, SchedulerBackend, TaskScheduler, TaskSchedulerImpl}
-import org.apache.spark.util.{SystemClock, ThreadUtils}
+import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
 
 private[spark] class KubernetesClusterManager extends ExternalClusterManager with Logging {
 
@@ -120,18 +122,16 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
         fullClass
     }
 
-    val cls = Utils.classForName[AbstractPodsAllocator](executorPodsAllocatorName)
+    val cls = Utils.classForName(executorPodsAllocatorName)
     val cstr = cls.getConstructor(
-      classOf[SparkConf], classOf[org.apache.spark.SecurityManager],
-      classOf[KubernetesExecutorBuilder], classOf[KubernetesClient],
+      classOf[SparkConf], classOf[KubernetesExecutorBuilder], classOf[KubernetesClient],
       classOf[ExecutorPodsSnapshotsStore], classOf[Clock])
     cstr.newInstance(
       sc.conf,
-      sc.env.securityManager,
       new KubernetesExecutorBuilder(),
       kubernetesClient,
       snapshotsStore,
-      new SystemClock())
+      new SystemClock()).asInstanceOf[AbstractPodsAllocator]
   }
 
   override def initialize(scheduler: TaskScheduler, backend: SchedulerBackend): Unit = {

@@ -152,7 +152,7 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
 
 
   test("Dynamically fetch an executor ID") {
-    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint(List())
     endpoint.receiveAndReply(context).apply(GenerateExecID("cheeseBurger"))
     verify(context).reply("1")
   }

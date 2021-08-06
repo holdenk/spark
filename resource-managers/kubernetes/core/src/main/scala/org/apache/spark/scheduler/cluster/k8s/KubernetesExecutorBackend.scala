@@ -16,6 +16,10 @@
  */
 package org.apache.spark.scheduler.cluster.k8s
 
+import java.net.URL
+
+import scala.collection.mutable
+
 import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.deploy.worker.WorkerWatcher
@@ -35,20 +39,18 @@ private[spark] object KubernetesExecutorBackend extends Logging {
   case class Arguments(
       driverUrl: String,
       executorId: String,
-      bindAddress: String,
       hostname: String,
       cores: Int,
       appId: String,
       workerUrl: Option[String],
-      resourcesFileOpt: Option[String],
-      podName: String)
+      podName: String,
+      userClassPath: List[URL])
 
   def main(args: Array[String]): Unit = {
     val createFn: (RpcEnv, Arguments, SparkEnv, String) =>
       CoarseGrainedExecutorBackend = { case (rpcEnv, arguments, env, execId) =>
         new CoarseGrainedExecutorBackend(rpcEnv, arguments.driverUrl, execId,
-        arguments.bindAddress, arguments.hostname, arguments.cores,
-        env, arguments.resourcesFileOpt)
+        arguments.hostname, arguments.cores, arguments.userClassPath, env)
     }
     run(parseArguments(args, this.getClass.getCanonicalName.stripSuffix("$")), createFn)
     System.exit(0)
@@ -69,12 +71,10 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       val executorConf = new SparkConf
       val fetcher = RpcEnv.create(
         "driverPropsFetcher",
-        arguments.bindAddress,
         arguments.hostname,
         -1,
         executorConf,
         new SecurityManager(executorConf),
-        numUsableCores = 0,
         clientMode = true)
 
       var driver: RpcEndpointRef = null
@@ -89,7 +89,7 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         }
       }
 
-      val cfg = driver.askSync[SparkAppConfig](RetrieveSparkAppConfig())
+      val cfg = driver.askSync[SparkAppConfig](RetrieveSparkAppConfig)
       val props = cfg.sparkProperties ++ Seq[(String, String)](("spark.app.id", arguments.appId))
       val execId: String = arguments.executorId match {
         case null | "EXECID" | "" =>
@@ -115,15 +115,14 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         SparkHadoopUtil.get.addDelegationTokens(tokens, driverConf)
       }
 
-      driverConf.set(EXECUTOR_ID, execId)
-      val env = SparkEnv.createExecutorEnv(driverConf, execId, arguments.bindAddress,
+      val env = SparkEnv.createExecutorEnv(driverConf, execId,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
 
       val backend = backendCreateFn(env.rpcEnv, arguments, env, execId)
       env.rpcEnv.setupEndpoint("Executor", backend)
       arguments.workerUrl.foreach { url =>
         env.rpcEnv.setupEndpoint("WorkerWatcher",
-          new WorkerWatcher(env.rpcEnv, url, isChildProcessStopping = backend.stopping))
+          new WorkerWatcher(env.rpcEnv, url))
       }
       env.rpcEnv.awaitTermination()
     }
@@ -132,13 +131,12 @@ private[spark] object KubernetesExecutorBackend extends Logging {
   def parseArguments(args: Array[String], classNameForEntry: String): Arguments = {
     var driverUrl: String = null
     var executorId: String = null
-    var bindAddress: String = null
     var hostname: String = null
     var cores: Int = 0
-    var resourcesFileOpt: Option[String] = None
     var appId: String = null
     var workerUrl: Option[String] = None
     var podName: String = null
+    val userClassPath = new mutable.ListBuffer[URL]()
 
     var argv = args.toList
     while (!argv.isEmpty) {
@@ -149,17 +147,11 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         case ("--executor-id") :: value :: tail =>
           executorId = value
           argv = tail
-        case ("--bind-address") :: value :: tail =>
-          bindAddress = value
-          argv = tail
         case ("--hostname") :: value :: tail =>
           hostname = value
           argv = tail
         case ("--cores") :: value :: tail =>
           cores = value.toInt
-          argv = tail
-        case ("--resourcesFile") :: value :: tail =>
-          resourcesFileOpt = Some(value)
           argv = tail
         case ("--app-id") :: value :: tail =>
           appId = value
@@ -170,6 +162,9 @@ private[spark] object KubernetesExecutorBackend extends Logging {
           argv = tail
         case ("--podName") :: value :: tail =>
           podName = value
+          argv = tail
+        case ("--user-class-path") :: value :: tail =>
+          userClassPath += new URL(value)
           argv = tail
         case Nil =>
         case tail =>
@@ -189,12 +184,8 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       printUsageAndExit(classNameForEntry)
     }
 
-    if (bindAddress == null) {
-      bindAddress = hostname
-    }
-
-    Arguments(driverUrl, executorId, bindAddress, hostname, cores, appId, workerUrl,
-      resourcesFileOpt, podName)
+    Arguments(driverUrl, executorId, hostname, cores, appId, workerUrl,
+      podName, userClassPath.toList)
   }
 
   private def printUsageAndExit(classNameForEntry: String): Unit = {
@@ -206,10 +197,8 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       | Options are:
       |   --driver-url <driverUrl>
       |   --executor-id <executorId>
-      |   --bind-address <bindAddress>
       |   --hostname <hostname>
       |   --cores <cores>
-      |   --resourcesFile <fileWithJSONResourceInformation>
       |   --app-id <appid>
       |   --worker-url <workerUrl>
       |   --podName <podName>

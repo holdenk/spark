@@ -39,7 +39,7 @@ class KubernetesClusterManagerSuite extends SparkFunSuite with BeforeAndAfter {
   private var sparkConf: SparkConf = _
 
   before {
-    MockitoAnnotations.openMocks(this).close()
+    MockitoAnnotations.initMocks(this)
     when(sc.conf).thenReturn(sparkConf)
     when(sc.conf.get(KUBERNETES_DRIVER_POD_NAME)).thenReturn(None)
     when(sc.env).thenReturn(env)
