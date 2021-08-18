@@ -19,6 +19,9 @@
 # echo commands to the terminal output
 set -ex
 
+# Give us a second to attach logging just incase
+sleep 1
+
 # Check whether there is a passwd entry for the container UID
 myuid=$(id -u)
 mygid=$(id -g)
@@ -115,7 +118,7 @@ case "$SPARK_K8S_CMD" in
       -Xms$SPARK_EXECUTOR_MEMORY
       -Xmx$SPARK_EXECUTOR_MEMORY
       -cp "$SPARK_CLASSPATH"
-      org.apache.spark.executor.CoarseGrainedExecutorBackend
+      org.apache.spark.scheduler.cluster.k8s.KubernetesExecutorBackend
       --driver-url $SPARK_DRIVER_URL
       --executor-id $SPARK_EXECUTOR_ID
       --cores $SPARK_EXECUTOR_CORES
