@@ -20,7 +20,6 @@ import copy
 from typing import (
     Any,
     Callable,
-    cast,
     Generic,
     List,
     Optional,
@@ -43,6 +42,7 @@ if TYPE_CHECKING:
 __all__ = ["Param", "Params", "TypeConverters"]
 
 T = TypeVar("T")
+P = TypeVar("P", bound="Params")
 
 
 class Param(Generic[T]):
@@ -303,7 +303,7 @@ class Params(Identifiable, metaclass=ABCMeta):
         Explains a single param and returns its name, doc, and optional
         default value and user-supplied value in a string.
         """
-        param = cast(Param, self._resolveParam(param))
+        param = self._resolveParam(param)
         values = []
         if self.isDefined(param):
             if param in self._defaultParamMap:
@@ -409,7 +409,7 @@ class Params(Identifiable, metaclass=ABCMeta):
         paramMap.update(extra)
         return paramMap
 
-    def copy(self, extra: Optional["ParamMap"] = None) -> "Params":
+    def copy(self: P, extra: Optional["ParamMap"] = None) -> P:
         """
         Creates a copy of this instance with the same uid and some
         extra params. The default implementation creates a
@@ -492,7 +492,7 @@ class Params(Identifiable, metaclass=ABCMeta):
         dummy.uid = "undefined"
         return dummy
 
-    def _set(self, **kwargs: Any) -> "Params":
+    def _set(self: P, **kwargs: Any) -> P:
         """
         Sets user-supplied params.
         """
@@ -513,7 +513,7 @@ class Params(Identifiable, metaclass=ABCMeta):
         if self.isSet(param):
             del self._paramMap[param]
 
-    def _setDefault(self, **kwargs: Any) -> "Params":
+    def _setDefault(self: P, **kwargs: Any) -> P:
         """
         Sets default params.
         """
@@ -529,7 +529,7 @@ class Params(Identifiable, metaclass=ABCMeta):
             self._defaultParamMap[p] = value
         return self
 
-    def _copyValues(self, to: "Params", extra: Optional["ParamMap"] = None) -> "Params":
+    def _copyValues(self, to: P, extra: Optional["ParamMap"] = None) -> P:
         """
         Copies param values from this instance to another instance for
         params shared by them.
@@ -568,7 +568,7 @@ class Params(Identifiable, metaclass=ABCMeta):
                 to._set(**{param.name: paramMap[param]})
         return to
 
-    def _resetUid(self, newUid: Any) -> "Params":
+    def _resetUid(self: P, newUid: Any) -> P:
         """
         Changes the uid of this instance. This updates both
         the stored uid and the parent uid of params and param maps.

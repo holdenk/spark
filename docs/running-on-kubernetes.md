@@ -44,8 +44,7 @@ Cluster administrators should use [Pod Security Policies](https://kubernetes.io/
 
 # Prerequisites
 
-* A runnable distribution of Spark 2.3 or above.
-* A running Kubernetes cluster at version >= 1.6 with access configured to it using
+* A running Kubernetes cluster at version >= 1.20 with access configured to it using
 [kubectl](https://kubernetes.io/docs/user-guide/prereqs/).  If you do not already have a working Kubernetes cluster,
 you may set up a test cluster on your local machine using
 [minikube](https://kubernetes.io/docs/getting-started-guides/minikube/).
@@ -1139,15 +1138,6 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>3.0.0</td>
 </tr>
 <tr>
-  <td><code>spark.kubernetes.memoryOverheadFactor</code></td>
-  <td><code>0.1</code></td>
-  <td>
-    This sets the Memory Overhead Factor that will allocate memory to non-JVM memory, which includes off-heap memory allocations, non-JVM tasks, various systems processes, and <code>tmpfs</code>-based local directories when <code>spark.kubernetes.local.dirs.tmpfs<code> is <code>true</code>. For JVM-based jobs this value will default to 0.10 and 0.40 for non-JVM jobs.
-    This is done as non-JVM tasks need more non-JVM heap space and such tasks commonly fail with "Memory Overhead Exceeded" errors. This preempts this error with a higher default.
-  </td>
-  <td>2.4.0</td>
-</tr>
-<tr>
   <td><code>spark.kubernetes.pyspark.pythonVersion</code></td>
   <td><code>"3"</code></td>
   <td>
@@ -1315,7 +1305,7 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>3.0.0</td>
 </tr>
 <tr>
-  <td><code>spark.kubernetes.executor.decommmissionLabel<code></td>
+  <td><code>spark.kubernetes.executor.decommissionLabel</code></td>
   <td>(none)</td>
   <td>
     Label to be applied to pods which are exiting or being decommissioned. Intended for use
@@ -1324,16 +1314,16 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>3.3.0</td>
 </tr>
 <tr>
-  <td><code>spark.kubernetes.executor.decommmissionLabelValue<code></td>
+  <td><code>spark.kubernetes.executor.decommissionLabelValue</code></td>
   <td>(none)</td>
   <td>
     Value to be applied with the label when
-    <code>spark.kubernetes.executor.decommmissionLabel</code> is enabled.
+    <code>spark.kubernetes.executor.decommissionLabel</code> is enabled.
   </td>
   <td>3.3.0</td>
 </tr>
 <tr>
-  <td><code>spark.kubernetes.executor.scheduler.name<code></td>
+  <td><code>spark.kubernetes.executor.scheduler.name</code></td>
   <td>(none)</td>
   <td>
 	Specify the scheduler name for each executor pod.
@@ -1341,10 +1331,19 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>3.0.0</td>
 </tr>
 <tr>
-  <td><code>spark.kubernetes.driver.scheduler.name<code></td>
+  <td><code>spark.kubernetes.driver.scheduler.name</code></td>
   <td>(none)</td>
   <td>
     Specify the scheduler name for driver pod.
+  </td>
+  <td>3.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.kubernetes.scheduler.name</code></td>
+  <td>(none)</td>
+  <td>
+    Specify the scheduler name for driver and executor pods. If `spark.kubernetes.driver.scheduler.name` or
+    `spark.kubernetes.executor.scheduler.name` is set, will override this.
   </td>
   <td>3.3.0</td>
 </tr>
@@ -1421,7 +1420,9 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>
     Class names of an extra driver pod feature step implementing
     `KubernetesFeatureConfigStep`. This is a developer API. Comma separated.
-    Runs after all of Spark internal feature steps.
+    Runs after all of Spark internal feature steps. Since 3.3.0, your driver feature step
+    can implement `KubernetesDriverCustomFeatureConfigStep` where the driver config
+    is also available.
   </td>
   <td>3.2.0</td>
 </tr>
@@ -1431,7 +1432,9 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>
     Class names of an extra executor pod feature step implementing
     `KubernetesFeatureConfigStep`. This is a developer API. Comma separated.
-    Runs after all of Spark internal feature steps.
+    Runs after all of Spark internal feature steps. Since 3.3.0, your executor feature step
+    can implement `KubernetesExecutorCustomFeatureConfigStep` where the executor config
+    is also available.
   </td>
   <td>3.2.0</td>
 </tr>
@@ -1685,6 +1688,30 @@ The user is responsible to properly configuring the Kubernetes cluster to have t
 Spark automatically handles translating the Spark configs <code>spark.{driver/executor}.resource.{resourceType}</code> into the kubernetes configs as long as the Kubernetes resource type follows the Kubernetes device plugin format of `vendor-domain/resourcetype`. The user must specify the vendor using the <code>spark.{driver/executor}.resource.{resourceType}.vendor</code> config. The user does not need to explicitly add anything if you are using Pod templates. For reference and an example, you can see the Kubernetes documentation for scheduling [GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/). Spark only supports setting the resource limits.
 
 Kubernetes does not tell Spark the addresses of the resources allocated to each container. For that reason, the user must specify a discovery script that gets run by the executor on startup to discover what resources are available to that executor. You can find an example scripts in `examples/src/main/scripts/getGpusResources.sh`. The script must have execute permissions set and the user should setup permissions to not allow malicious users to modify it. The script should write to STDOUT a JSON string in the format of the ResourceInformation class. This has the resource name and an array of resource addresses available to just that executor.
+
+### Resource Level Scheduling Overview
+
+There are several resource level scheduling features supported by Spark on Kubernetes.
+
+#### Priority Scheduling
+
+Kubernetes supports [Pod priority](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption) by default.
+
+Spark on Kubernetes allows defining the priority of jobs by [Pod template](#pod-template). The user can specify the <code>priorityClassName</code> in driver or executor Pod template <code>spec</code> section. Below is an example to show how to specify it:
+
+```
+apiVersion: v1
+Kind: Pod
+metadata:
+  labels:
+    template-label-key: driver-template-label-value
+spec:
+  # Specify the priority in here 
+  priorityClassName: system-node-critical
+  containers:
+  - name: test-driver-container
+    image: will-be-overwritten
+```
 
 ### Stage Level Scheduling Overview
 

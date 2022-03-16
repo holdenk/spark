@@ -410,9 +410,12 @@ class DataSourceV2SQLSuite
   test("SPARK-36850: CreateTableAsSelect partitions can be specified using " +
     "PARTITIONED BY and/or CLUSTERED BY") {
     val identifier = "testcat.table_name"
+    val df = spark.createDataFrame(Seq((1L, "a", "a1", "a2", "a3"), (2L, "b", "b1", "b2", "b3"),
+      (3L, "c", "c1", "c2", "c3"))).toDF("id", "data1", "data2", "data3", "data4")
+    df.createOrReplaceTempView("source_table")
     withTable(identifier) {
       spark.sql(s"CREATE TABLE $identifier USING foo PARTITIONED BY (id) " +
-        s"CLUSTERED BY (data) INTO 4 BUCKETS AS SELECT * FROM source")
+        s"CLUSTERED BY (data1, data2, data3, data4) INTO 4 BUCKETS AS SELECT * FROM source_table")
       val describe = spark.sql(s"DESCRIBE $identifier")
       val part1 = describe
         .filter("col_name = 'Part 0'")
@@ -421,18 +424,22 @@ class DataSourceV2SQLSuite
       val part2 = describe
         .filter("col_name = 'Part 1'")
         .select("data_type").head.getString(0)
-      assert(part2 === "bucket(4, data)")
+      assert(part2 === "bucket(4, data1, data2, data3, data4)")
     }
   }
 
   test("SPARK-36850: ReplaceTableAsSelect partitions can be specified using " +
     "PARTITIONED BY and/or CLUSTERED BY") {
     val identifier = "testcat.table_name"
+    val df = spark.createDataFrame(Seq((1L, "a", "a1", "a2", "a3"), (2L, "b", "b1", "b2", "b3"),
+      (3L, "c", "c1", "c2", "c3"))).toDF("id", "data1", "data2", "data3", "data4")
+    df.createOrReplaceTempView("source_table")
     withTable(identifier) {
       spark.sql(s"CREATE TABLE $identifier USING foo " +
         "AS SELECT id FROM source")
       spark.sql(s"REPLACE TABLE $identifier USING foo PARTITIONED BY (id) " +
-        s"CLUSTERED BY (data) INTO 4 BUCKETS AS SELECT * FROM source")
+        s"CLUSTERED BY (data1, data2) SORTED by (data3, data4) INTO 4 BUCKETS " +
+        s"AS SELECT * FROM source_table")
       val describe = spark.sql(s"DESCRIBE $identifier")
       val part1 = describe
         .filter("col_name = 'Part 0'")
@@ -441,7 +448,7 @@ class DataSourceV2SQLSuite
       val part2 = describe
         .filter("col_name = 'Part 1'")
         .select("data_type").head.getString(0)
-      assert(part2 === "bucket(4, data)")
+      assert(part2 === "sorted_bucket(data1, data2, 4, data3, data4)")
     }
   }
 
@@ -1479,18 +1486,21 @@ class DataSourceV2SQLSuite
   test("create table using - with sorted bucket") {
     val identifier = "testcat.table_name"
     withTable(identifier) {
-      sql(s"CREATE TABLE $identifier (a int, b string, c int) USING $v2Source PARTITIONED BY (c)" +
-        s" CLUSTERED BY (b) SORTED by (a) INTO 4 BUCKETS")
-      val table = getTableMetadata(identifier)
+      sql(s"CREATE TABLE $identifier (a int, b string, c int, d int, e int, f int) USING" +
+        s" $v2Source PARTITIONED BY (a, b) CLUSTERED BY (c, d) SORTED by (e, f) INTO 4 BUCKETS")
       val describe = spark.sql(s"DESCRIBE $identifier")
       val part1 = describe
         .filter("col_name = 'Part 0'")
         .select("data_type").head.getString(0)
-      assert(part1 === "c")
+      assert(part1 === "a")
       val part2 = describe
         .filter("col_name = 'Part 1'")
         .select("data_type").head.getString(0)
-      assert(part2 === "bucket(4, b, a)")
+      assert(part2 === "b")
+      val part3 = describe
+        .filter("col_name = 'Part 2'")
+        .select("data_type").head.getString(0)
+      assert(part3 === "sorted_bucket(c, d, 4, e, f)")
     }
   }
 
@@ -1851,109 +1861,6 @@ class DataSourceV2SQLSuite
       testNotSupportedV2Command("LOAD DATA", s"LOCAL INPATH 'filepath' OVERWRITE INTO TABLE $t")
       testNotSupportedV2Command("LOAD DATA",
         s"LOCAL INPATH 'filepath' OVERWRITE INTO TABLE $t PARTITION(id=1)")
-    }
-  }
-
-  test("SPARK-33898: SHOW CREATE TABLE AS SERDE") {
-    val t = "testcat.ns1.ns2.tbl"
-    withTable(t) {
-      spark.sql(s"CREATE TABLE $t (id bigint, data string) USING foo")
-      val e = intercept[AnalysisException] {
-        sql(s"SHOW CREATE TABLE $t AS SERDE")
-      }
-      assert(e.message.contains(s"SHOW CREATE TABLE AS SERDE is not supported for v2 tables."))
-    }
-  }
-
-  test("SPARK-33898: SHOW CREATE TABLE") {
-    val t = "testcat.ns1.ns2.tbl"
-    withTable(t) {
-      sql(
-        s"""
-           |CREATE TABLE $t (
-           |  a bigint NOT NULL,
-           |  b bigint,
-           |  c bigint,
-           |  `extra col` ARRAY<INT>,
-           |  `<another>` STRUCT<x: INT, y: ARRAY<BOOLEAN>>
-           |)
-           |USING foo
-           |OPTIONS (
-           |  from = 0,
-           |  to = 1,
-           |  via = 2)
-           |COMMENT 'This is a comment'
-           |TBLPROPERTIES ('prop1' = '1', 'prop2' = '2', 'prop3' = 3, 'prop4' = 4)
-           |PARTITIONED BY (a)
-           |LOCATION 'file:/tmp'
-        """.stripMargin)
-      val showDDL = getShowCreateDDL(s"SHOW CREATE TABLE $t")
-      assert(showDDL === Array(
-        "CREATE TABLE testcat.ns1.ns2.tbl (",
-        "`a` BIGINT NOT NULL,",
-        "`b` BIGINT,",
-        "`c` BIGINT,",
-        "`extra col` ARRAY<INT>,",
-        "`<another>` STRUCT<`x`: INT, `y`: ARRAY<BOOLEAN>>)",
-        "USING foo",
-        "OPTIONS(",
-        "'from' = '0',",
-        "'to' = '1',",
-        "'via' = '2')",
-        "PARTITIONED BY (a)",
-        "COMMENT 'This is a comment'",
-        "LOCATION 'file:/tmp'",
-        "TBLPROPERTIES (",
-        "'prop1' = '1',",
-        "'prop2' = '2',",
-        "'prop3' = '3',",
-        "'prop4' = '4')"
-      ))
-    }
-  }
-
-  test("SPARK-33898: SHOW CREATE TABLE WITH AS SELECT") {
-    val t = "testcat.ns1.ns2.tbl"
-    withTable(t) {
-      sql(
-        s"""
-           |CREATE TABLE $t
-           |USING foo
-           |AS SELECT 1 AS a, "foo" AS b
-         """.stripMargin)
-      val showDDL = getShowCreateDDL(s"SHOW CREATE TABLE $t")
-      assert(showDDL === Array(
-        "CREATE TABLE testcat.ns1.ns2.tbl (",
-        "`a` INT,",
-        "`b` STRING)",
-        "USING foo"
-      ))
-    }
-  }
-
-  test("SPARK-33898: SHOW CREATE TABLE PARTITIONED BY Transforms") {
-    val t = "testcat.ns1.ns2.tbl"
-    withTable(t) {
-      sql(
-        s"""
-           |CREATE TABLE $t (a INT, b STRING, ts TIMESTAMP) USING foo
-           |PARTITIONED BY (
-           |    a,
-           |    bucket(16, b),
-           |    years(ts),
-           |    months(ts),
-           |    days(ts),
-           |    hours(ts))
-         """.stripMargin)
-      val showDDL = getShowCreateDDL(s"SHOW CREATE TABLE $t")
-      assert(showDDL === Array(
-        "CREATE TABLE testcat.ns1.ns2.tbl (",
-        "`a` INT,",
-        "`b` STRING,",
-        "`ts` TIMESTAMP)",
-        "USING foo",
-        "PARTITIONED BY (a, bucket(16, b), years(ts), months(ts), days(ts), hours(ts))"
-      ))
     }
   }
 
@@ -2866,8 +2773,9 @@ class DataSourceV2SQLSuite
       val properties = table.properties
       assert(properties.get(TableCatalog.PROP_PROVIDER) == "parquet")
       assert(properties.get(TableCatalog.PROP_COMMENT) == "This is a comment")
-      assert(properties.get(TableCatalog.PROP_LOCATION) == "file:/tmp")
+      assert(properties.get(TableCatalog.PROP_LOCATION) == "file:///tmp")
       assert(properties.containsKey(TableCatalog.PROP_OWNER))
+      assert(properties.get(TableCatalog.PROP_EXTERNAL) == "true")
       assert(properties.get(s"${TableCatalog.OPTION_PREFIX}from") == "0")
       assert(properties.get(s"${TableCatalog.OPTION_PREFIX}to") == "1")
       assert(properties.get("prop1") == "1")
@@ -2900,10 +2808,6 @@ class DataSourceV2SQLSuite
     }
     assert(ex.getErrorClass == expectedErrorClass)
     assert(ex.messageParameters.sameElements(expectedErrorMessageParameters))
-  }
-
-  private def getShowCreateDDL(showCreateTableSql: String): Array[String] = {
-    sql(showCreateTableSql).head().getString(0).split("\n").map(_.trim)
   }
 }
 

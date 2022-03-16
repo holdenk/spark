@@ -43,7 +43,7 @@ from pyspark.pandas.typedef.typehints import (
 )
 from pyspark.testing.pandasutils import (
     have_tabulate,
-    PandasOnSparkTestCase,
+    ComparisonTestBase,
     SPARK_CONF_ARROW_ENABLED,
     tabulate_requirement_message,
 )
@@ -51,17 +51,13 @@ from pyspark.testing.sqlutils import SQLTestUtils
 from pyspark.pandas.utils import name_like_string
 
 
-class DataFrameTest(PandasOnSparkTestCase, SQLTestUtils):
+class DataFrameTest(ComparisonTestBase, SQLTestUtils):
     @property
     def pdf(self):
         return pd.DataFrame(
             {"a": [1, 2, 3, 4, 5, 6, 7, 8, 9], "b": [4, 5, 6, 3, 2, 1, 0, 0, 0]},
             index=np.random.rand(9),
         )
-
-    @property
-    def psdf(self):
-        return ps.from_pandas(self.pdf)
 
     @property
     def df_pair(self):
@@ -1562,6 +1558,9 @@ class DataFrameTest(PandasOnSparkTestCase, SQLTestUtils):
         psdf = ps.from_pandas(pdf)
 
         self.assert_eq(psdf.sort_values("b"), pdf.sort_values("b"))
+        self.assert_eq(
+            psdf.sort_values("b", ignore_index=True), pdf.sort_values("b", ignore_index=True)
+        )
 
         for ascending in [True, False]:
             for na_position in ["first", "last"]:
@@ -1571,6 +1570,10 @@ class DataFrameTest(PandasOnSparkTestCase, SQLTestUtils):
                 )
 
         self.assert_eq(psdf.sort_values(["a", "b"]), pdf.sort_values(["a", "b"]))
+        self.assert_eq(
+            psdf.sort_values(["a", "b"], ignore_index=True),
+            pdf.sort_values(["a", "b"], ignore_index=True),
+        )
         self.assert_eq(
             psdf.sort_values(["a", "b"], ascending=[False, True]),
             pdf.sort_values(["a", "b"], ascending=[False, True]),
@@ -1590,6 +1593,41 @@ class DataFrameTest(PandasOnSparkTestCase, SQLTestUtils):
         self.assert_eq(psdf.sort_values("b", inplace=True), pdf.sort_values("b", inplace=True))
         self.assert_eq(psdf, pdf)
         self.assert_eq(psserA, pserA)
+
+        pdf = pd.DataFrame(
+            {"a": [1, 2, 3, 4, 5, None, 7], "b": [7, 6, 5, 4, 3, 2, 1]}, index=np.random.rand(7)
+        )
+        psdf = ps.from_pandas(pdf)
+        pserA = pdf.a
+        psserA = psdf.a
+        self.assert_eq(
+            psdf.sort_values("b", inplace=True, ignore_index=True),
+            pdf.sort_values("b", inplace=True, ignore_index=True),
+        )
+        self.assert_eq(psdf, pdf)
+        self.assert_eq(psserA, pserA)
+
+        # multi-index indexes
+
+        pdf = pd.DataFrame(
+            {"a": [1, 2, 3, 4, 5, None, 7], "b": [7, 6, 5, 4, 3, 2, 1]},
+            index=pd.MultiIndex.from_tuples(
+                [
+                    ("bar", "one"),
+                    ("bar", "two"),
+                    ("baz", "one"),
+                    ("baz", "two"),
+                    ("foo", "one"),
+                    ("foo", "two"),
+                    ("qux", "one"),
+                ]
+            ),
+        )
+        psdf = ps.from_pandas(pdf)
+        self.assert_eq(psdf.sort_values("b"), pdf.sort_values("b"))
+        self.assert_eq(
+            psdf.sort_values("b", ignore_index=True), pdf.sort_values("b", ignore_index=True)
+        )
 
         # multi-index columns
         pdf = pd.DataFrame(
@@ -4543,7 +4581,7 @@ class DataFrameTest(PandasOnSparkTestCase, SQLTestUtils):
 
             def identify4(
                 x,
-            ) -> ps.DataFrame[float, [int, ntp.NDArray[int]]]:  # type: ignore[name-defined]
+            ) -> ps.DataFrame[float, [int, ntp.NDArray[int]]]:
                 return x
 
             actual = psdf.pandas_on_spark.apply_batch(identify4)
