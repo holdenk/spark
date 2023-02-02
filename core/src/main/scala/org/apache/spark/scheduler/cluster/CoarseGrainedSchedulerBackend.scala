@@ -53,6 +53,8 @@ private[spark]
 class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: RpcEnv)
   extends ExecutorAllocationClient with SchedulerBackend with Logging {
 
+  // If we are stopping we will skip logging a bunch of errors.
+  private var stopping: Boolean = false
   // Use an atomic variable to track total number of cores in the cluster for simplicity and speed
   protected val totalCoreCount = new AtomicInteger(0)
   // Total number of executors that are currently registered
@@ -488,23 +490,35 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
      * @return Whether executor should be disabled
      */
     protected def disableExecutor(executorId: String): Boolean = {
-      val shouldDisable = CoarseGrainedSchedulerBackend.this.synchronized {
-        if (isExecutorActive(executorId)) {
-          executorsPendingLossReason += executorId
-          true
-        } else {
-          // Returns true for explicitly killed executors, we also need to get pending loss reasons;
-          // For others return false.
-          executorsPendingToRemove.contains(executorId)
+      try {
+        val shouldDisable = CoarseGrainedSchedulerBackend.this.synchronized {
+          if (isExecutorActive(executorId)) {
+            executorsPendingLossReason += executorId
+            true
+          } else {
+            // Returns true for explicitly killed executors, we also need to get pending loss reasons;
+            // For others return false.
+            executorsPendingToRemove.contains(executorId)
+          }
         }
-      }
 
-      if (shouldDisable) {
-        logInfo(s"Disabling executor $executorId.")
-        scheduler.executorLost(executorId, LossReasonPending)
-      }
+        if (shouldDisable) {
+          logInfo(s"Disabling executor $executorId.")
+          scheduler.executorLost(executorId, LossReasonPending)
+        }
 
-      shouldDisable
+        shouldDisable
+      } catch {
+        case e: org.apache.spark.SparkException =>
+          CoarseGrainedSchedulerBackend.this.synchronized {
+            if (stopping) {
+              logInfo("Scheduler stopping - ${executorId} disabled.")
+              false
+            } else {
+              throw e;
+            }
+          }
+      }
     }
   }
 
@@ -615,6 +629,9 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
   }
 
   override def stop(): Unit = {
+    CoarseGrainedSchedulerBackend.this.synchronized {
+      stopping = True
+    }
     reviveThread.shutdownNow()
     cleanupService.foreach(_.shutdownNow())
     stopExecutors()

@@ -95,6 +95,7 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int) exte
   private def unregisterRpcEndpoint(name: String): Unit = {
     val loop = endpoints.remove(name)
     if (loop != null) {
+      logInfo(s"Removed endpoint ${name}")
       loop.unregister(name)
     }
     // Don't clean `endpointRefs` here because it's possible that some messages are being processed
@@ -186,6 +187,7 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int) exte
   }
 
   def stop(): Unit = {
+    logInfo("Stopping all endpoints.")
     synchronized {
       if (stopped) {
         return
