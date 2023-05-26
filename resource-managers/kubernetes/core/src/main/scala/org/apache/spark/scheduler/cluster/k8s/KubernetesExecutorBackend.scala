@@ -71,8 +71,8 @@ private[spark] object KubernetesExecutorBackend extends Logging {
 
       // Bootstrap to fetch the driver's Spark properties.
       val executorConf = new SparkConf
-      val fetcher = RpcEnv.create(
-        "driverPropsFetcher",
+      val rpcEnv = RpcEnv.create(
+        "initial",
         arguments.bindAddress,
         arguments.hostname,
         -1,
@@ -85,7 +85,7 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       val nTries = sys.env.getOrElse("EXECUTOR_DRIVER_PROPS_FETCHER_MAX_ATTEMPTS", "3").toInt
       for (i <- 0 until nTries if driver == null) {
         try {
-          driver = fetcher.setupEndpointRefByURI(arguments.driverUrl)
+          driver = rpcEnv.setupEndpointRefByURI(arguments.driverUrl)
         } catch {
           case e: Throwable => if (i == nTries - 1) {
             throw e
@@ -102,7 +102,6 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         case id =>
           id
       }
-      fetcher.shutdown()
 
       // Create SparkEnv using properties we fetched from the driver.
       val driverConf = new SparkConf()
@@ -120,8 +119,9 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       }
 
       driverConf.set(EXECUTOR_ID, execId)
-      val env = SparkEnv.createExecutorEnv(driverConf, execId, arguments.bindAddress,
+      val env = SparkEnv.createExecutorEnv(driverConf, execId,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
+      env.set(rpcEnv)
 
       val backend = backendCreateFn(env.rpcEnv, arguments, env, cfg.resourceProfile, execId)
       env.rpcEnv.setupEndpoint("Executor", backend)

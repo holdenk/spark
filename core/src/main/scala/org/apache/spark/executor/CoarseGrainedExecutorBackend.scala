@@ -431,8 +431,8 @@ private[spark] object CoarseGrainedExecutorBackend extends Logging {
 
       // Bootstrap to fetch the driver's Spark properties.
       val executorConf = new SparkConf
-      val fetcher = RpcEnv.create(
-        "driverPropsFetcher",
+      val rpcEnv = RpcEnv.create(
+        "initial",
         arguments.bindAddress,
         arguments.hostname,
         -1,
@@ -445,7 +445,7 @@ private[spark] object CoarseGrainedExecutorBackend extends Logging {
       val nTries = 3
       for (i <- 0 until nTries if driver == null) {
         try {
-          driver = fetcher.setupEndpointRefByURI(arguments.driverUrl)
+          driver = rpcEnv.setupEndpointRefByURI(arguments.driverUrl)
         } catch {
           case e: Throwable => if (i == nTries - 1) {
             throw e
@@ -455,7 +455,6 @@ private[spark] object CoarseGrainedExecutorBackend extends Logging {
 
       val cfg = driver.askSync[SparkAppConfig](RetrieveSparkAppConfig(arguments.resourceProfileId))
       val props = cfg.sparkProperties ++ Seq[(String, String)](("spark.app.id", arguments.appId))
-      fetcher.shutdown()
 
       // Create SparkEnv using properties we fetched from the driver.
       val driverConf = new SparkConf()
@@ -473,8 +472,9 @@ private[spark] object CoarseGrainedExecutorBackend extends Logging {
       }
 
       driverConf.set(EXECUTOR_ID, arguments.executorId)
-      val env = SparkEnv.createExecutorEnv(driverConf, arguments.executorId, arguments.bindAddress,
+      val env = SparkEnv.createExecutorEnv(driverConf, arguments.executorId,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
+      env.set(rpcEnv)
       // Set the application attemptId in the BlockStoreClient if available.
       val appAttemptId = env.conf.get(APP_ATTEMPT_ID)
       appAttemptId.foreach(attemptId =>
