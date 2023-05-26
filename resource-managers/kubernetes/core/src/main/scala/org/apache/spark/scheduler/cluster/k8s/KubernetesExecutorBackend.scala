@@ -16,6 +16,9 @@
  */
 package org.apache.spark.scheduler.cluster.k8s
 
+import scala.concurrent.Future
+import scala.concurrent.duration._
+
 import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.deploy.worker.WorkerWatcher
@@ -26,9 +29,12 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
 import org.apache.spark.rpc._
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{ThreadUtils, Utils}
+
 
 private[spark] object KubernetesExecutorBackend extends Logging {
+
+  implicit val ec: scala.concurrent.ExecutionContext = scala.concurrent.ExecutionContext.global
 
   // Message used internally to start the executor when the driver successfully accepted the
   // registration request.
@@ -93,19 +99,22 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         }
       }
 
-      val cfg = driver.askSync[SparkAppConfig](RetrieveSparkAppConfig(arguments.resourceProfileId))
-      val props = cfg.sparkProperties ++ Seq[(String, String)](("spark.app.id", arguments.appId))
-      val execId: String = arguments.executorId match {
+      val cfgFuture = driver.ask[SparkAppConfig](
+        RetrieveSparkAppConfig(arguments.resourceProfileId))
+      val execIdFuture: Future[String] = arguments.executorId match {
         case null | "EXECID" | "" =>
           // We need to resolve the exec id dynamically
-          driver.askSync[String](GenerateExecID(arguments.podName))
+          driver.ask[String](GenerateExecID(arguments.podName))
         case id =>
-          id
+          Future { id }
       }
+      val driverConf = new SparkConf()
+
+      val cfg = ThreadUtils.awaitResult(cfgFuture, 30.seconds)
       fetcher.shutdown()
 
       // Create SparkEnv using properties we fetched from the driver.
-      val driverConf = new SparkConf()
+      val props = cfg.sparkProperties ++ Seq[(String, String)](("spark.app.id", arguments.appId))
       for ((key, value) <- props) {
         // this is required for SSL in standalone mode
         if (SparkConf.isExecutorStartupConf(key)) {
@@ -119,6 +128,7 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         SparkHadoopUtil.get.addDelegationTokens(tokens, driverConf)
       }
 
+      val execId = ThreadUtils.awaitResult(execIdFuture, 30.seconds)
       driverConf.set(EXECUTOR_ID, execId)
       val env = SparkEnv.createExecutorEnv(driverConf, execId, arguments.bindAddress,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
