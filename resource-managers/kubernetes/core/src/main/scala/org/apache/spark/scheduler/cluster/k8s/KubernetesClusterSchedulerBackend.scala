@@ -19,7 +19,6 @@ package org.apache.spark.scheduler.cluster.k8s
 import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 
-import scala.collection.mutable.HashMap
 import scala.concurrent.Future
 
 import io.fabric8.kubernetes.api.model.Pod
@@ -295,15 +294,10 @@ private[spark] class KubernetesClusterSchedulerBackend(
   }
 
   private class KubernetesDriverEndpoint extends DriverEndpoint {
-
-    protected val execIDRequester = new HashMap[RpcAddress, String]
-
     private def generateExecID(context: RpcCallContext): PartialFunction[Any, Unit] = {
       case x: GenerateExecID =>
         val newId = execId.incrementAndGet().toString
         context.reply(newId)
-        val executorAddress = context.senderAddress
-        execIDRequester(executorAddress) = newId
         // Generally this should complete quickly but safer to not block in-case we're in the
         // middle of an etcd fail over or otherwise slower writes.
         val labelTask = new Runnable() {
@@ -346,14 +340,7 @@ private[spark] class KubernetesClusterSchedulerBackend(
               disableExecutor(id)
           }
         case _ =>
-          val newExecId = execIDRequester.get(rpcAddress)
-          newExecId match {
-            case Some(id) =>
-              execIDRequester -= rpcAddress
-              // Expected, executors re-establish a connection with an ID
-            case _ =>
-              logInfo(s"No executor found for ${rpcAddress}")
-          }
+          logInfo(s"No executor found for ${rpcAddress}")
       }
     }
   }
