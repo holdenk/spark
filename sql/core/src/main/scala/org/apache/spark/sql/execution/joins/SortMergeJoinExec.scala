@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, RangePartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -68,6 +69,22 @@ case class SortMergeJoinExec(
     case x =>
       throw new IllegalArgumentException(
         s"${getClass.getSimpleName} should not take $x as the JoinType")
+  }
+
+  override def outputPartitioning: Partitioning = {
+    val numPartitions = joinType match {
+      case _: InnerLike =>
+        left.outputPartitioning.numPartitions
+      case LeftOuter => left.outputPartitioning.numPartitions
+      case RightOuter => right.outputPartitioning.numPartitions
+      case FullOuter => left.outputPartitioning.numPartitions
+      case LeftExistence(_) => left.outputPartitioning.numPartitions
+    }
+    val order = outputOrdering
+    order match {
+      case Nil => UnknownPartitioning(numPartitions)
+      case _ => RangePartitioning(order, numPartitions)
+    }
   }
 
   /**
