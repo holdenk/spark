@@ -27,7 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, RangePartitioning, UnknownPartitioning}
+import org.apache.spark.sql.catalyst.plans.physical.{Distribution, OrderedDistribution, Partitioning, RangePartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -79,6 +79,10 @@ case class SortMergeJoinExec(
       case RightOuter => right.outputPartitioning.numPartitions
       case FullOuter => left.outputPartitioning.numPartitions
       case LeftExistence(_) => left.outputPartitioning.numPartitions
+      case x =>
+        throw new IllegalArgumentException(
+          s"${getClass.getSimpleName} should not take $x as the JoinType")
+
     }
     val order = outputOrdering
     order match {
@@ -110,6 +114,11 @@ case class SortMergeJoinExec(
 
   override def requiredChildOrdering: Seq[Seq[SortOrder]] =
     requiredOrders(leftKeys) :: requiredOrders(rightKeys) :: Nil
+
+    override def requiredChildDistribution: Seq[Distribution] = {
+      List(OrderedDistribution(requiredOrders(leftKeys)),
+        OrderedDistribution(requiredOrders(rightKeys)))
+  }
 
   private def requiredOrders(keys: Seq[Expression]): Seq[SortOrder] = {
     // This must be ascending in order to agree with the `keyOrdering` defined in `doExecute()`.
