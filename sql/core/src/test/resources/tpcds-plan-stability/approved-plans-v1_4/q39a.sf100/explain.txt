@@ -160,7 +160,7 @@ Input [5]: [w_warehouse_sk#9, i_item_sk#8, d_moy#7, stdev#23, mean#24]
 
 (24) Exchange
 Input [5]: [w_warehouse_sk#9, i_item_sk#8, d_moy#7, mean#24, cov#25]
-Arguments: hashpartitioning(i_item_sk#8, w_warehouse_sk#9, 5), ENSURE_REQUIREMENTS, [plan_id=4]
+Arguments: rangepartitioning(i_item_sk#8 ASC NULLS FIRST, w_warehouse_sk#9 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=4]
 
 (25) Sort [codegen id : 6]
 Input [5]: [w_warehouse_sk#9, i_item_sk#8, d_moy#7, mean#24, cov#25]
@@ -248,7 +248,7 @@ Input [5]: [w_warehouse_sk#34, i_item_sk#33, d_moy#32, stdev#46, mean#47]
 
 (43) Exchange
 Input [5]: [w_warehouse_sk#34, i_item_sk#33, d_moy#32, mean#47, cov#48]
-Arguments: hashpartitioning(i_item_sk#33, w_warehouse_sk#34, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(i_item_sk#33 ASC NULLS FIRST, w_warehouse_sk#34 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (44) Sort [codegen id : 12]
 Input [5]: [w_warehouse_sk#34, i_item_sk#33, d_moy#32, mean#47, cov#48]

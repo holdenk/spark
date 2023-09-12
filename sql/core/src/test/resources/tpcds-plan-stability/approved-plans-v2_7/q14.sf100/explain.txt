@@ -164,7 +164,7 @@ Condition : (((isnotnull(i_item_sk#14) AND isnotnull(i_brand_id#15)) AND isnotnu
 
 (16) Exchange
 Input [4]: [i_item_sk#14, i_brand_id#15, i_class_id#16, i_category_id#17]
-Arguments: hashpartitioning(coalesce(i_brand_id#15, 0), isnull(i_brand_id#15), coalesce(i_class_id#16, 0), isnull(i_class_id#16), coalesce(i_category_id#17, 0), isnull(i_category_id#17), 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(coalesce(i_brand_id#15, 0) ASC NULLS FIRST, isnull(i_brand_id#15) ASC NULLS FIRST, coalesce(i_class_id#16, 0) ASC NULLS FIRST, isnull(i_class_id#16) ASC NULLS FIRST, coalesce(i_category_id#17, 0) ASC NULLS FIRST, isnull(i_category_id#17) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (17) Sort [codegen id : 3]
 Input [4]: [i_item_sk#14, i_brand_id#15, i_class_id#16, i_category_id#17]
@@ -228,7 +228,7 @@ Input [5]: [cs_item_sk#18, i_item_sk#21, i_brand_id#22, i_class_id#23, i_categor
 
 (30) Exchange
 Input [3]: [i_brand_id#22, i_class_id#23, i_category_id#24]
-Arguments: hashpartitioning(coalesce(i_brand_id#22, 0), isnull(i_brand_id#22), coalesce(i_class_id#23, 0), isnull(i_class_id#23), coalesce(i_category_id#24, 0), isnull(i_category_id#24), 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(coalesce(i_brand_id#22, 0) ASC NULLS FIRST, isnull(i_brand_id#22) ASC NULLS FIRST, coalesce(i_class_id#23, 0) ASC NULLS FIRST, isnull(i_class_id#23) ASC NULLS FIRST, coalesce(i_category_id#24, 0) ASC NULLS FIRST, isnull(i_category_id#24) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (31) Sort [codegen id : 7]
 Input [3]: [i_brand_id#22, i_class_id#23, i_category_id#24]
@@ -274,7 +274,7 @@ Results [3]: [brand_id#25, class_id#26, category_id#27]
 
 (39) Exchange
 Input [3]: [brand_id#25, class_id#26, category_id#27]
-Arguments: hashpartitioning(coalesce(brand_id#25, 0), isnull(brand_id#25), coalesce(class_id#26, 0), isnull(class_id#26), coalesce(category_id#27, 0), isnull(category_id#27), 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(coalesce(brand_id#25, 0) ASC NULLS FIRST, isnull(brand_id#25) ASC NULLS FIRST, coalesce(class_id#26, 0) ASC NULLS FIRST, isnull(class_id#26) ASC NULLS FIRST, coalesce(category_id#27, 0) ASC NULLS FIRST, isnull(category_id#27) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (40) Sort [codegen id : 11]
 Input [3]: [brand_id#25, class_id#26, category_id#27]
@@ -323,7 +323,7 @@ Input [5]: [ws_item_sk#28, i_item_sk#31, i_brand_id#32, i_class_id#33, i_categor
 
 (50) Exchange
 Input [3]: [i_brand_id#32, i_class_id#33, i_category_id#34]
-Arguments: hashpartitioning(coalesce(i_brand_id#32, 0), isnull(i_brand_id#32), coalesce(i_class_id#33, 0), isnull(i_class_id#33), coalesce(i_category_id#34, 0), isnull(i_category_id#34), 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(coalesce(i_brand_id#32, 0) ASC NULLS FIRST, isnull(i_brand_id#32) ASC NULLS FIRST, coalesce(i_class_id#33, 0) ASC NULLS FIRST, isnull(i_class_id#33) ASC NULLS FIRST, coalesce(i_category_id#34, 0) ASC NULLS FIRST, isnull(i_category_id#34) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (51) Sort [codegen id : 15]
 Input [3]: [i_brand_id#32, i_class_id#33, i_category_id#34]

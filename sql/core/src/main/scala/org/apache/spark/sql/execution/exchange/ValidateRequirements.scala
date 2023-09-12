@@ -50,15 +50,22 @@ object ValidateRequirements extends Logging {
           if !child.outputPartitioning.satisfies(distribution)
             || !SortOrder.orderingSatisfies(child.outputOrdering, ordering) =>
         logDebug(s"ValidateRequirements failed: $distribution, $ordering\n$plan")
+        println(s"ValidateRequirements failed: $distribution, $ordering\n$plan")
         false
       case _ => true
     }
 
     if (satisfied && children.length > 1 &&
-      requiredChildDistributions.forall(_.isInstanceOf[ClusteredDistribution])) {
+      requiredChildDistributions.forall(x =>
+        x.isInstanceOf[ClusteredDistribution] || x.isInstanceOf[RangePartitioning])) {
       // Check the co-partitioning requirement.
       val specs = children.map(_.outputPartitioning).zip(requiredChildDistributions).map {
-        case (p, d) => p.createShuffleSpec(d.asInstanceOf[ClusteredDistribution])
+        case (p, d) =>
+          if (d.isInstanceOf[ClusteredDistribution]) {
+            p.createShuffleSpec(d.asInstanceOf[ClusteredDistribution])
+          } else {
+            p.createShuffleSpec(d.asInstanceOf[RangePartitioning])
+          }
       }
       if (specs.tail.forall(_.isCompatibleWith(specs.head))) {
         true

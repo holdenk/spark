@@ -101,7 +101,7 @@ Input [5]: [ws_item_sk#2, ws_bill_customer_sk#3, ws_sales_price#4, i_item_sk#8, 
 
 (13) Exchange
 Input [3]: [ws_bill_customer_sk#3, ws_sales_price#4, i_item_id#9]
-Arguments: hashpartitioning(ws_bill_customer_sk#3, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ws_bill_customer_sk#3 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (14) Sort [codegen id : 4]
 Input [3]: [ws_bill_customer_sk#3, ws_sales_price#4, i_item_id#9]
@@ -123,7 +123,7 @@ Condition : (isnotnull(c_customer_sk#10) AND isnotnull(c_current_addr_sk#11))
 
 (18) Exchange
 Input [2]: [c_customer_sk#10, c_current_addr_sk#11]
-Arguments: hashpartitioning(c_current_addr_sk#11, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(c_current_addr_sk#11 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (19) Sort [codegen id : 6]
 Input [2]: [c_customer_sk#10, c_current_addr_sk#11]
@@ -145,7 +145,7 @@ Condition : isnotnull(ca_address_sk#12)
 
 (23) Exchange
 Input [3]: [ca_address_sk#12, ca_city#13, ca_zip#14]
-Arguments: hashpartitioning(ca_address_sk#12, 5), ENSURE_REQUIREMENTS, [plan_id=4]
+Arguments: rangepartitioning(ca_address_sk#12 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=4]
 
 (24) Sort [codegen id : 8]
 Input [3]: [ca_address_sk#12, ca_city#13, ca_zip#14]
@@ -163,7 +163,7 @@ Input [5]: [c_customer_sk#10, c_current_addr_sk#11, ca_address_sk#12, ca_city#13
 
 (27) Exchange
 Input [3]: [c_customer_sk#10, ca_city#13, ca_zip#14]
-Arguments: hashpartitioning(c_customer_sk#10, 5), ENSURE_REQUIREMENTS, [plan_id=5]
+Arguments: rangepartitioning(c_customer_sk#10 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=5]
 
 (28) Sort [codegen id : 10]
 Input [3]: [c_customer_sk#10, ca_city#13, ca_zip#14]

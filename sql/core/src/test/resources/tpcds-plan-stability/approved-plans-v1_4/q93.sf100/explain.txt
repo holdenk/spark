@@ -77,7 +77,7 @@ Input [5]: [sr_item_sk#1, sr_reason_sk#2, sr_ticket_number#3, sr_return_quantity
 
 (12) Exchange
 Input [3]: [sr_item_sk#1, sr_ticket_number#3, sr_return_quantity#4]
-Arguments: hashpartitioning(sr_item_sk#1, sr_ticket_number#3, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(sr_item_sk#1 ASC NULLS FIRST, sr_ticket_number#3 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (13) Sort [codegen id : 3]
 Input [3]: [sr_item_sk#1, sr_ticket_number#3, sr_return_quantity#4]
@@ -98,7 +98,7 @@ Input [6]: [ss_item_sk#8, ss_customer_sk#9, ss_ticket_number#10, ss_quantity#11,
 
 (17) Exchange
 Input [5]: [ss_item_sk#8, ss_customer_sk#9, ss_ticket_number#10, ss_quantity#11, ss_sales_price#12]
-Arguments: hashpartitioning(ss_item_sk#8, ss_ticket_number#10, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(ss_item_sk#8 ASC NULLS FIRST, ss_ticket_number#10 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (18) Sort [codegen id : 5]
 Input [5]: [ss_item_sk#8, ss_customer_sk#9, ss_ticket_number#10, ss_quantity#11, ss_sales_price#12]

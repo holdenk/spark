@@ -111,7 +111,7 @@ Input [8]: [ss_item_sk#1, ss_store_sk#2, ss_sales_price#3, d_year#7, d_moy#8, s_
 
 (13) Exchange
 Input [6]: [ss_item_sk#1, ss_sales_price#3, d_year#7, d_moy#8, s_store_name#10, s_company_name#11]
-Arguments: hashpartitioning(ss_item_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ss_item_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (14) Sort [codegen id : 4]
 Input [6]: [ss_item_sk#1, ss_sales_price#3, d_year#7, d_moy#8, s_store_name#10, s_company_name#11]
@@ -133,7 +133,7 @@ Condition : ((isnotnull(i_item_sk#12) AND isnotnull(i_category#14)) AND isnotnul
 
 (18) Exchange
 Input [3]: [i_item_sk#12, i_brand#13, i_category#14]
-Arguments: hashpartitioning(i_item_sk#12, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(i_item_sk#12 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (19) Sort [codegen id : 6]
 Input [3]: [i_item_sk#12, i_brand#13, i_category#14]
@@ -197,7 +197,7 @@ Input [10]: [i_category#14, i_brand#13, s_store_name#10, s_company_name#11, d_ye
 
 (32) Exchange
 Input [9]: [i_category#14, i_brand#13, s_store_name#10, s_company_name#11, d_year#7, d_moy#8, sum_sales#18, avg_monthly_sales#21, rn#20]
-Arguments: hashpartitioning(i_category#14, i_brand#13, s_store_name#10, s_company_name#11, rn#20, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(i_category#14 ASC NULLS FIRST, i_brand#13 ASC NULLS FIRST, s_store_name#10 ASC NULLS FIRST, s_company_name#11 ASC NULLS FIRST, rn#20 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (33) Sort [codegen id : 12]
 Input [9]: [i_category#14, i_brand#13, s_store_name#10, s_company_name#11, d_year#7, d_moy#8, sum_sales#18, avg_monthly_sales#21, rn#20]
@@ -231,7 +231,7 @@ Input [8]: [i_category#22, i_brand#23, s_store_name#24, s_company_name#25, d_yea
 
 (40) Exchange
 Input [6]: [i_category#22, i_brand#23, s_store_name#24, s_company_name#25, sum_sales#30, rn#31]
-Arguments: hashpartitioning(i_category#22, i_brand#23, s_store_name#24, s_company_name#25, (rn#31 + 1), 5), ENSURE_REQUIREMENTS, [plan_id=8]
+Arguments: rangepartitioning(i_category#22 ASC NULLS FIRST, i_brand#23 ASC NULLS FIRST, s_store_name#24 ASC NULLS FIRST, s_company_name#25 ASC NULLS FIRST, (rn#31 + 1) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=8]
 
 (41) Sort [codegen id : 23]
 Input [6]: [i_category#22, i_brand#23, s_store_name#24, s_company_name#25, sum_sales#30, rn#31]
@@ -264,7 +264,7 @@ Input [8]: [i_category#32, i_brand#33, s_store_name#34, s_company_name#35, d_yea
 
 (48) Exchange
 Input [6]: [i_category#32, i_brand#33, s_store_name#34, s_company_name#35, sum_sales#38, rn#39]
-Arguments: hashpartitioning(i_category#32, i_brand#33, s_store_name#34, s_company_name#35, (rn#39 - 1), 5), ENSURE_REQUIREMENTS, [plan_id=9]
+Arguments: rangepartitioning(i_category#32 ASC NULLS FIRST, i_brand#33 ASC NULLS FIRST, s_store_name#34 ASC NULLS FIRST, s_company_name#35 ASC NULLS FIRST, (rn#39 - 1) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=9]
 
 (49) Sort [codegen id : 35]
 Input [6]: [i_category#32, i_brand#33, s_store_name#34, s_company_name#35, sum_sales#38, rn#39]

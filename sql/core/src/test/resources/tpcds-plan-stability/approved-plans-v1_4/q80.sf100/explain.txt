@@ -125,7 +125,7 @@ Condition : ((((isnotnull(ss_store_sk#2) AND isnotnull(ss_item_sk#1)) AND isnotn
 
 (4) Exchange
 Input [7]: [ss_item_sk#1, ss_store_sk#2, ss_promo_sk#3, ss_ticket_number#4, ss_ext_sales_price#5, ss_net_profit#6, ss_sold_date_sk#7]
-Arguments: hashpartitioning(ss_item_sk#1, ss_ticket_number#4, 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(ss_item_sk#1 ASC NULLS FIRST, ss_ticket_number#4 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (5) Sort [codegen id : 2]
 Input [7]: [ss_item_sk#1, ss_store_sk#2, ss_promo_sk#3, ss_ticket_number#4, ss_ext_sales_price#5, ss_net_profit#6, ss_sold_date_sk#7]
@@ -151,7 +151,7 @@ Input [5]: [sr_item_sk#13, sr_ticket_number#14, sr_return_amt#15, sr_net_loss#16
 
 (10) Exchange
 Input [4]: [sr_item_sk#13, sr_ticket_number#14, sr_return_amt#15, sr_net_loss#16]
-Arguments: hashpartitioning(sr_item_sk#13, sr_ticket_number#14, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(sr_item_sk#13 ASC NULLS FIRST, sr_ticket_number#14 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (11) Sort [codegen id : 4]
 Input [4]: [sr_item_sk#13, sr_ticket_number#14, sr_return_amt#15, sr_net_loss#16]
@@ -307,7 +307,7 @@ Condition : ((((isnotnull(cs_catalog_page_sk#43) AND isnotnull(cs_item_sk#44)) A
 
 (43) Exchange
 Input [7]: [cs_catalog_page_sk#43, cs_item_sk#44, cs_promo_sk#45, cs_order_number#46, cs_ext_sales_price#47, cs_net_profit#48, cs_sold_date_sk#49]
-Arguments: hashpartitioning(cs_item_sk#44, cs_order_number#46, 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(cs_item_sk#44 ASC NULLS FIRST, cs_order_number#46 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (44) Sort [codegen id : 12]
 Input [7]: [cs_catalog_page_sk#43, cs_item_sk#44, cs_promo_sk#45, cs_order_number#46, cs_ext_sales_price#47, cs_net_profit#48, cs_sold_date_sk#49]
@@ -333,7 +333,7 @@ Input [5]: [cr_item_sk#50, cr_order_number#51, cr_return_amount#52, cr_net_loss#
 
 (49) Exchange
 Input [4]: [cr_item_sk#50, cr_order_number#51, cr_return_amount#52, cr_net_loss#53]
-Arguments: hashpartitioning(cr_item_sk#50, cr_order_number#51, 5), ENSURE_REQUIREMENTS, [plan_id=8]
+Arguments: rangepartitioning(cr_item_sk#50 ASC NULLS FIRST, cr_order_number#51 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=8]
 
 (50) Sort [codegen id : 14]
 Input [4]: [cr_item_sk#50, cr_order_number#51, cr_return_amount#52, cr_net_loss#53]
@@ -451,7 +451,7 @@ Condition : ((((isnotnull(ws_web_site_sk#79) AND isnotnull(ws_item_sk#78)) AND i
 
 (74) Exchange
 Input [7]: [ws_item_sk#78, ws_web_site_sk#79, ws_promo_sk#80, ws_order_number#81, ws_ext_sales_price#82, ws_net_profit#83, ws_sold_date_sk#84]
-Arguments: hashpartitioning(ws_item_sk#78, ws_order_number#81, 5), ENSURE_REQUIREMENTS, [plan_id=11]
+Arguments: rangepartitioning(ws_item_sk#78 ASC NULLS FIRST, ws_order_number#81 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=11]
 
 (75) Sort [codegen id : 22]
 Input [7]: [ws_item_sk#78, ws_web_site_sk#79, ws_promo_sk#80, ws_order_number#81, ws_ext_sales_price#82, ws_net_profit#83, ws_sold_date_sk#84]
@@ -477,7 +477,7 @@ Input [5]: [wr_item_sk#85, wr_order_number#86, wr_return_amt#87, wr_net_loss#88,
 
 (80) Exchange
 Input [4]: [wr_item_sk#85, wr_order_number#86, wr_return_amt#87, wr_net_loss#88]
-Arguments: hashpartitioning(wr_item_sk#85, wr_order_number#86, 5), ENSURE_REQUIREMENTS, [plan_id=12]
+Arguments: rangepartitioning(wr_item_sk#85 ASC NULLS FIRST, wr_order_number#86 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=12]
 
 (81) Sort [codegen id : 24]
 Input [4]: [wr_item_sk#85, wr_order_number#86, wr_return_amt#87, wr_net_loss#88]

@@ -132,7 +132,7 @@ Input [9]: [ss_item_sk#1, ss_store_sk#2, ss_quantity#3, ss_sales_price#4, d_year
 
 (13) Exchange
 Input [7]: [ss_item_sk#1, ss_quantity#3, ss_sales_price#4, d_year#8, d_moy#9, d_qoy#10, s_store_id#12]
-Arguments: hashpartitioning(ss_item_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ss_item_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (14) Sort [codegen id : 4]
 Input [7]: [ss_item_sk#1, ss_quantity#3, ss_sales_price#4, d_year#8, d_moy#9, d_qoy#10, s_store_id#12]
@@ -154,7 +154,7 @@ Condition : isnotnull(i_item_sk#13)
 
 (18) Exchange
 Input [5]: [i_item_sk#13, i_brand#14, i_class#15, i_category#16, i_product_name#17]
-Arguments: hashpartitioning(i_item_sk#13, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(i_item_sk#13 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (19) Sort [codegen id : 6]
 Input [5]: [i_item_sk#13, i_brand#14, i_class#15, i_category#16, i_product_name#17]

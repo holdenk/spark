@@ -70,7 +70,7 @@ Condition : (isnotnull(c_current_addr_sk#5) AND isnotnull(c_current_cdemo_sk#4))
 
 (4) Exchange
 Input [3]: [c_customer_sk#3, c_current_cdemo_sk#4, c_current_addr_sk#5]
-Arguments: hashpartitioning(c_customer_sk#3, 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(c_customer_sk#3 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (5) Sort [codegen id : 2]
 Input [3]: [c_customer_sk#3, c_current_cdemo_sk#4, c_current_addr_sk#5]
@@ -101,7 +101,7 @@ Input [3]: [ss_customer_sk#6, ss_sold_date_sk#7, d_date_sk#9]
 
 (11) Exchange
 Input [1]: [ss_customer_sk#6]
-Arguments: hashpartitioning(ss_customer_sk#6, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ss_customer_sk#6 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (12) Sort [codegen id : 5]
 Input [1]: [ss_customer_sk#6]
@@ -138,7 +138,7 @@ Input [3]: [ws_bill_customer_sk#10, ws_sold_date_sk#11, d_date_sk#12]
 
 (19) Exchange
 Input [1]: [ws_bill_customer_sk#10]
-Arguments: hashpartitioning(ws_bill_customer_sk#10, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(ws_bill_customer_sk#10 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (20) Sort [codegen id : 9]
 Input [1]: [ws_bill_customer_sk#10]
@@ -175,7 +175,7 @@ Input [3]: [cs_ship_customer_sk#13, cs_sold_date_sk#14, d_date_sk#15]
 
 (27) Exchange
 Input [1]: [cs_ship_customer_sk#13]
-Arguments: hashpartitioning(cs_ship_customer_sk#13, 5), ENSURE_REQUIREMENTS, [plan_id=4]
+Arguments: rangepartitioning(cs_ship_customer_sk#13 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=4]
 
 (28) Sort [codegen id : 13]
 Input [1]: [cs_ship_customer_sk#13]
@@ -197,7 +197,7 @@ Input [5]: [c_customer_sk#3, c_current_cdemo_sk#4, c_current_addr_sk#5, exists#2
 
 (32) Exchange
 Input [2]: [c_current_cdemo_sk#4, c_current_addr_sk#5]
-Arguments: hashpartitioning(c_current_addr_sk#5, 5), ENSURE_REQUIREMENTS, [plan_id=5]
+Arguments: rangepartitioning(c_current_addr_sk#5 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=5]
 
 (33) Sort [codegen id : 15]
 Input [2]: [c_current_cdemo_sk#4, c_current_addr_sk#5]
@@ -219,7 +219,7 @@ Condition : isnotnull(ca_address_sk#16)
 
 (37) Exchange
 Input [2]: [ca_address_sk#16, ca_state#17]
-Arguments: hashpartitioning(ca_address_sk#16, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(ca_address_sk#16 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (38) Sort [codegen id : 17]
 Input [2]: [ca_address_sk#16, ca_state#17]
@@ -237,7 +237,7 @@ Input [4]: [c_current_cdemo_sk#4, c_current_addr_sk#5, ca_address_sk#16, ca_stat
 
 (41) Exchange
 Input [2]: [c_current_cdemo_sk#4, ca_state#17]
-Arguments: hashpartitioning(c_current_cdemo_sk#4, 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(c_current_cdemo_sk#4 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (42) Sort [codegen id : 19]
 Input [2]: [c_current_cdemo_sk#4, ca_state#17]
@@ -259,7 +259,7 @@ Condition : isnotnull(cd_demo_sk#18)
 
 (46) Exchange
 Input [6]: [cd_demo_sk#18, cd_gender#19, cd_marital_status#20, cd_dep_count#21, cd_dep_employed_count#22, cd_dep_college_count#23]
-Arguments: hashpartitioning(cd_demo_sk#18, 5), ENSURE_REQUIREMENTS, [plan_id=8]
+Arguments: rangepartitioning(cd_demo_sk#18 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=8]
 
 (47) Sort [codegen id : 21]
 Input [6]: [cd_demo_sk#18, cd_gender#19, cd_marital_status#20, cd_dep_count#21, cd_dep_employed_count#22, cd_dep_college_count#23]

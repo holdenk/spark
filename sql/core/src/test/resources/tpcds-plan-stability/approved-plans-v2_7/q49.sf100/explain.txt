@@ -121,7 +121,7 @@ Input [6]: [ws_item_sk#1, ws_order_number#2, ws_quantity#3, ws_net_paid#4, ws_so
 
 (8) Exchange
 Input [4]: [ws_item_sk#1, ws_order_number#2, ws_quantity#3, ws_net_paid#4]
-Arguments: hashpartitioning(ws_order_number#2, ws_item_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(ws_order_number#2 ASC NULLS FIRST, ws_item_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (9) Sort [codegen id : 3]
 Input [4]: [ws_item_sk#1, ws_order_number#2, ws_quantity#3, ws_net_paid#4]
@@ -147,7 +147,7 @@ Input [5]: [wr_item_sk#9, wr_order_number#10, wr_return_quantity#11, wr_return_a
 
 (14) Exchange
 Input [4]: [wr_item_sk#9, wr_order_number#10, wr_return_quantity#11, wr_return_amt#12]
-Arguments: hashpartitioning(wr_order_number#10, wr_item_sk#9, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(wr_order_number#10 ASC NULLS FIRST, wr_item_sk#9 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (15) Sort [codegen id : 5]
 Input [4]: [wr_item_sk#9, wr_order_number#10, wr_return_quantity#11, wr_return_amt#12]
@@ -243,7 +243,7 @@ Input [6]: [cs_item_sk#36, cs_order_number#37, cs_quantity#38, cs_net_paid#39, c
 
 (35) Exchange
 Input [4]: [cs_item_sk#36, cs_order_number#37, cs_quantity#38, cs_net_paid#39]
-Arguments: hashpartitioning(cs_order_number#37, cs_item_sk#36, 5), ENSURE_REQUIREMENTS, [plan_id=5]
+Arguments: rangepartitioning(cs_order_number#37 ASC NULLS FIRST, cs_item_sk#36 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=5]
 
 (36) Sort [codegen id : 13]
 Input [4]: [cs_item_sk#36, cs_order_number#37, cs_quantity#38, cs_net_paid#39]
@@ -269,7 +269,7 @@ Input [5]: [cr_item_sk#43, cr_order_number#44, cr_return_quantity#45, cr_return_
 
 (41) Exchange
 Input [4]: [cr_item_sk#43, cr_order_number#44, cr_return_quantity#45, cr_return_amount#46]
-Arguments: hashpartitioning(cr_order_number#44, cr_item_sk#43, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(cr_order_number#44 ASC NULLS FIRST, cr_item_sk#43 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (42) Sort [codegen id : 15]
 Input [4]: [cr_item_sk#43, cr_order_number#44, cr_return_quantity#45, cr_return_amount#46]
@@ -365,7 +365,7 @@ Input [6]: [ss_item_sk#70, ss_ticket_number#71, ss_quantity#72, ss_net_paid#73, 
 
 (62) Exchange
 Input [4]: [ss_item_sk#70, ss_ticket_number#71, ss_quantity#72, ss_net_paid#73]
-Arguments: hashpartitioning(ss_ticket_number#71, ss_item_sk#70, 5), ENSURE_REQUIREMENTS, [plan_id=9]
+Arguments: rangepartitioning(ss_ticket_number#71 ASC NULLS FIRST, ss_item_sk#70 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=9]
 
 (63) Sort [codegen id : 23]
 Input [4]: [ss_item_sk#70, ss_ticket_number#71, ss_quantity#72, ss_net_paid#73]
@@ -391,7 +391,7 @@ Input [5]: [sr_item_sk#77, sr_ticket_number#78, sr_return_quantity#79, sr_return
 
 (68) Exchange
 Input [4]: [sr_item_sk#77, sr_ticket_number#78, sr_return_quantity#79, sr_return_amt#80]
-Arguments: hashpartitioning(sr_ticket_number#78, sr_item_sk#77, 5), ENSURE_REQUIREMENTS, [plan_id=10]
+Arguments: rangepartitioning(sr_ticket_number#78 ASC NULLS FIRST, sr_item_sk#77 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=10]
 
 (69) Sort [codegen id : 25]
 Input [4]: [sr_item_sk#77, sr_ticket_number#78, sr_return_quantity#79, sr_return_amt#80]

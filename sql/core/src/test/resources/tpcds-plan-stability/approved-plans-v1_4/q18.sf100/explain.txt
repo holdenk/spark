@@ -140,7 +140,7 @@ Input [10]: [cs_bill_customer_sk#1, cs_item_sk#3, cs_quantity#4, cs_list_price#5
 
 (20) Exchange
 Input [8]: [cs_bill_customer_sk#1, cs_quantity#4, cs_list_price#5, cs_sales_price#6, cs_coupon_amt#7, cs_net_profit#8, cd_dep_count#14, i_item_id#17]
-Arguments: hashpartitioning(cs_bill_customer_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(cs_bill_customer_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (21) Sort [codegen id : 5]
 Input [8]: [cs_bill_customer_sk#1, cs_quantity#4, cs_list_price#5, cs_sales_price#6, cs_coupon_amt#7, cs_net_profit#8, cd_dep_count#14, i_item_id#17]
@@ -194,7 +194,7 @@ Input [8]: [c_customer_sk#18, c_current_cdemo_sk#19, c_current_addr_sk#20, c_bir
 
 (32) Exchange
 Input [6]: [c_customer_sk#18, c_current_cdemo_sk#19, c_birth_year#22, ca_county#24, ca_state#25, ca_country#26]
-Arguments: hashpartitioning(c_current_cdemo_sk#19, 5), ENSURE_REQUIREMENTS, [plan_id=5]
+Arguments: rangepartitioning(c_current_cdemo_sk#19 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=5]
 
 (33) Sort [codegen id : 8]
 Input [6]: [c_customer_sk#18, c_current_cdemo_sk#19, c_birth_year#22, ca_county#24, ca_state#25, ca_country#26]
@@ -216,7 +216,7 @@ Condition : isnotnull(cd_demo_sk#27)
 
 (37) Exchange
 Input [1]: [cd_demo_sk#27]
-Arguments: hashpartitioning(cd_demo_sk#27, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(cd_demo_sk#27 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (38) Sort [codegen id : 10]
 Input [1]: [cd_demo_sk#27]
@@ -234,7 +234,7 @@ Input [7]: [c_customer_sk#18, c_current_cdemo_sk#19, c_birth_year#22, ca_county#
 
 (41) Exchange
 Input [5]: [c_customer_sk#18, c_birth_year#22, ca_county#24, ca_state#25, ca_country#26]
-Arguments: hashpartitioning(c_customer_sk#18, 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(c_customer_sk#18 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (42) Sort [codegen id : 12]
 Input [5]: [c_customer_sk#18, c_birth_year#22, ca_county#24, ca_state#25, ca_country#26]

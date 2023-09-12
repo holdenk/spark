@@ -108,7 +108,7 @@ Input [5]: [ss_store_sk#1, ss_net_profit#2, s_store_sk#6, s_store_name#7, s_zip#
 
 (13) Exchange
 Input [3]: [ss_net_profit#2, s_store_name#7, s_zip#8]
-Arguments: hashpartitioning(substr(s_zip#8, 1, 2), 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(substr(s_zip#8, 1, 2) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (14) Sort [codegen id : 4]
 Input [3]: [ss_net_profit#2, s_store_name#7, s_zip#8]
@@ -147,7 +147,7 @@ Condition : isnotnull(ca_address_sk#11)
 
 (22) Exchange
 Input [2]: [ca_address_sk#11, ca_zip#12]
-Arguments: hashpartitioning(ca_address_sk#11, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(ca_address_sk#11 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (23) Sort [codegen id : 6]
 Input [2]: [ca_address_sk#11, ca_zip#12]
@@ -173,7 +173,7 @@ Input [2]: [c_current_addr_sk#13, c_preferred_cust_flag#14]
 
 (28) Exchange
 Input [1]: [c_current_addr_sk#13]
-Arguments: hashpartitioning(c_current_addr_sk#13, 5), ENSURE_REQUIREMENTS, [plan_id=4]
+Arguments: rangepartitioning(c_current_addr_sk#13 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=4]
 
 (29) Sort [codegen id : 8]
 Input [1]: [c_current_addr_sk#13]
@@ -245,7 +245,7 @@ Results [1]: [ca_zip#10]
 
 (42) Exchange
 Input [1]: [ca_zip#10]
-Arguments: hashpartitioning(substr(ca_zip#10, 1, 2), 5), ENSURE_REQUIREMENTS, [plan_id=8]
+Arguments: rangepartitioning(substr(ca_zip#10, 1, 2) ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=8]
 
 (43) Sort [codegen id : 13]
 Input [1]: [ca_zip#10]

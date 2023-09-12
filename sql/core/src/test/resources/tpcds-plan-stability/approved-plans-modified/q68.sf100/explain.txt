@@ -214,7 +214,7 @@ Input [10]: [ss_ticket_number#5, ss_customer_sk#1, bought_city#28, extended_pric
 
 (36) Exchange
 Input [8]: [ss_ticket_number#5, bought_city#28, extended_price#29, list_price#30, extended_tax#31, c_current_addr_sk#33, c_first_name#34, c_last_name#35]
-Arguments: hashpartitioning(c_current_addr_sk#33, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(c_current_addr_sk#33 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (37) Sort [codegen id : 8]
 Input [8]: [ss_ticket_number#5, bought_city#28, extended_price#29, list_price#30, extended_tax#31, c_current_addr_sk#33, c_first_name#34, c_last_name#35]
@@ -236,7 +236,7 @@ Condition : (isnotnull(ca_address_sk#36) AND isnotnull(ca_city#37))
 
 (41) Exchange
 Input [2]: [ca_address_sk#36, ca_city#37]
-Arguments: hashpartitioning(ca_address_sk#36, 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(ca_address_sk#36 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (42) Sort [codegen id : 10]
 Input [2]: [ca_address_sk#36, ca_city#37]

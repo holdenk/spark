@@ -66,7 +66,7 @@ Input [8]: [cs_ship_date_sk#1, cs_ship_addr_sk#2, cs_call_center_sk#3, cs_wareho
 
 (5) Exchange
 Input [7]: [cs_ship_date_sk#1, cs_ship_addr_sk#2, cs_call_center_sk#3, cs_warehouse_sk#4, cs_order_number#5, cs_ext_ship_cost#6, cs_net_profit#7]
-Arguments: hashpartitioning(cs_order_number#5, 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(cs_order_number#5 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (6) Sort [codegen id : 2]
 Input [7]: [cs_ship_date_sk#1, cs_ship_addr_sk#2, cs_call_center_sk#3, cs_warehouse_sk#4, cs_order_number#5, cs_ext_ship_cost#6, cs_net_profit#7]
@@ -87,7 +87,7 @@ Input [3]: [cs_warehouse_sk#9, cs_order_number#10, cs_sold_date_sk#11]
 
 (10) Exchange
 Input [2]: [cs_warehouse_sk#9, cs_order_number#10]
-Arguments: hashpartitioning(cs_order_number#10, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(cs_order_number#10 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (11) Sort [codegen id : 4]
 Input [2]: [cs_warehouse_sk#9, cs_order_number#10]
@@ -118,7 +118,7 @@ Input [2]: [cr_order_number#12, cr_returned_date_sk#13]
 
 (17) Exchange
 Input [1]: [cr_order_number#12]
-Arguments: hashpartitioning(cr_order_number#12, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(cr_order_number#12 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (18) Sort [codegen id : 7]
 Input [1]: [cr_order_number#12]

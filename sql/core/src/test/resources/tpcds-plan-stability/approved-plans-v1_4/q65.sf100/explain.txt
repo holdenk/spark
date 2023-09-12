@@ -205,7 +205,7 @@ Input [5]: [ss_store_sk#2, ss_item_sk#1, revenue#10, s_store_sk#26, s_store_name
 
 (33) Exchange
 Input [3]: [ss_item_sk#1, revenue#10, s_store_name#27]
-Arguments: hashpartitioning(ss_item_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(ss_item_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (34) Sort [codegen id : 9]
 Input [3]: [ss_item_sk#1, revenue#10, s_store_name#27]
@@ -227,7 +227,7 @@ Condition : isnotnull(i_item_sk#28)
 
 (38) Exchange
 Input [5]: [i_item_sk#28, i_item_desc#29, i_current_price#30, i_wholesale_cost#31, i_brand#32]
-Arguments: hashpartitioning(i_item_sk#28, 5), ENSURE_REQUIREMENTS, [plan_id=7]
+Arguments: rangepartitioning(i_item_sk#28 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=7]
 
 (39) Sort [codegen id : 11]
 Input [5]: [i_item_sk#28, i_item_desc#29, i_current_price#30, i_wholesale_cost#31, i_brand#32]

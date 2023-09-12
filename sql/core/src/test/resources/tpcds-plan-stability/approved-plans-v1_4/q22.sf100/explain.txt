@@ -85,7 +85,7 @@ Input [4]: [inv_item_sk#1, inv_quantity_on_hand#3, inv_date_sk#4, d_date_sk#7]
 
 (13) Exchange
 Input [2]: [inv_item_sk#1, inv_quantity_on_hand#3]
-Arguments: hashpartitioning(inv_item_sk#1, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(inv_item_sk#1 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (14) Sort [codegen id : 4]
 Input [2]: [inv_item_sk#1, inv_quantity_on_hand#3]
@@ -107,7 +107,7 @@ Condition : isnotnull(i_item_sk#8)
 
 (18) Exchange
 Input [5]: [i_item_sk#8, i_brand#9, i_class#10, i_category#11, i_product_name#12]
-Arguments: hashpartitioning(i_item_sk#8, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(i_item_sk#8 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (19) Sort [codegen id : 6]
 Input [5]: [i_item_sk#8, i_brand#9, i_class#10, i_category#11, i_product_name#12]

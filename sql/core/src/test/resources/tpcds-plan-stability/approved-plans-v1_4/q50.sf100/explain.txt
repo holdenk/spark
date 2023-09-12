@@ -62,7 +62,7 @@ Input [5]: [sr_item_sk#1, sr_customer_sk#2, sr_ticket_number#3, sr_returned_date
 
 (7) Exchange
 Input [4]: [sr_item_sk#1, sr_customer_sk#2, sr_ticket_number#3, sr_returned_date_sk#4]
-Arguments: hashpartitioning(sr_ticket_number#3, sr_item_sk#1, sr_customer_sk#2, 5), ENSURE_REQUIREMENTS, [plan_id=1]
+Arguments: rangepartitioning(sr_ticket_number#3 ASC NULLS FIRST, sr_item_sk#1 ASC NULLS FIRST, sr_customer_sk#2 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=1]
 
 (8) Sort [codegen id : 3]
 Input [4]: [sr_item_sk#1, sr_customer_sk#2, sr_ticket_number#3, sr_returned_date_sk#4]
@@ -85,7 +85,7 @@ Condition : (((isnotnull(ss_ticket_number#10) AND isnotnull(ss_item_sk#7)) AND i
 
 (12) Exchange
 Input [5]: [ss_item_sk#7, ss_customer_sk#8, ss_store_sk#9, ss_ticket_number#10, ss_sold_date_sk#11]
-Arguments: hashpartitioning(ss_ticket_number#10, ss_item_sk#7, ss_customer_sk#8, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ss_ticket_number#10 ASC NULLS FIRST, ss_item_sk#7 ASC NULLS FIRST, ss_customer_sk#8 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (13) Sort [codegen id : 5]
 Input [5]: [ss_item_sk#7, ss_customer_sk#8, ss_store_sk#9, ss_ticket_number#10, ss_sold_date_sk#11]

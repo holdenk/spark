@@ -100,7 +100,7 @@ Input [8]: [ws_item_sk#1, ws_web_page_sk#2, ws_order_number#3, ws_quantity#4, ws
 
 (10) Exchange
 Input [6]: [ws_item_sk#1, ws_order_number#3, ws_quantity#4, ws_sales_price#5, ws_net_profit#6, ws_sold_date_sk#7]
-Arguments: hashpartitioning(ws_item_sk#1, ws_order_number#3, 5), ENSURE_REQUIREMENTS, [plan_id=2]
+Arguments: rangepartitioning(ws_item_sk#1 ASC NULLS FIRST, ws_order_number#3 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=2]
 
 (11) Sort [codegen id : 3]
 Input [6]: [ws_item_sk#1, ws_order_number#3, ws_quantity#4, ws_sales_price#5, ws_net_profit#6, ws_sold_date_sk#7]
@@ -126,7 +126,7 @@ Input [9]: [wr_item_sk#10, wr_refunded_cdemo_sk#11, wr_refunded_addr_sk#12, wr_r
 
 (16) Exchange
 Input [8]: [wr_item_sk#10, wr_refunded_cdemo_sk#11, wr_refunded_addr_sk#12, wr_returning_cdemo_sk#13, wr_reason_sk#14, wr_order_number#15, wr_fee#16, wr_refunded_cash#17]
-Arguments: hashpartitioning(wr_item_sk#10, wr_order_number#15, 5), ENSURE_REQUIREMENTS, [plan_id=3]
+Arguments: rangepartitioning(wr_item_sk#10 ASC NULLS FIRST, wr_order_number#15 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=3]
 
 (17) Sort [codegen id : 5]
 Input [8]: [wr_item_sk#10, wr_refunded_cdemo_sk#11, wr_refunded_addr_sk#12, wr_returning_cdemo_sk#13, wr_reason_sk#14, wr_order_number#15, wr_fee#16, wr_refunded_cash#17]
@@ -172,7 +172,7 @@ Input [13]: [ws_quantity#4, ws_sales_price#5, ws_net_profit#6, ws_sold_date_sk#7
 
 (26) Exchange
 Input [10]: [ws_quantity#4, ws_net_profit#6, ws_sold_date_sk#7, wr_refunded_addr_sk#12, wr_returning_cdemo_sk#13, wr_reason_sk#14, wr_fee#16, wr_refunded_cash#17, cd_marital_status#24, cd_education_status#25]
-Arguments: hashpartitioning(wr_returning_cdemo_sk#13, cd_marital_status#24, cd_education_status#25, 5), ENSURE_REQUIREMENTS, [plan_id=5]
+Arguments: rangepartitioning(wr_returning_cdemo_sk#13 ASC NULLS FIRST, cd_marital_status#24 ASC NULLS FIRST, cd_education_status#25 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=5]
 
 (27) Sort [codegen id : 8]
 Input [10]: [ws_quantity#4, ws_net_profit#6, ws_sold_date_sk#7, wr_refunded_addr_sk#12, wr_returning_cdemo_sk#13, wr_reason_sk#14, wr_fee#16, wr_refunded_cash#17, cd_marital_status#24, cd_education_status#25]
@@ -194,7 +194,7 @@ Condition : ((isnotnull(cd_demo_sk#26) AND isnotnull(cd_marital_status#27)) AND 
 
 (31) Exchange
 Input [3]: [cd_demo_sk#26, cd_marital_status#27, cd_education_status#28]
-Arguments: hashpartitioning(cd_demo_sk#26, cd_marital_status#27, cd_education_status#28, 5), ENSURE_REQUIREMENTS, [plan_id=6]
+Arguments: rangepartitioning(cd_demo_sk#26 ASC NULLS FIRST, cd_marital_status#27 ASC NULLS FIRST, cd_education_status#28 ASC NULLS FIRST, 5), ENSURE_REQUIREMENTS, [plan_id=6]
 
 (32) Sort [codegen id : 10]
 Input [3]: [cd_demo_sk#26, cd_marital_status#27, cd_education_status#28]
