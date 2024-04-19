@@ -83,15 +83,13 @@ object V2ScanRelationPushDown extends Rule[LogicalPlan] with PredicateHelper {
         sHolder.pushedPredicates.mkString(", ")
       }
 
-      val (postScanFilters, advisoryFilters) = (postScanFiltersWithoutSubquery ++
-        normalizedFiltersWithSubquery).patition(_.advisory)
+      val postScanFilters = postScanFiltersWithoutSubquery ++ normalizedFiltersWithSubquery
 
       logInfo(
         s"""
            |Pushing operators to ${sHolder.relation.name}
            |Pushed Filters: $pushedFiltersStr
            |Post-Scan Filters: ${postScanFilters.mkString(",")}
-           |Advisory Filters (skipped): ${advisoryFilters}
          """.stripMargin)
 
       val filterCondition = postScanFilters.reduceLeftOption(And)
