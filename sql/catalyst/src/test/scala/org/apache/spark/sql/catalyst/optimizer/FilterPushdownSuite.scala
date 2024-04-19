@@ -168,6 +168,22 @@ class FilterPushdownSuite extends PlanTest {
     comparePlans(optimized, correctAnswer)
   }
 
+  test("SPARK-47672: Always push predicates that the base relation can handle") {
+    val originalQuery = testStringRelation
+      .select($"a", $"e".rlike("magic") as "f", $"b" + $"a")
+      .where($"a" > 5 && $"f")
+      .analyze
+
+    val optimized = Optimize.execute(originalQuery)
+
+    val correctAnswer = testStringRelation
+      .where($"a" > 5 && $"f")
+      .select($"a", $"e".rlike("magic") as "f", $"b" + $"a")
+      .analyze
+
+    comparePlans(optimized, correctAnswer)
+  }
+
   test("SPARK-47672: Avoid double evaluation with projections but push components that can be") {
     val originalQuery = testStringRelation
       .select($"a", $"e".rlike("magic") as "f", $"e".rlike("notmagic") as "j", $"b")

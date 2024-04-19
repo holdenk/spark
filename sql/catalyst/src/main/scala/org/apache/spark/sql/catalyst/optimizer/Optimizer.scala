@@ -1806,23 +1806,34 @@ object PushPredicateThroughNonJoin extends Rule[LogicalPlan] with PredicateHelpe
         // If there are no left behind aliases then we've used all of the aliases in our filter.
         // We can try and split on the &&s and see if we can push individual components
         // that do not use any of the aliases.
-        val (pushDown, stayUp) = splitConjunctivePredicates(condition).partition { cond =>
+        // Components which do use components will be pushed as advisory (optional) & left up
+        // post projection for final evaluation.
+        val (pushDown, advisory) = splitConjunctivePredicates(condition).partition { cond =>
           val replaced = replaceAlias(cond, aliasMap)
           if (cond == replaced) {
             // If nothing changes this element can safely be pushed past the projection since
             // it does not depend on any alias introduced by the projection.
             true
           } else {
+            // Alternatively if something is changed we _might_ still want to push the filter
+            // if the table could evaluate the filter.
             false
           }
         }
         if (!pushDown.isEmpty) {
           val childCondition = replaceAlias(pushDown.reduce(And), aliasMap)
-          if (!stayUp.isEmpty) {
-            Filter(stayUp.reduce(And), project.copy(child = Filter(childCondition, grandChild)))
+          if (!advisory.isEmpty) {
+            val advisoryCondition = replaceAlias(advisory.reduce(And), aliasMap)
+            Filter(advisory.reduce(And), project.copy(child =
+              Filter(childCondition,
+                new AdvisoryFilter(advisoryCondition, grandChild))))
           } else {
             project.copy(child = Filter(childCondition, grandChild))
           }
+        } else if (!advisory.isEmpty) {
+          val advisoryCondition = replaceAlias(advisory.reduce(And), aliasMap)
+          Filter(advisoryCondition,
+            project.copy(child = new AdvisoryFilter(advisoryCondition, grandChild)))
         } else {
           f
         }
