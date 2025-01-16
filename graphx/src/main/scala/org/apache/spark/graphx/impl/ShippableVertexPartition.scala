@@ -24,6 +24,7 @@ import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
 import org.apache.spark.util.collection.{BitSet, PrimitiveVector}
 
 /** Stores vertex attributes to ship to an edge partition. */
+@deprecated
 private[graphx]
 class VertexAttributeBlock[VD: ClassTag](val vids: Array[VertexId], val attrs: Array[VD])
   extends Serializable {
@@ -31,6 +32,7 @@ class VertexAttributeBlock[VD: ClassTag](val vids: Array[VertexId], val attrs: A
     vids.indices.iterator.map { i => (vids(i), attrs(i)) }
 }
 
+@deprecated
 private[graphx]
 object ShippableVertexPartition {
   /** Construct a `ShippableVertexPartition` from the given vertices without any routing table. */
@@ -93,6 +95,7 @@ object ShippableVertexPartition {
  * A map from vertex id to vertex attribute that additionally stores edge partition join sites for
  * each vertex attribute, enabling joining with an [[org.apache.spark.graphx.EdgeRDD]].
  */
+@deprecated
 private[graphx]
 class ShippableVertexPartition[VD: ClassTag](
     val index: VertexIdToIndexMap,
@@ -145,6 +148,7 @@ class ShippableVertexPartition[VD: ClassTag](
   }
 }
 
+@deprecated
 private[graphx] class ShippableVertexPartitionOps[VD: ClassTag](self: ShippableVertexPartition[VD])
   extends VertexPartitionBaseOps[VD, ShippableVertexPartition](self) {
 

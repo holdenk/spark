@@ -21,6 +21,7 @@ import org.apache.spark.graphx._
 import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
 import org.apache.spark.util.collection.{BitSet, PrimitiveVector}
 
+@deprecated
 private[graphx]
 object RoutingTablePartition {
   /**
@@ -98,6 +99,7 @@ object RoutingTablePartition {
  * vertex partition. This provides routing information for shipping vertex attributes to edge
  * partitions.
  */
+@deprecated
 private[graphx]
 class RoutingTablePartition(
     private val routingTable: Array[(Array[VertexId], BitSet, BitSet)]) extends Serializable {

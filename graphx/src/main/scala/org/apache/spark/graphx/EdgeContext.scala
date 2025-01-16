@@ -21,6 +21,7 @@ package org.apache.spark.graphx
  * Represents an edge along with its neighboring vertices and allows sending messages along the
  * edge. Used in [[Graph#aggregateMessages]].
  */
+@deprecated
 abstract class EdgeContext[VD, ED, A] {
   /** The vertex id of the edge's source vertex. */
   def srcId: VertexId
@@ -50,6 +51,7 @@ abstract class EdgeContext[VD, ED, A] {
   }
 }
 
+@deprecated
 object EdgeContext {
 
   /**

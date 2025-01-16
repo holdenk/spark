@@ -477,6 +477,7 @@ class EdgePartition[
   }
 }
 
+@deprecated
 private class AggregatingEdgeContext[VD, ED, A](
     mergeMsg: (A, A) => A,
     aggregates: Array[A],

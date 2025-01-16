@@ -24,6 +24,7 @@ import org.apache.spark.graphx._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
+@deprecated
 class EdgeRDDImpl[ED: ClassTag, VD: ClassTag] private[graphx] (
     @transient override val partitionsRDD: RDD[(PartitionID, EdgePartition[ED, VD])],
     val targetStorageLevel: StorageLevel = StorageLevel.MEMORY_ONLY)

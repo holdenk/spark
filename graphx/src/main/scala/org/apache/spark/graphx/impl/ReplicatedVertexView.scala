@@ -29,6 +29,7 @@ import org.apache.spark.rdd.RDD
  * set may additionally be shipped to the edge partitions. Be careful not to store a reference to
  * `edges`, since it may be modified when the attribute shipping level is upgraded.
  */
+@deprecated
 private[impl]
 class ReplicatedVertexView[VD: ClassTag, ED: ClassTag](
     var edges: EdgeRDDImpl[ED, VD],

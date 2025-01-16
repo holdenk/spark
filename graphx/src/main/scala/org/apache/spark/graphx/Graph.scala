@@ -38,6 +38,7 @@ import org.apache.spark.storage.StorageLevel
  * @tparam VD the vertex attribute type
  * @tparam ED the edge attribute type
  */
+@deprecated
 abstract class Graph[VD: ClassTag, ED: ClassTag] protected () extends Serializable {
 
   /**
@@ -457,6 +458,7 @@ abstract class Graph[VD: ClassTag, ED: ClassTag] protected () extends Serializab
 /**
  * The Graph object contains a collection of routines used to construct graphs from RDDs.
  */
+@deprecated
 object Graph {
 
   /**

@@ -29,6 +29,7 @@ import org.apache.spark.util.collection.SortDataFormat
  * @param dstId The vertex id of the target vertex
  * @param attr The attribute associated with the edge
  */
+@deprecated
 case class Edge[@specialized(Char, Int, Boolean, Byte, Long, Float, Double) ED] (
     var srcId: VertexId = 0,
     var dstId: VertexId = 0,
@@ -56,6 +57,7 @@ case class Edge[@specialized(Char, Int, Boolean, Byte, Long, Float, Double) ED] 
     if (vid == srcId) EdgeDirection.Out else { assert(vid == dstId); EdgeDirection.In }
 }
 
+@deprecated
 object Edge {
   private[graphx] def lexicographicOrdering[ED] = new Ordering[Edge[ED]] {
     override def compare(a: Edge[ED], b: Edge[ED]): Int = {

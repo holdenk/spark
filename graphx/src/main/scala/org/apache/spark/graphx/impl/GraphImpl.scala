@@ -31,6 +31,7 @@ import org.apache.spark.storage.StorageLevel
  * routing information for shipping vertex attributes to edge partitions, and
  * `replicatedVertexView`, which contains edges and the vertex attributes mentioned by each edge.
  */
+@deprecated
 class GraphImpl[VD: ClassTag, ED: ClassTag] protected (
     @transient val vertices: VertexRDD[VD],
     @transient val replicatedVertexView: ReplicatedVertexView[VD, ED])
@@ -267,6 +268,7 @@ class GraphImpl[VD: ClassTag, ED: ClassTag] protected (
 } // end of class GraphImpl
 
 
+@deprecated
 object GraphImpl {
 
   /**

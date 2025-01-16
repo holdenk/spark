@@ -28,6 +28,7 @@ import org.apache.spark.util.collection.OpenHashSet
  *
  * Under the hood, it uses our OpenHashSet implementation.
  */
+@deprecated
 private[graphx]
 class GraphXPrimitiveKeyOpenHashMap[@specialized(Long, Int) K: ClassTag,
                               @specialized(Long, Int, Double) V: ClassTag](

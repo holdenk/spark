@@ -49,6 +49,7 @@ import org.apache.spark.graphx._
  * }}}
  *
  */
+@deprecated
 object TriangleCount {
 
   def run[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]): Graph[Int, ED] = {

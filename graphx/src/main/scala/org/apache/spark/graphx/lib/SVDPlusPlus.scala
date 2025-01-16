@@ -24,9 +24,11 @@ import org.apache.spark.ml.linalg.BLAS
 import org.apache.spark.rdd._
 
 /** Implementation of SVD++ algorithm. */
+@deprecated
 object SVDPlusPlus {
 
   /** Configuration parameters for SVDPlusPlus. */
+  @deprecated
   class Conf(
       var rank: Int,
       var maxIters: Int,

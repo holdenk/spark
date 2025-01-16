@@ -22,6 +22,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.graphx._
 import org.apache.spark.util.collection.BitSet
 
+@deprecated
 private[graphx] object VertexPartition {
   /** Construct a `VertexPartition` from the given vertices. */
   def apply[VD: ClassTag](iter: Iterator[(VertexId, VD)])
@@ -52,12 +53,14 @@ private[graphx] object VertexPartition {
 }
 
 /** A map from vertex id to vertex attribute. */
+@deprecated
 private[graphx] class VertexPartition[VD: ClassTag](
     val index: VertexIdToIndexMap,
     val values: Array[VD],
     val mask: BitSet)
   extends VertexPartitionBase[VD]
 
+@deprecated
 private[graphx] class VertexPartitionOps[VD: ClassTag](self: VertexPartition[VD])
   extends VertexPartitionBaseOps[VD, VertexPartition](self) {
 

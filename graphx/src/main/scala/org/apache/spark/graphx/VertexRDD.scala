@@ -52,6 +52,7 @@ import org.apache.spark.storage.StorageLevel
  *
  * @tparam VD the vertex attribute associated with each vertex in the set.
  */
+@deprecated
 abstract class VertexRDD[VD](
     sc: SparkContext,
     deps: Seq[Dependency[_]]) extends RDD[(VertexId, VD)](sc, deps) {
@@ -262,6 +263,7 @@ abstract class VertexRDD[VD](
 /**
  * The VertexRDD singleton is used to construct VertexRDDs.
  */
+@deprecated
 object VertexRDD {
 
   /**

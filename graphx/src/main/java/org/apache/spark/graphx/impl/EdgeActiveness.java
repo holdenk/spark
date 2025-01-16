@@ -20,6 +20,7 @@ package org.apache.spark.graphx.impl;
 /**
  * Criteria for filtering edges based on activeness. For internal use only.
  */
+@Deprecated
 public enum EdgeActiveness {
   /** Neither the source vertex nor the destination vertex need be active. */
   Neither,

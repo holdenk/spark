@@ -57,6 +57,7 @@ import org.apache.spark.rdd.util.PeriodicRDDCheckpointer
  * }}}
  *
  */
+@deprecated
 object Pregel extends Logging {
 
   /**
