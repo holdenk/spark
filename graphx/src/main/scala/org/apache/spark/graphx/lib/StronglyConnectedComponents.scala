@@ -22,6 +22,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.graphx._
 
 /** Strongly connected components algorithm implementation. */
+@deprecated
 object StronglyConnectedComponents {
 
   /**

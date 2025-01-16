@@ -77,6 +77,7 @@ import org.apache.spark.util.PeriodicCheckpointer
  * @tparam ED  Edge descriptor type
  *
  */
+@deprecated
 private[spark] class PeriodicGraphCheckpointer[VD, ED](
     checkpointInterval: Int,
     sc: SparkContext)

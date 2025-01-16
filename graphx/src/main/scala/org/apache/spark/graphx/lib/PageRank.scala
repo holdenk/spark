@@ -62,6 +62,7 @@ import org.apache.spark.ml.linalg.{Vector, Vectors}
  * @note This is not the "normalized" PageRank and as a consequence pages that have no
  * inlinks will have a PageRank of alpha.
  */
+@deprecated
 object PageRank extends Logging {
 
 

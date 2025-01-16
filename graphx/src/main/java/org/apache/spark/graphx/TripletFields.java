@@ -23,6 +23,7 @@ import java.io.Serializable;
  * Represents a subset of the fields of an [[EdgeTriplet]] or [[EdgeContext]]. This allows the
  * system to populate only those fields for efficiency.
  */
+@Deprecated
 public class TripletFields implements Serializable {
 
   /** Indicates whether the source vertex attribute is included. */

@@ -28,6 +28,7 @@ import org.apache.spark.storage.StorageLevel
 /**
  * Provides utilities for loading [[Graph]]s from files.
  */
+@deprecated
 object GraphLoader extends Logging {
 
   /**

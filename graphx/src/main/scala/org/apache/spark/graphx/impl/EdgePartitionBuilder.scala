@@ -24,6 +24,7 @@ import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
 import org.apache.spark.util.collection.{PrimitiveVector, SortDataFormat, Sorter}
 
 /** Constructs an EdgePartition from scratch. */
+@deprecated
 private[graphx]
 class EdgePartitionBuilder[@specialized(Long, Int, Double) ED: ClassTag, VD: ClassTag](
     size: Int = 64) {
@@ -125,9 +126,11 @@ class ExistingEdgePartitionBuilder[
   }
 }
 
+@deprecated
 private[impl] case class EdgeWithLocalIds[@specialized ED](
     srcId: VertexId, dstId: VertexId, localSrcId: Int, localDstId: Int, attr: ED)
 
+@deprecated
 private[impl] object EdgeWithLocalIds {
   implicit def lexicographicOrdering[ED]: Ordering[EdgeWithLocalIds[ED]] =
     (a: EdgeWithLocalIds[ED], b: EdgeWithLocalIds[ED]) =>

@@ -20,6 +20,7 @@ package org.apache.spark.graphx
 /**
  * The direction of a directed edge relative to a vertex.
  */
+@deprecated
 class EdgeDirection private (private val name: String) extends Serializable {
   /**
    * Reverse the direction of an edge.  An in becomes out,
@@ -46,6 +47,7 @@ class EdgeDirection private (private val name: String) extends Serializable {
 /**
  * A set of [[EdgeDirection]]s.
  */
+@deprecated
 object EdgeDirection {
   /** Edges arriving at a vertex. */
   final val In: EdgeDirection = new EdgeDirection("In")

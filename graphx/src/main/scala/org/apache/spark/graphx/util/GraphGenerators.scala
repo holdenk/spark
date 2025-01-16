@@ -28,6 +28,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 
 /** A collection of graph generating functions. */
+@deprecated
 object GraphGenerators extends Logging {
 
   val RMATa = 0.45

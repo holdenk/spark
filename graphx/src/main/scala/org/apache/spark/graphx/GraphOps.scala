@@ -32,6 +32,7 @@ import org.apache.spark.rdd.RDD
  * @tparam VD the vertex attribute type
  * @tparam ED the edge attribute type
  */
+@deprecated
 class GraphOps[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]) extends Serializable {
 
   /** The number of edges in the graph. */

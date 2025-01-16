@@ -25,6 +25,7 @@ import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
 import org.apache.spark.util.BoundedPriorityQueue
 import org.apache.spark.util.collection.{BitSet, OpenHashSet}
 
+@deprecated
 object GraphXUtils {
 
   /**

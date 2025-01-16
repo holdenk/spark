@@ -21,6 +21,7 @@ package org.apache.spark.graphx
  * Represents the way edges are assigned to edge partitions based on their source and destination
  * vertex IDs.
  */
+@deprecated
 trait PartitionStrategy extends Serializable {
   /** Returns the partition number for a given edge. */
   def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID
@@ -29,6 +30,7 @@ trait PartitionStrategy extends Serializable {
 /**
  * Collection of built-in [[PartitionStrategy]] implementations.
  */
+@deprecated
 object PartitionStrategy {
   /**
    * Assigns edges to partitions using a 2D partitioning of the sparse edge adjacency matrix,
@@ -71,6 +73,7 @@ object PartitionStrategy {
    * method where the last column can have a different number of rows than the others while still
    * maintaining the same size per block.
    */
+  @deprecated
   case object EdgePartition2D extends PartitionStrategy {
     override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
       val ceilSqrtNumParts: PartitionID = math.ceil(math.sqrt(numParts)).toInt
@@ -98,6 +101,7 @@ object PartitionStrategy {
    * Assigns edges to partitions using only the source vertex ID, colocating edges with the same
    * source.
    */
+  @deprecated
   case object EdgePartition1D extends PartitionStrategy {
     override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
       val mixingPrime: VertexId = 1125899906842597L
@@ -110,6 +114,7 @@ object PartitionStrategy {
    * Assigns edges to partitions by hashing the source and destination vertex IDs, resulting in a
    * random vertex cut that colocates all same-direction edges between two vertices.
    */
+  @deprecated
   case object RandomVertexCut extends PartitionStrategy {
     override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
       math.abs((src, dst).hashCode()) % numParts
@@ -122,6 +127,7 @@ object PartitionStrategy {
    * direction, resulting in a random vertex cut that colocates all edges between two vertices,
    * regardless of direction.
    */
+  @deprecated
   case object CanonicalRandomVertexCut extends PartitionStrategy {
     override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
       if (src < dst) {

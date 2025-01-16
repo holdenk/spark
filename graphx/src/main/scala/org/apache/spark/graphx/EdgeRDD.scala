@@ -36,6 +36,7 @@ import org.apache.spark.storage.StorageLevel
  * edge to provide the triplet view. Shipping of the vertex attributes is managed by
  * `impl.ReplicatedVertexView`.
  */
+@deprecated
 abstract class EdgeRDD[ED](
     sc: SparkContext,
     deps: Seq[Dependency[_]]) extends RDD[Edge[ED]](sc, deps) {
@@ -94,6 +95,7 @@ abstract class EdgeRDD[ED](
   private[graphx] def withTargetStorageLevel(targetStorageLevel: StorageLevel): EdgeRDD[ED]
 }
 
+@deprecated
 object EdgeRDD {
   /**
    * Creates an EdgeRDD from a set of edges.

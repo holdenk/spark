@@ -23,6 +23,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.graphx._
 
 /** Label Propagation algorithm. */
+@deprecated
 object LabelPropagation {
   /**
    * Run static Label Propagation for detecting communities in networks.
