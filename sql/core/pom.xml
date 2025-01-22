@@ -110,19 +110,16 @@
       <groupId>org.apache.orc</groupId>
       <artifactId>orc-format</artifactId>
       <classifier>${orc.classifier}</classifier>
-      <scope>${orc.deps.scope}</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.orc</groupId>
       <artifactId>orc-core</artifactId>
       <classifier>${orc.classifier}</classifier>
-      <scope>${orc.deps.scope}</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.orc</groupId>
       <artifactId>orc-mapreduce</artifactId>
       <classifier>${orc.classifier}</classifier>
-      <scope>${orc.deps.scope}</scope>
     </dependency>
     <dependency>
       <groupId>${hive.group}</groupId>
