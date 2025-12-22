@@ -52,6 +52,8 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
 
   override def defaultResult: Option[Literal] = Option(Literal.create(Array(), dataType))
 
+  def limit: Option[Long] = None
+
   protected def convertToBufferElement(value: Any): Any
 
   override def update(buffer: T, input: InternalRow): T = {
@@ -60,13 +62,23 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
     // Do not allow null values. We follow the semantics of Hive's collect_list/collect_set here.
     // See: org.apache.hadoop.hive.ql.udf.generic.GenericUDAFMkCollectionEvaluator
     if (value != null) {
-      buffer += convertToBufferElement(value)
+      if (limit.isEmpty || buffer.knownSize < limit.get) {
+        buffer += convertToBufferElement(value)
+      }
     }
     buffer
   }
 
   override def merge(buffer: T, other: T): T = {
-    buffer ++= other
+    if (limit.isEmpty || buffer.knownSize + other.knownSize <= limit.get) {
+      buffer ++= other
+    } else if (buffer.knownSize < limit.get) {
+      val toAdd = (limit.get - buffer.knownSize)
+      buffer ++= other.take(toAdd.toInt)
+    } else {
+      // Already over target
+      buffer
+    }
   }
 
   protected val bufferElementType: DataType
@@ -83,7 +95,21 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
   override def deserialize(bytes: Array[Byte]): T = {
     val buffer = createAggregationBuffer()
     row.pointTo(bytes, bytes.length)
-    row.getArray(0).foreach(bufferElementType, (_, x: Any) => buffer += x)
+    limit match {
+      case None =>
+        row.getArray(0).foreach(bufferElementType, (_, x: Any) =>
+          buffer += x
+        )
+      case Some(l) =>
+        var count = 0
+        row.getArray(0).foreach(bufferElementType, (_, x: Any) => {
+          count = count + 1
+          if (count <= l) {
+            buffer += x
+          }
+        }
+        )
+    }
     buffer
   }
 }
