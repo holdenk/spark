@@ -197,6 +197,35 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
+        # Extract Python UDF details if transpilation is enabled.
+        ast_info = None
+        ast_dumped = None
+        src = None
+        transpiled = None
+        from pyspark.sql import SparkSession
+
+        session = SparkSession._instantiatedSession
+        transpile_enabled = (
+            False
+            if session is None
+            else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
+        )
+        if transpile_enabled:
+            try:
+                # Note: consider maybe dill? (see the JYTHON PR)
+                # inspect getsource does not work for functions defined in vanilla
+                # repl, but does for those in files or in ipython.
+                # It also fails when we give it an instance of a callable class.
+                try:
+                    src = inspect.getsource(func)
+                except Exception:
+                    src = inspect.getsource(func.__call__)
+                ast_info = ast.parse(src)
+                transpiled = _transpile(src, ast_info)
+            except Exception as e:
+                warnings.warn(f"Error building AST for UDF: {e} -- will not transpile")
+        self.src = src
+        self.catalyst_transpiled = catalyst_transpiled
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:

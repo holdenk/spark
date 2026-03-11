@@ -73,6 +73,16 @@ class BaseUDFTestsMixin(object):
         res = data.select(pudf(data["number"]).alias("plus_four"))
         self.assertEqual(res.agg({"plus_four": "sum"}).collect()[0][0], 85)
 
+    def test_udf_transpilable(self):
+        class PlusFour:
+            def __call__(self, col):
+                if col is not None:
+                    return col + 4
+
+        call = PlusFour()
+        pudf = UserDefinedFunction(call, LongType())
+        self.assertIn("col + 4", pudf._judf.src())
+
     def test_udf_with_partial_function(self):
         data = self.spark.createDataFrame([(i, i**2) for i in range(10)], ["number", "squared"])
 
