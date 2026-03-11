@@ -78,10 +78,15 @@ class BaseUDFTestsMixin(object):
             def __call__(self, col):
                 if col is not None:
                     return col + 4
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
+            call = PlusFour()
+            pudf = UserDefinedFunction(call, LongType())
+            self.assertIn("col + 4", pudf.src)
 
-        call = PlusFour()
-        pudf = UserDefinedFunction(call, LongType())
-        self.assertIn("col + 4", pudf.src)
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
+            call = PlusFour()
+            pudf = UserDefinedFunction(call, LongType())
+            self.assertEqual(None, pudf.src)
 
     def test_udf_with_partial_function(self):
         data = self.spark.createDataFrame([(i, i**2) for i in range(10)], ["number", "squared"])
