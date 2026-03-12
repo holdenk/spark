@@ -982,6 +982,48 @@ object LimitPushDown extends Rule[LogicalPlan] {
 }
 
 /**
+ * Attempt to convert UDFS to Catalyst expressions.
+ */
+object ConvertToCatalyst extends Rule[LogicalPlan] {
+  val UDFTypeCoercesExpressionTypes = new resolver.UDFTypeCoercesExpressionTypes()
+  def apply(plan: LogicalPlan): LogicalPlan = {
+    // Short circuit if we are not transpiling or there is no Python UDFs in the plan.
+    if (!conf.getConf(SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS) ||
+      !plan.containsPattern(PYTHON_UDF)) {
+      return plan
+    }
+    plan.mapExpressions(applyExpr(_, false))
+  }
+
+  def applyExpr(expression: Expression, parent_is_udf: Boolean = false): Expression = {
+    expression match {
+      case s: PythonUDF =>
+        // We should avoid converting a UDF node where that could break pipelining.
+        // For example: (UDF -> UDF -> UDF) is often cheaper than UDF -> Catalyst -> UDF.
+        // But if we can convert the first or the last in a chain we should.
+        if (!parent_is_udf ||
+          !s.children.forall { x => x.isInstanceOf[PythonUDF] &&
+            x.asInstanceOf[PythonUDF].toCatalyst() == None }) {
+          s.pureCatalystExpression() match {
+            case None =>
+              s.mapChildren(applyExpr(_, parent_is_udf = true))
+            case Some(catalystExpr) =>
+              // Upgrade the types here since Python duct-typing means that
+              // in Python the types get automatically upgraded (e.g. 4 -> 4L or 4.0 automatically).
+              val catalystExprUpgraded = UDFTypeCoercesExpressionTypes.runCoercionTransformations(
+                catalystExpr, false)
+              catalystExprUpgraded.mapChildren(applyExpr(_, parent_is_udf = false))
+          }
+        } else {
+          s.mapChildren(applyExpr(_, parent_is_udf = true))
+        }
+      case _ =>
+        expression.mapChildren(applyExpr(_, parent_is_udf = false))
+    }
+  }
+}
+
+/**
  * Pushes Project operator to both sides of a Union operator.
  * Operations that are safe to pushdown are listed as follows.
  * Union:
