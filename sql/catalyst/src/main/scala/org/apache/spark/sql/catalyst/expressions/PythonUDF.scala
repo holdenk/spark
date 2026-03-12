@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.SparkException.internalError
 import org.apache.spark.api.python.{PythonEvalType, PythonFunction}
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.UnresolvedException
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction
@@ -75,12 +76,14 @@ object PythonUDF {
 }
 
 
-trait PythonFuncExpression extends NonSQLExpression with UserDefinedExpression { self: Expression =>
+trait PythonFuncExpression extends NonSQLExpression with UserDefinedExpression
+    with Logging { self: Expression =>
   def name: String
   def func: PythonFunction
   def evalType: Int
   def udfDeterministic: Boolean
   def resultId: ExprId
+  def pureCatalystExpression: Option[Expression] = None
 
   override lazy val deterministic: Boolean = udfDeterministic && children.forall(_.deterministic)
 
@@ -100,7 +103,8 @@ case class PythonUDF(
     children: Seq[Expression],
     evalType: Int,
     udfDeterministic: Boolean,
-    resultId: ExprId = NamedExpression.newExprId)
+    resultId: ExprId = NamedExpression.newExprId,
+    pureCatalystExpression: Option[Expression] = None)
   extends Expression with PythonFuncExpression with Unevaluable {
 
   lazy val resultAttribute: Attribute = AttributeReference(toPrettySQL(this), dataType, nullable)(
