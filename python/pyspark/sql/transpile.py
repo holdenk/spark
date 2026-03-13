@@ -1,0 +1,121 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+"""
+Experimental tools for transpiling UDFS.
+"""
+import ast
+from typing import Optional, List, Any, Tuple
+import inspect
+
+def _transpile_func(
+        func: Callable[..., Any],
+        returnType: "DataTypeOrString" = StringType(),
+        name: Optional[str] = None,
+        evalType: int = PythonEvalType.SQL_BATCHED_UDF,
+        deterministic: bool = True) -> Tuple[List[Column], List[str]]: # fake return type
+    """
+    An experimental internal function that attempts to transpile a callable function.
+
+    Returns
+    -------
+    list of transpiled functions
+    list fo errors as strings
+    """
+    try:
+        ast = _get_ast_from_func(func)
+        if ast is None:
+            return ([], ["Error getting ast for function, can not transpile"])
+        transpiled = []
+        errors = []
+        # Maybe multiple transpilers (think CUDA, etc.).
+        for transpiler in transpilers:
+            try:
+                transpiled_result = transpiler._transpile_from_ast(src, ast_info)
+                transpiled.append(transpiled_result)
+            except Exception as e:
+                errors.append(str(e))
+        return (transpiled, errors)
+    except Exception as e:
+        return ([], [str(e)])
+
+
+class AbstractTranspiler(object):
+    """Base class for transpilers. All experimental."""
+    @staticmethod
+    def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
+        pass
+
+class CatalystTranspiler(AbstractTranspiler):
+    @staticmethod
+    def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
+        # Short circuit on nothing to transpile.
+        if src == "" or ast_info is None:
+            return None
+        lambda_ast = _get_lambda_from_ast(ast_info)
+        if lambda_ast is None:
+            return None
+        lambda_body = lambda_ast.body
+        params = _get_parameter_list(lambda_ast)
+        return [_convert_function(params, lambda_body)]
+
+    @staticmethod
+    def _convert_function(params: List[str], body: ast.AST) -> Optional[Column]:
+        match body:
+            case ast.BinOp(left=left, op=op, right=right):
+                match op:
+                    case ast.Add():
+                        left_col = _convert_function(params, left)
+                        if left_col is None:
+                            raise Exception("Could not find left param for addition")
+                        right_col = _convert_function(params, right)
+                        if right_col is None:
+                            raise Exception("Could not find right column for addition")
+                        return left_col.add(right_col)
+                    case _:
+                        return
+            case ast.Constant(value=value):
+                return Column._literal(value)
+            case ast.Name(id=name, ctx=ast.Load()):
+                # Note: the Python UDF parameter name might not match the column
+                # And at this point we don't know who are children are going to be.
+                if name in params:
+                    param_index = params.index(name)
+                    # TODO: Add a special node here that indicates we want child number param_index
+                    return ParamIndexNode(param_index)
+            case _:
+                raise Exception(f"Found unhandled Python component {body}")
+
+    @staticmethod
+    def _get_ast_from_func(func) -> Option[ast.AST]:
+        """Try and get the AST from a given callable"""
+        # Note: consider maybe dill? (see the JYTHON PR)
+        # inspect getsource does not work for functions defined in vanilla
+        # repl, but does for those in files or in ipython.
+        # It also fails when we give it an instance of a callable class.
+        try:
+            src = inspect.getsource(func)
+        except Exception:
+            # Open q: local var in class?
+            src = inspect.getsource(func.__call__)
+        ast_info = ast.parse(src)
+        return ast_info
+
+    @staticmethod
+    def _transpile_ast(ast: ast.AST):
+        lambda_ast = _get_lambda_from_ast(ast_info)
+        if lambda_ast is None:
+            return None
