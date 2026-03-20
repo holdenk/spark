@@ -18,8 +18,10 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.{DataInputStream, DataOutputStream}
+import java.util.{List => JList}
 
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 
 import net.razorvine.pickle.Pickler
 
@@ -43,7 +45,8 @@ case class UserDefinedPythonFunction(
     func: PythonFunction,
     dataType: DataType,
     pythonEvalType: Int,
-    udfDeterministic: Boolean) {
+    udfDeterministic: Boolean,
+    transpiled: JList[Column]) {
 
   def builder(e: Seq[Expression]): Expression = {
     if (pythonEvalType == PythonEvalType.SQL_BATCHED_UDF
@@ -68,9 +71,9 @@ case class UserDefinedPythonFunction(
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF) {
-      PythonUDAF(name, func, dataType, e, udfDeterministic, pythonEvalType)
+      PythonUDAF(name, func, dataType, e, udfDeterministic, pythonEvalType, transpiledExprs)
     } else {
-      PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic)
+      PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic, transpiledExprs)
     }
   }
 
