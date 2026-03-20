@@ -1003,21 +1003,28 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
         // But if we can convert the first or the last in a chain we should.
         if (!parent_is_udf ||
           !s.children.forall { x => x.isInstanceOf[PythonUDF] &&
-            x.asInstanceOf[PythonUDF].toCatalyst() == None }) {
-          s.pureCatalystExpression() match {
-            case None =>
+            x.asInstanceOf[PythonUDF].transpiled == Nil }) {
+          s.transpiled match {
+            case Nil =>
               s.mapChildren(applyExpr(_, parent_is_udf = true))
-            case Some(catalystExpr) =>
+            case catalystExpr :: _ =>
+              // Recursively apply to the children first
+              val withTranspiledChildren = catalystExpr.mapChildren(applyExpr(_, parent_is_udf = false))
+              // Then resolve our place holders with the resolved children
+              val resolvedPlaceHolders = withTranspiledChildren.transform {
+                case p: PythonUDFChildrenPlaceHolder =>
+                  s.children(p.index)
+              }
               // Upgrade the types here since Python duct-typing means that
               // in Python the types get automatically upgraded (e.g. 4 -> 4L or 4.0 automatically).
               val catalystExprUpgraded = UDFTypeCoercesExpressionTypes.runCoercionTransformations(
-                catalystExpr, false)
-              catalystExprUpgraded.mapChildren(applyExpr(_, parent_is_udf = false))
+                resolvedPlaceholders, false)
           }
         } else {
           s.mapChildren(applyExpr(_, parent_is_udf = true))
         }
       case _ =>
+        // Not a PythonUDF, just recurse down
         expression.mapChildren(applyExpr(_, parent_is_udf = false))
     }
   }

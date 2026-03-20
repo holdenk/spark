@@ -21,19 +21,20 @@ import ast
 from typing import Optional, List, Any, Tuple
 import inspect
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit
+from pyspark.sql.functions.builtin import _invoke_function
 
 def _get_transpilers(session: SparkSession) -> List[AbstractTranspiler]:
     """Get the transpilers we should try."""
-    transpiler_names = session.conf.get("spark.sql.experimental.optimizer.transpilers").split(",")
+    transpiler_names = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers").split(",")
     return [AbstractTranspiler.varieties[name]() for name in transpiler_names if name in AbstractTranspiler.varieties]
 
 def _transpile_func(
         session: SparkSession,
         func: Callable[..., Any],
-        returnType: "DataTypeOrString" = StringType(),
-        name: Optional[str] = None,
-        evalType: int = PythonEvalType.SQL_BATCHED_UDF,
-        deterministic: bool = True) -> Tuple[List[Column], List[str]]: # fake return type
+        
+        returnType: "DataTypeOrString" = StringType()
+    ) -> Tuple[List[Column], List[str]]:
     """
     An experimental internal function that attempts to transpile a callable function.
 
@@ -64,6 +65,8 @@ def _transpile_func(
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
     varieties = {}
+    # Specify the "friendly" name a user can add to spark.sql.experimental.optimizer.transpilers
+    # to enable this transpiler.
     variety = None
 
     @classmethod
@@ -101,6 +104,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 if right_col is None:
                     raise Exception("Could not find right column for addition")
                 match op:
+                    # TODO: Maybe use one of the try functions so we can control errors and map topython exceptional cases better.
                     case ast.Add():
                         return left_col.__add__(right_col)
                     case ast.Sub():
@@ -114,14 +118,14 @@ class CatalystTranspiler(AbstractTranspiler):
                     case _:
                         raise Exception(f"Found unhandled binary operator {op}")
             case ast.Constant(value=value):
-                return Column._literal(value)
+                return lit(value)
             case ast.Name(id=name, ctx=ast.Load()):
                 # Note: the Python UDF parameter name might not match the column
                 # And at this point we don't know who are children are going to be.
                 if name in params:
                     param_index = params.index(name)
                     # TODO: Add a special node here that indicates we want child number param_index
-                    return ParamIndexNode(param_index)
+                    return _invoke_function("childPlaceholder", param_index)
             case _:
                 raise Exception(f"Found unhandled Python component {body}")
 
