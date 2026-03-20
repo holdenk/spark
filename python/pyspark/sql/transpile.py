@@ -20,8 +20,15 @@ Experimental tools for transpiling UDFS.
 import ast
 from typing import Optional, List, Any, Tuple
 import inspect
+from pyspark.sql import SparkSession
+
+def _get_transpilers(session: SparkSession) -> List[AbstractTranspiler]:
+    """Get the transpilers we should try."""
+    transpiler_names = session.conf.get("spark.sql.experimental.optimizer.transpilers").split(",")
+    return [AbstractTranspiler.varieties[name]() for name in transpiler_names if name in AbstractTranspiler.varieties]
 
 def _transpile_func(
+        session: SparkSession,
         func: Callable[..., Any],
         returnType: "DataTypeOrString" = StringType(),
         name: Optional[str] = None,
@@ -42,6 +49,7 @@ def _transpile_func(
         transpiled = []
         errors = []
         # Maybe multiple transpilers (think CUDA, etc.).
+        transpilers = _get_transpilers()
         for transpiler in transpilers:
             try:
                 transpiled_result = transpiler._transpile_from_ast(src, ast_info)
@@ -55,11 +63,21 @@ def _transpile_func(
 
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
+    varieties = {}
+    variety = None
+
+    @classmethod
+    def register(cls):
+        AbstractTranspiler.varieties[cls.variety] = cls
+
     @staticmethod
     def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
         pass
 
 class CatalystTranspiler(AbstractTranspiler):
+    """Transpiler that attempts to convert a Python UDF into native Spark SQL expressions."""
+    variety = "catalyst"
+
     @staticmethod
     def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
         # Short circuit on nothing to transpile.
@@ -76,17 +94,25 @@ class CatalystTranspiler(AbstractTranspiler):
     def _convert_function(params: List[str], body: ast.AST) -> Optional[Column]:
         match body:
             case ast.BinOp(left=left, op=op, right=right):
+                left_col = _convert_function(params, left)
+                if left_col is None:
+                    raise Exception("Could not find left param for addition")
+                right_col = _convert_function(params, right)
+                if right_col is None:
+                    raise Exception("Could not find right column for addition")
                 match op:
                     case ast.Add():
-                        left_col = _convert_function(params, left)
-                        if left_col is None:
-                            raise Exception("Could not find left param for addition")
-                        right_col = _convert_function(params, right)
-                        if right_col is None:
-                            raise Exception("Could not find right column for addition")
-                        return left_col.add(right_col)
+                        return left_col.__add__(right_col)
+                    case ast.Sub():
+                        return left_col.__subtract__(right_col)
+                    case ast.Mult():
+                        return left_col.__mul__(right_col)
+                    case ast.Mod():
+                        return left_col.__mod__(right_col)
+                    case ast.Pow():
+                        return left_col.__mod__(right_col)
                     case _:
-                        return
+                        raise Exception(f"Found unhandled binary operator {op}")
             case ast.Constant(value=value):
                 return Column._literal(value)
             case ast.Name(id=name, ctx=ast.Load()):
@@ -119,3 +145,5 @@ class CatalystTranspiler(AbstractTranspiler):
         lambda_ast = _get_lambda_from_ast(ast_info)
         if lambda_ast is None:
             return None
+
+CatalystTranspiler.register()

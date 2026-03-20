@@ -508,6 +508,14 @@ object SQLConf {
     .booleanConf
     .createWithDefault(false)
 
+
+  val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
+    buildConf("spark.sql.experimental.optimizer.transpilers")
+    .doc("Which transpilers to use for transpiling UDFS")
+    .version("4.3.0")
+    .stringConf
+    .createWithDefault("catalyst")
+
   val OPTIMIZER_EXCLUDED_RULES = buildConf("spark.sql.optimizer.excludedRules")
     .doc("Configures a list of rules to be disabled in the optimizer, in which the rules are " +
       "specified by their rule names and separated by comma. It is not guaranteed that all the " +
