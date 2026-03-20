@@ -509,9 +509,10 @@ object SQLConf {
     .createWithDefault(false)
 
 
-  val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
-    buildConf("spark.sql.experimental.optimizer.transpilers")
-    .doc("Which transpilers to use for transpiling UDFS")
+  val PYTHON_UDF_TRANSPILERS =
+    buildConf("spark.sql.experimental.optimizer.pyTranspilers")
+    .doc("Which transpilers to use for transpiling UDFS. Without the default optimizer " +
+      " the first successful result will be the one used.")
     .version("4.3.0")
     .stringConf
     .createWithDefault("catalyst")

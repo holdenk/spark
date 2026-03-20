@@ -200,8 +200,7 @@ class UserDefinedFunction:
         # Extract Python UDF details if transpilation is enabled.
         ast_info = None
         ast_dumped = None
-        src = None
-        transpiled = None
+        transpiled = []
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession
@@ -212,20 +211,17 @@ class UserDefinedFunction:
         )
         if transpile_enabled:
             try:
-                # Note: consider maybe dill? (see the JYTHON PR)
-                # inspect getsource does not work for functions defined in vanilla
-                # repl, but does for those in files or in ipython.
-                # It also fails when we give it an instance of a callable class.
-                try:
-                    src = inspect.getsource(func)
-                except Exception:
-                    src = inspect.getsource(func.__call__)
-                ast_info = ast.parse(src)
-                transpiled = _transpile(src, ast_info)
+                transpiled, errors = _transpile_func(
+                    session,
+                    func,
+                    returnType)
+                if errors:
+                    warnings.warn(f"Errors encountered during transpilation attempts: {e}")
+                if not transpiled:
+                    warnings.warn(f"Unable to transpile UDF {func}")
             except Exception as e:
-                warnings.warn(f"Error building AST for UDF: {e} -- will not transpile")
-        self.src = src
-        self.catalyst_transpiled = catalyst_transpiled
+                warnings.warn(f"Exception transpiling UDF {func}: {e}")
+        self.transpiled = transpiled
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
@@ -441,7 +437,7 @@ class UserDefinedFunction:
         jdt = spark._jsparkSession.parseDataType(self.returnType.json())
         assert sc._jvm is not None
         judf = getattr(sc._jvm, "org.apache.spark.sql.execution.python.UserDefinedPythonFunction")(
-            self._name, wrapped_func, jdt, self.evalType, self.deterministic
+            self._name, wrapped_func, jdt, self.evalType, self.deterministic, self.transpiled
         )
         return judf
 

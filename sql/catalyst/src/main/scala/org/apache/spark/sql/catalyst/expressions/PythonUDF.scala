@@ -83,7 +83,7 @@ trait PythonFuncExpression extends NonSQLExpression with UserDefinedExpression
   def evalType: Int
   def udfDeterministic: Boolean
   def resultId: ExprId
-  def pureCatalystExpression: Option[Expression] = None
+  def transpiled: List[Expression] = Nil
 
   override lazy val deterministic: Boolean = udfDeterministic && children.forall(_.deterministic)
 
@@ -104,7 +104,7 @@ case class PythonUDF(
     evalType: Int,
     udfDeterministic: Boolean,
     resultId: ExprId = NamedExpression.newExprId,
-    pureCatalystExpression: Option[Expression] = None)
+    override val transpiled: List[Expression] = Nil)
   extends Expression with PythonFuncExpression with Unevaluable {
 
   lazy val resultAttribute: Attribute = AttributeReference(toPrettySQL(this), dataType, nullable)(
@@ -147,7 +147,8 @@ case class PythonUDAF(
     children: Seq[Expression],
     udfDeterministic: Boolean,
     evalType: Int = PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
-    resultId: ExprId = NamedExpression.newExprId)
+    resultId: ExprId = NamedExpression.newExprId,
+    override val transpiled: List[Expression] = Nil)
   extends UnevaluableAggregateFunc with PythonFuncExpression {
 
   override def sql(isDistinct: Boolean): String = {
