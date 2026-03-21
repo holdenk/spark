@@ -18,48 +18,9 @@
 Experimental tools for transpiling UDFS.
 """
 import ast
-from typing import Optional, List, Any, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 import inspect
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit
-from pyspark.sql.functions.builtin import _invoke_function
-
-def _get_transpilers(session: SparkSession) -> List[AbstractTranspiler]:
-    """Get the transpilers we should try."""
-    transpiler_names = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers").split(",")
-    return [AbstractTranspiler.varieties[name]() for name in transpiler_names if name in AbstractTranspiler.varieties]
-
-def _transpile_func(
-        session: SparkSession,
-        func: Callable[..., Any],
-        
-        returnType: "DataTypeOrString" = StringType()
-    ) -> Tuple[List[Column], List[str]]:
-    """
-    An experimental internal function that attempts to transpile a callable function.
-
-    Returns
-    -------
-    list of transpiled functions
-    list fo errors as strings
-    """
-    try:
-        ast = _get_ast_from_func(func)
-        if ast is None:
-            return ([], ["Error getting ast for function, can not transpile"])
-        transpiled = []
-        errors = []
-        # Maybe multiple transpilers (think CUDA, etc.).
-        transpilers = _get_transpilers()
-        for transpiler in transpilers:
-            try:
-                transpiled_result = transpiler._transpile_from_ast(src, ast_info)
-                transpiled.append(transpiled_result)
-            except Exception as e:
-                errors.append(str(e))
-        return (transpiled, errors)
-    except Exception as e:
-        return ([], [str(e)])
+import textwrap
 
 
 class AbstractTranspiler(object):
@@ -73,34 +34,57 @@ class AbstractTranspiler(object):
     def register(cls):
         AbstractTranspiler.varieties[cls.variety] = cls
 
-    @staticmethod
-    def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
+    def _transpile_from_ast(
+            self,
+            src: str,
+            ast_info: ast.AST,
+            function_ast: ast.FunctionDef,
+            params: List[str],
+            returnType: "DataTypeOrString"
+    ) -> Optional["Column"]:
         pass
 
 class CatalystTranspiler(AbstractTranspiler):
     """Transpiler that attempts to convert a Python UDF into native Spark SQL expressions."""
     variety = "catalyst"
 
-    @staticmethod
-    def _transpile_from_ast(src: str, ast_info: ast.AST) -> Optional[Column]:
-        # Short circuit on nothing to transpile.
-        if src == "" or ast_info is None:
-            return None
-        lambda_ast = _get_lambda_from_ast(ast_info)
-        if lambda_ast is None:
-            return None
-        lambda_body = lambda_ast.body
-        params = _get_parameter_list(lambda_ast)
-        return [_convert_function(params, lambda_body)]
 
-    @staticmethod
-    def _convert_function(params: List[str], body: ast.AST) -> Optional[Column]:
+    def _convert_chunk(self, params: List[str], body: ast.AST) -> Optional["Column"]:
+        from pyspark.sql.functions import lit, when
         match body:
+            case None:
+                # Special case literal None
+                return lit(None)
+            case ast.If(test, success, orelse):
+                test_col = self._convert_chunk(params, test)
+                inverse_test_col = _convert_chunk(
+                    params,
+                    ast.UnaryOp(op=ast.Not(), operand=test))
+                if len(success) != 1:
+                    raise Exception("Currently only support if statements with a single expression in the body")
+                body_col = self._convert_chunk(params, success[0])
+                if len(orelse) != 1:
+                    raise Exception("Currently only support if statements with a single expression in the else body")
+                else_col = self._convert_chunk(params, orelse)
+                # Since otherwise acts on all nulls we double check.
+                return when(test_condition, body_col).otherwise(
+                    when(inverse_test_col, else_col))
+            case ast.Compare(left, ops, comps):
+                if len(ops) != 1 or len(comps) != 1:
+                    raise Exception("Currently only support simple comparisons with a single comparator")
+                left_col = self._convert_chunk(params, left)
+                match ops[0]:
+                    case ast.IsNot():
+                        return left_col.isNotNull()
+                    case ast.Is():
+                        return left_col.isNull()
+                    case _:
+                        raise Exception(f"Found unhandled comparison operator {ops[0]}")
             case ast.BinOp(left=left, op=op, right=right):
-                left_col = _convert_function(params, left)
+                left_col = _convert_chunk(params, left)
                 if left_col is None:
                     raise Exception("Could not find left param for addition")
-                right_col = _convert_function(params, right)
+                right_col = _convert_chunk(params, right)
                 if right_col is None:
                     raise Exception("Could not find right column for addition")
                 match op:
@@ -118,36 +102,141 @@ class CatalystTranspiler(AbstractTranspiler):
                     case _:
                         raise Exception(f"Found unhandled binary operator {op}")
             case ast.Constant(value=value):
+                # Avoid circular import issue.
                 return lit(value)
             case ast.Name(id=name, ctx=ast.Load()):
-                # Note: the Python UDF parameter name might not match the column
-                # And at this point we don't know who are children are going to be.
+                # Insert columns referencing the param indexes for children
                 if name in params:
                     param_index = params.index(name)
-                    # TODO: Add a special node here that indicates we want child number param_index
-                    return _invoke_function("childPlaceholder", param_index)
+                    return Column(f"_udf_param_{param_index}")
+                else:
+                    # TODO: Handle assignments, class vars, etc.
+                    raise Exception("Variable referenced not found in inputs")
             case _:
                 raise Exception(f"Found unhandled Python component {body}")
 
-    @staticmethod
-    def _get_ast_from_func(func) -> Option[ast.AST]:
-        """Try and get the AST from a given callable"""
-        # Note: consider maybe dill? (see the JYTHON PR)
-        # inspect getsource does not work for functions defined in vanilla
-        # repl, but does for those in files or in ipython.
-        # It also fails when we give it an instance of a callable class.
-        try:
-            src = inspect.getsource(func)
-        except Exception:
-            # Open q: local var in class?
-            src = inspect.getsource(func.__call__)
-        ast_info = ast.parse(src)
-        return ast_info
-
-    @staticmethod
-    def _transpile_ast(ast: ast.AST):
-        lambda_ast = _get_lambda_from_ast(ast_info)
-        if lambda_ast is None:
+    def _transpile_from_ast(
+            self,
+            src: str,
+            ast_info: ast.AST,
+            function_ast: ast.FunctionDef,
+            params: List[str],
+            returnType: "DataTypeOrString"
+    ) -> Optional["Column"]:
+        # Short circuit on nothing to transpile.
+        if src == "" or ast_info is None:
             return None
+        function_body = function_ast.body
+        if len(function_body) != 1:
+            raise Exception("Currently only support functions with a single expression in the body")
+        return [self._convert_chunk(params, function_body[0])]
 
 CatalystTranspiler.register()
+
+def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
+    """Get the transpilers we should try."""
+    transpiler_names = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers").split(",")
+    return [AbstractTranspiler.varieties[name]() for name in transpiler_names if name in AbstractTranspiler.varieties]
+
+
+def _get_src_ast_from_func(func) -> Tuple[Optional[str], Optional[ast.AST]]:
+    """Try and get the AST from a given callable"""
+    # Note: consider maybe dill? (see the JYTHON PR)
+    # inspect getsource does not work for functions defined in vanilla
+    # repl, but does for those in files or in ipython.
+    # It also fails when we give it an instance of a callable class.
+    try:
+        src = inspect.getsource(func)
+        src = textwrap.dedent(src).strip()
+        ast_info = ast.parse(src)
+    except Exception:
+        src = inspect.getsource(func.__call__)
+        src = textwrap.dedent(src).strip()
+        ast_info = ast.parse(src)
+    return src, ast_info
+
+def _get_parameter_list(node: ast.FunctionDef) -> list[str]:
+    """Return the positional argument names of in order."""
+    return [arg.arg for arg in node.args.args]
+ 
+ 
+def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
+    """
+    Extract a :class:`ast.FunctionDef` node from an AST produced by
+    ``ast.parse(inspect.getsource(udf_func))``.
+ 
+    Handles the following source patterns (in order):
+ 
+    * ``f = lambda x: x + 1``  — direct assignment
+    * ``f = some_wrapper(lambda x: x + 1, ...)``  — lambda as first positional
+      arg of a call (e.g. ``functools.partial``)
+    * ``lambda x: x + 1``  — bare expression (getsource on a raw lambda)
+    * ``def f(x): ... return x + 1``
+    * class with callable
+ 
+    Returns ``None`` when no single unambiguous function can be identified.
+    Note yet handled: local class variables.
+    """
+    print("Extracting lambda from AST:")
+    print(ast.dump(body))
+    if not body.body:
+        return None
+ 
+    stmt = body.body[0]
+ 
+    # Grab the value side of a top level assign (e.g. x = lambda ...)
+    if isinstance(stmt, ast.Assign):
+        stmt = stmt.value
+
+    # --- bare lambda expression ---
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Lambda):
+        return ast.FunctionDef(
+            name="<lambda>",
+            args=stmt.value.args,
+            body=[ast.Return(value=stmt.value.body)]
+        )
+                               
+ 
+    if isinstance(stmt, ast.FunctionDef):
+        return stmt
+    print(f"Could not match on AST node type {type(stmt)}?")
+    return None
+
+def _transpile_func(
+        session: "SparkSession",
+        func: Callable[..., Any],        
+        returnType: "DataTypeOrString",
+    ) -> Tuple[List["Column"], List[str]]:
+    """
+    An experimental internal function that attempts to transpile a callable function.
+
+    Returns
+    -------
+    list of transpiled functions
+    list fo errors as strings
+    """
+    try:
+        src, ast = _get_src_ast_from_func(func)
+        if ast is None:
+            return ([], ["Error getting ast for function, can not transpile"])
+        # Get the lambda body and parameters
+        function_ast = _get_function_from_ast(ast)
+        params = _get_parameter_list(function_ast)
+        transpiled = []
+        errors = []
+        # Maybe multiple transpilers (think CUDA, etc.).
+        transpilers = _get_transpilers(session)
+        for transpiler in transpilers:
+            try:
+                transpiled_result = transpiler._transpile_from_ast(
+                    src, ast, function_ast, params, returnType)
+                transpiled.append(transpiled_result)
+            except Exception as e:
+                errors.append(str(e))
+                # temporarily raise
+                raise
+        return (transpiled, errors)
+    except Exception as e:
+        # temporarily raise
+        raise
+        return ([], [str(e)])

@@ -36,6 +36,7 @@ from pyspark.sql.types import (
 from pyspark.sql.utils import get_active_spark_context
 from pyspark.sql.pandas.types import to_arrow_type
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
+from pyspark.sql.transpile import _transpile_func
 from pyspark.errors import PySparkTypeError, PySparkNotImplementedError, PySparkRuntimeError
 
 if TYPE_CHECKING:
@@ -216,11 +217,13 @@ class UserDefinedFunction:
                     func,
                     returnType)
                 if errors:
-                    warnings.warn(f"Errors encountered during transpilation attempts: {e}")
+                    warnings.warn(f"Errors encountered during transpilation attempts: {errors}")
                 if not transpiled:
                     warnings.warn(f"Unable to transpile UDF {func}")
             except Exception as e:
                 warnings.warn(f"Exception transpiling UDF {func}: {e}")
+                # Temporarily: re-throw everything during dev.
+                raise
         self.transpiled = transpiled
 
     @staticmethod
