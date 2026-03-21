@@ -1008,17 +1008,18 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
             case Nil =>
               s.mapChildren(applyExpr(_, parent_is_udf = true))
             case catalystExpr :: _ =>
-              // Recursively apply to the children first
-              val withTranspiledChildren = catalystExpr.mapChildren(applyExpr(_, parent_is_udf = false))
+              // Recursively apply to the children first because we may use them as inputs in parent
+              val withTranspiledChildren = catalystExpr.mapChildren(
+                applyExpr(_, parent_is_udf = false))
               // Then resolve our place holders with the resolved children
-              val resolvedPlaceHolders = withTranspiledChildren.transform {
-                case p: PythonUDFChildrenPlaceHolder =>
-                  s.children(p.index)
-              }
+              // TODO: use _udf_param_param_index.
+              // We can either insert a project type node here OR do manual resolution.
+              val withResolvedParams = withTranspiledChildren
               // Upgrade the types here since Python duct-typing means that
               // in Python the types get automatically upgraded (e.g. 4 -> 4L or 4.0 automatically).
               val catalystExprUpgraded = UDFTypeCoercesExpressionTypes.runCoercionTransformations(
-                resolvedPlaceholders, false)
+                withResolvedParams, false)
+              catalystExprUpgraded
           }
         } else {
           s.mapChildren(applyExpr(_, parent_is_udf = true))
