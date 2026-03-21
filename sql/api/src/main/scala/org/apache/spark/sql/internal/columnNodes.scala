@@ -108,13 +108,6 @@ private[sql] object ColumnNode {
 }
 
 /**
- * A special column referencing just the children, used as place holder for
- * partial transpilation.
- */
-private[sql] case class PythonUDFChildrenPlaceHolder(index: int) extends ColumnNode {
-}
-
-/**
  * A literal column.
  *
  * @param value

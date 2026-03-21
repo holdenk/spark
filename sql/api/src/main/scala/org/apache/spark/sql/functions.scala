@@ -89,13 +89,6 @@ object functions {
 // scalastyle:on
 
   /**
-   * Python transpilation placeholder.
-   */
-  private[spark] def childPlaceholder(idx: Int): Column = {
-    Column(internal.PythonUDFChildrenPlaceHolder(idx))
-  }
-
-  /**
    * Returns a [[Column]] based on the given column name.
    *
    * @group normal_funcs
