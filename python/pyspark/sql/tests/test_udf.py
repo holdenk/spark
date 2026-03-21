@@ -73,6 +73,33 @@ class BaseUDFTestsMixin(object):
         res = data.select(pudf(data["number"]).alias("plus_four"))
         self.assertEqual(res.agg({"plus_four": "sum"}).collect()[0][0], 85)
 
+    def test_udf_transpile_basic(self):
+        # Test callable object
+        class PlusFour:
+            def __call__(self, col):
+                if col is not None:
+                    return col + 4
+
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
+            call = PlusFour()
+            pudf = UserDefinedFunction(call, LongType())
+            self.assertTrue(pudf.transpiled)
+
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
+            call = PlusFour()
+            pudf = UserDefinedFunction(call, LongType())
+            self.assertEqual([], pudf.transpiled)
+
+    def test_udf_not_transpilable(self):
+        class UnsupportedEx:
+            def __call__(self, col):
+                if col is not None:
+                    return col in "4"
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
+            call = UnsupportedEx()
+            pudf = UserDefinedFunction(call, BooleanType())
+            self.assertEqual([], pudf.transpiled)
+
     def test_udf_with_partial_function(self):
         data = self.spark.createDataFrame([(i, i**2) for i in range(10)], ["number", "squared"])
 

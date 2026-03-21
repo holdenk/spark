@@ -36,6 +36,7 @@ from pyspark.sql.types import (
 from pyspark.sql.utils import get_active_spark_context
 from pyspark.sql.pandas.types import to_arrow_type
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
+from pyspark.sql.transpile import _transpile_func
 from pyspark.errors import PySparkTypeError, PySparkNotImplementedError, PySparkRuntimeError
 
 if TYPE_CHECKING:
@@ -197,6 +198,33 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
+        # Extract Python UDF details if transpilation is enabled.
+        ast_info = None
+        ast_dumped = None
+        transpiled = []
+        from pyspark.sql import SparkSession
+
+        session = SparkSession._instantiatedSession
+        transpile_enabled = (
+            False
+            if session is None
+            else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
+        )
+        if transpile_enabled:
+            try:
+                transpiled, errors = _transpile_func(
+                    session,
+                    func,
+                    returnType)
+                if errors:
+                    warnings.warn(f"Errors encountered during transpilation attempts: {errors}")
+                if not transpiled:
+                    warnings.warn(f"Unable to transpile UDF {func}")
+            except Exception as e:
+                warnings.warn(f"Exception transpiling UDF {func}: {e}")
+                # Temporarily: re-throw everything during dev.
+                raise
+        self.transpiled = transpiled
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
@@ -412,7 +440,7 @@ class UserDefinedFunction:
         jdt = spark._jsparkSession.parseDataType(self.returnType.json())
         assert sc._jvm is not None
         judf = getattr(sc._jvm, "org.apache.spark.sql.execution.python.UserDefinedPythonFunction")(
-            self._name, wrapped_func, jdt, self.evalType, self.deterministic
+            self._name, wrapped_func, jdt, self.evalType, self.deterministic, self.transpiled
         )
         return judf
 

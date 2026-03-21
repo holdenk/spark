@@ -501,6 +501,22 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
+    buildConf("spark.sql.experimental.optimizer.transpilePyUDFS")
+    .doc("When true, attempt to transpile Python UDFs to Catalyst expressions")
+    .version("4.3.0")
+    .booleanConf
+    .createWithDefault(false)
+
+
+  val PYTHON_UDF_TRANSPILERS =
+    buildConf("spark.sql.experimental.optimizer.pyTranspilers")
+    .doc("Which transpilers to use for transpiling UDFS. Without the default optimizer " +
+      " the first successful result will be the one used.")
+    .version("4.3.0")
+    .stringConf
+    .createWithDefault("catalyst")
+
   val OPTIMIZER_EXCLUDED_RULES = buildConf("spark.sql.optimizer.excludedRules")
     .doc("Configures a list of rules to be disabled in the optimizer, in which the rules are " +
       "specified by their rule names and separated by comma. It is not guaranteed that all the " +

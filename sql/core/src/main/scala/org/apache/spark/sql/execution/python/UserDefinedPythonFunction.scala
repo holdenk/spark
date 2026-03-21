@@ -18,8 +18,10 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.{DataInputStream, DataOutputStream}
+import java.util.{List => JList}
 
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 
 import net.razorvine.pickle.Pickler
 
@@ -43,7 +45,9 @@ case class UserDefinedPythonFunction(
     func: PythonFunction,
     dataType: DataType,
     pythonEvalType: Int,
-    udfDeterministic: Boolean) {
+    udfDeterministic: Boolean,
+    // TODO: Add support for transpilation with Spark Connect and remove the default value.
+    transpiled: JList[Column] = Nil.asJava) {
 
   def builder(e: Seq[Expression]): Expression = {
     if (pythonEvalType == PythonEvalType.SQL_BATCHED_UDF
@@ -64,13 +68,17 @@ case class UserDefinedPythonFunction(
       throw QueryCompilationErrors.namedArgumentsNotSupported(name)
     }
 
+    val transpiledExprs = transpiled.asScala.map(expression).toList
+
     if (pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF
       || pythonEvalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF) {
-      PythonUDAF(name, func, dataType, e, udfDeterministic, pythonEvalType)
+      PythonUDAF(name, func, dataType, e, udfDeterministic, pythonEvalType,
+        transpiled = transpiledExprs)
     } else {
-      PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic)
+      PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic,
+        transpiled = transpiledExprs)
     }
   }
 
