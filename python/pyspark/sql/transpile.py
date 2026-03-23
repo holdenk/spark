@@ -21,6 +21,8 @@ import ast
 from typing import Any, Callable, List, Optional, Tuple
 import inspect
 import textwrap
+from pyspark.sql.column import Column
+from pyspark.sql.functions import lit, when, col
 
 
 class AbstractTranspiler(object):
@@ -41,7 +43,7 @@ class AbstractTranspiler(object):
             function_ast: ast.FunctionDef,
             params: List[str],
             returnType: "DataTypeOrString"
-    ) -> Optional["Column"]:
+    ) -> Optional[Column]:
         pass
 
 class CatalystTranspiler(AbstractTranspiler):
@@ -49,25 +51,38 @@ class CatalystTranspiler(AbstractTranspiler):
     variety = "catalyst"
 
 
-    def _convert_chunk(self, params: List[str], body: ast.AST) -> Optional["Column"]:
-        from pyspark.sql.functions import lit, when
+    # TODO:
+    # handle
+    # def f(x):
+    #     x + x
+    # should return None because there is no return statement
+    # (although maybe we should log since it's likely a mistake).
+    def _convert_chunk(self, params: List[str], body: ast.AST) -> Optional[Column]:
         match body:
             case None:
-                # Special case literal None
+                # Special case literal None, the implicit return None
                 return lit(None)
+            case ast.UnaryOp(op=ast.Not(), operand=operand):
+                return self._convert_chunk(params, operand).__invert__()
             case ast.If(test, success, orelse):
                 test_col = self._convert_chunk(params, test)
-                inverse_test_col = _convert_chunk(
+                inverse_test_col = self._convert_chunk(
                     params,
                     ast.UnaryOp(op=ast.Not(), operand=test))
-                if len(success) != 1:
-                    raise Exception("Currently only support if statements with a single expression in the body")
-                body_col = self._convert_chunk(params, success[0])
-                if len(orelse) != 1:
-                    raise Exception("Currently only support if statements with a single expression in the else body")
-                else_col = self._convert_chunk(params, orelse)
+                if len(success) > 1:
+                    raise Exception("Currently only support if statements with at most one expression in the body")
+                elif len(success) == 0:
+                    body_col = lit(None)
+                else:
+                    body_col = self._convert_chunk(params, success[0])
+                if len(orelse) > 1:
+                    raise Exception("Currently only support if statements with at most one expression in the else body")
+                elif len(orelse) == 0:
+                    else_col = lit(None)
+                else:
+                    else_col = self._convert_chunk(params, orelse[0])
                 # Since otherwise acts on all nulls we double check.
-                return when(test_condition, body_col).otherwise(
+                return when(test_col, body_col).otherwise(
                     when(inverse_test_col, else_col))
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
@@ -81,10 +96,10 @@ class CatalystTranspiler(AbstractTranspiler):
                     case _:
                         raise Exception(f"Found unhandled comparison operator {ops[0]}")
             case ast.BinOp(left=left, op=op, right=right):
-                left_col = _convert_chunk(params, left)
+                left_col = self._convert_chunk(params, left)
                 if left_col is None:
                     raise Exception("Could not find left param for addition")
-                right_col = _convert_chunk(params, right)
+                right_col = self._convert_chunk(params, right)
                 if right_col is None:
                     raise Exception("Could not find right column for addition")
                 match op:
@@ -101,6 +116,8 @@ class CatalystTranspiler(AbstractTranspiler):
                         return left_col.__mod__(right_col)
                     case _:
                         raise Exception(f"Found unhandled binary operator {op}")
+            case ast.Return(value=value):
+                return self._convert_chunk(params, value)
             case ast.Constant(value=value):
                 # Avoid circular import issue.
                 return lit(value)
@@ -108,7 +125,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 # Insert columns referencing the param indexes for children
                 if name in params:
                     param_index = params.index(name)
-                    return Column(f"_udf_param_{param_index}")
+                    return col(f"_udf_param_{param_index}")
                 else:
                     # TODO: Handle assignments, class vars, etc.
                     raise Exception("Variable referenced not found in inputs")
@@ -122,7 +139,7 @@ class CatalystTranspiler(AbstractTranspiler):
             function_ast: ast.FunctionDef,
             params: List[str],
             returnType: "DataTypeOrString"
-    ) -> Optional["Column"]:
+    ) -> Optional[Column]:
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
             return None
@@ -206,7 +223,7 @@ def _transpile_func(
         session: "SparkSession",
         func: Callable[..., Any],        
         returnType: "DataTypeOrString",
-    ) -> Tuple[List["Column"], List[str]]:
+    ) -> Tuple[List[Column], List[str]]:
     """
     An experimental internal function that attempts to transpile a callable function.
 
