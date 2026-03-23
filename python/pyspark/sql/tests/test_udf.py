@@ -86,12 +86,13 @@ class BaseUDFTestsMixin(object):
             self.assertTrue(pudf.transpiled)
             print(f"Transpiled alt is {pudf.transpiled[0]} of type {type(pudf.transpiled[0])}")
             # Now make sure we can run the transpiled UDF*
-            # TODO: Check that it's actually running the transpiled version
-            # maybe with an explain?
             input_df = self.spark.createDataFrame([Row(a=1)])
             transformed_df = input_df.select(pudf("a"))
             [row] = transformed_df.collect()
             self.assertEqual(row[0], 5)
+            self.assertEqual(
+                "notfound",
+                transformed_df.explain(extended=True))
 
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
