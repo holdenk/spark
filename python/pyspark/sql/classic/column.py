@@ -425,7 +425,7 @@ class Column(ParentColumn):
 
     def __iter__(self) -> None:
         raise PySparkTypeError(
-            errorClass="NOT_ITERABLE", messageParameters={"objectName": "Column"}
+            errorClass="NOT_ITERABLE", messageParameters={"objectName": f"Column {self}"}
         )
 
     # string methods
