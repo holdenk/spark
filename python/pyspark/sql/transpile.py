@@ -146,7 +146,7 @@ class CatalystTranspiler(AbstractTranspiler):
         function_body = function_ast.body
         if len(function_body) != 1:
             raise Exception("Currently only support functions with a single expression in the body")
-        return [self._convert_chunk(params, function_body[0])]
+        return self._convert_chunk(params, function_body[0])
 
 CatalystTranspiler.register()
 

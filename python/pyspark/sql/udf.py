@@ -442,6 +442,7 @@ class UserDefinedFunction:
 
     def _create_judf(self, func: Callable[..., Any]) -> "JavaObject":
         from pyspark.sql import SparkSession
+        from pyspark.sql.classic.column import _to_java_column
 
         spark = SparkSession._getActiveSessionOrCreate()
         sc = spark.sparkContext
@@ -450,7 +451,7 @@ class UserDefinedFunction:
         jdt = spark._jsparkSession.parseDataType(self.returnType.json())
         assert sc._jvm is not None
         judf = getattr(sc._jvm, "org.apache.spark.sql.execution.python.UserDefinedPythonFunction")(
-            self._name, wrapped_func, jdt, self.evalType, self.deterministic, self.transpiled
+            self._name, wrapped_func, jdt, self.evalType, self.deterministic, map(_to_java_column, self.transpiled)
         )
         return judf
 
