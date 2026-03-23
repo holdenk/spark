@@ -36,7 +36,6 @@ from pyspark.sql.types import (
 from pyspark.sql.utils import get_active_spark_context
 from pyspark.sql.pandas.types import to_arrow_type
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
-from pyspark.sql.transpile import _transpile_func
 from pyspark.errors import PySparkTypeError, PySparkNotImplementedError, PySparkRuntimeError
 
 if TYPE_CHECKING:
@@ -220,6 +219,8 @@ class UserDefinedFunction:
             else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
         )
         if transpile_enabled:
+            # Import only if needed, also avoid circular import loops.
+            from pyspark.sql.transpile import _transpile_func
             try:
                 transpiled, errors = _transpile_func(
                     session,
