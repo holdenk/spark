@@ -81,14 +81,30 @@ class BaseUDFTestsMixin(object):
                     return col + 4
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
+            # Make sure we can transpile the object
             call = PlusFour()
             pudf = UserDefinedFunction(call, LongType())
             self.assertTrue(pudf.transpiled)
+            print(f"Transpiled alt is {pudf.transpiled[0]} of type {type(pudf.transpiled[0])}")
+            # Now make sure we can run the transpiled UDF*
+            # TODO: Check that it's actually running the transpiled version
+            # maybe with an explain?
+            input_df = self.spark.createDataFrame([Row(a=1)])
+            transformed_df = input_df.select(pudf("a"))
+            [row] = transformed_df.collect()
+            self.assertEqual(row[0], 5)
+
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             call = PlusFour()
             pudf = UserDefinedFunction(call, LongType())
             self.assertEqual([], pudf.transpiled)
+            # Now make sure we can run the UDF
+            input_df = self.spark.createDataFrame([Row(a=1)])
+            transformed_df = input_df.select(pudf("a"))
+            [row] = transformed_df.collect()
+            self.assertEqual(row[0], 5)
+
 
     def test_udf_not_transpilable(self):
         class UnsupportedEx:
