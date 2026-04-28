@@ -62,6 +62,12 @@ def _create_column_from_name(name: str) -> "JavaObject":
     return cast(JVMView, sc._jvm).functions.col(name)
 
 
+def _to_java_column_opt(col: Optional["ColumnOrName"]) -> Optional["JavaObject"]:
+    if col is None:
+        return None
+    else:
+        return _to_java_column(col)
+
 def _to_java_column(col: "ColumnOrName") -> "JavaObject":
     if isinstance(col, Column):
         jcol = col._jc
