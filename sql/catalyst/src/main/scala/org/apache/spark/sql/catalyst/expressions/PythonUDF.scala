@@ -83,13 +83,25 @@ trait PythonFuncExpression extends NonSQLExpression with UserDefinedExpression
   def evalType: Int
   def udfDeterministic: Boolean
   def resultId: ExprId
-  def transpiled: List[Expression] = Nil
 
   override lazy val deterministic: Boolean = udfDeterministic && children.forall(_.deterministic)
 
   override def toString: String = s"$name(${children.mkString(", ")})#${resultId.id}$typeSuffix"
 
   override def nullable: Boolean = true
+}
+
+
+case class TranspiledPythonUDF(
+  name: String,
+  pythonUDFExpr: Expression,
+  transpiledOptions: List[Expression]) extends Expression with Unevaluable {
+  override def children: Seq[Expression] = pythonUDFExpr +: transpiledOptions
+  override def dataType: DataType = pythonUDFExpr.dataType
+  override def nullable: Boolean = pythonUDFExpr.nullable
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]):
+      TranspiledPythonUDF =
+    copy(pythonUDFExpr = newChildren.head, transpiledOptions = newChildren.tail.toList)
 }
 
 /**
@@ -103,8 +115,7 @@ case class PythonUDF(
     children: Seq[Expression],
     evalType: Int,
     udfDeterministic: Boolean,
-    resultId: ExprId = NamedExpression.newExprId,
-    override val transpiled: List[Expression] = Nil)
+    resultId: ExprId = NamedExpression.newExprId)
   extends Expression with PythonFuncExpression with Unevaluable {
 
   lazy val resultAttribute: Attribute = AttributeReference(toPrettySQL(this), dataType, nullable)(
@@ -147,8 +158,7 @@ case class PythonUDAF(
     children: Seq[Expression],
     udfDeterministic: Boolean,
     evalType: Int = PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
-    resultId: ExprId = NamedExpression.newExprId,
-    override val transpiled: List[Expression] = Nil)
+    resultId: ExprId = NamedExpression.newExprId)
   extends UnevaluableAggregateFunc with PythonFuncExpression {
 
   override def sql(isDistinct: Boolean): String = {

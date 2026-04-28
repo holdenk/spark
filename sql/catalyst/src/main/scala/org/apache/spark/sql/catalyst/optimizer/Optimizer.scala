@@ -48,6 +48,7 @@ import org.apache.spark.util.Utils
  * Abstract class all optimizers should inherit of, contains the standard batches (extending
  * Optimizers can override this.
  */
+// scalastyle:off println
 abstract class Optimizer(catalogManager: CatalogManager)
   extends RuleExecutor[LogicalPlan] with SQLConfHelper {
 
@@ -995,6 +996,7 @@ object LimitPushDown extends Rule[LogicalPlan] {
  * Attempt to convert UDFS to Catalyst expressions.
  */
 object ConvertToCatalyst extends Rule[LogicalPlan] {
+  // TODO: Can we remove?
   val UDFTypeCoercesExpressionTypes = new resolver.UDFTypeCoercesExpressionTypes()
   def apply(plan: LogicalPlan): LogicalPlan = {
     // Short circuit if we are not transpiling or there is no Python UDFs in the plan.
@@ -1006,33 +1008,31 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
   }
 
   def applyExpr(expression: Expression, parent_is_udf: Boolean = false): Expression = {
+    println(f"Applying mapping to $expression")
     expression match {
-      case s: PythonUDF =>
+      case s: TranspiledPythonUDF =>
         // We should avoid converting a UDF node where that could break pipelining.
         // For example: (UDF -> UDF -> UDF) is often cheaper than UDF -> Catalyst -> UDF.
         // But if we can convert the first or the last in a chain we should.
         if (!parent_is_udf ||
-          !s.children.forall { x => x.isInstanceOf[PythonUDF] &&
-            x.asInstanceOf[PythonUDF].transpiled == Nil }) {
-          s.transpiled match {
+          !s.children.forall { x => x.isInstanceOf[PythonUDF] }) {
+          s.transpiledOptions match {
             case Nil =>
-              s.mapChildren(applyExpr(_, parent_is_udf = true))
-            case catalystExpr :: _ =>
+              s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
+            case catalystExpr :: extra =>
+              println(f"Huzzah we found a transpiled version of $s (is $catalystExpr) " +
+                f"but also got $extra")
               // Recursively apply to the children first because we may use them as inputs in parent
               val withTranspiledChildren = catalystExpr.mapChildren(
                 applyExpr(_, parent_is_udf = false))
-              // Then resolve our place holders with the resolved children
-              // TODO: use _udf_param_param_index.
-              // We can either insert a project type node here OR do manual resolution.
-              val withResolvedParams = withTranspiledChildren
               // Upgrade the types here since Python duct-typing means that
               // in Python the types get automatically upgraded (e.g. 4 -> 4L or 4.0 automatically).
               val catalystExprUpgraded = UDFTypeCoercesExpressionTypes.runCoercionTransformations(
-                withResolvedParams, false)
+                withTranspiledChildren, false)
               catalystExprUpgraded
           }
         } else {
-          s.mapChildren(applyExpr(_, parent_is_udf = true))
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
         }
       case _ =>
         // Not a PythonUDF, just recurse down
