@@ -57,7 +57,7 @@ class CatalystTranspiler(AbstractTranspiler):
     #     x + x
     # should return None because there is no return statement
     # (although maybe we should log since it's likely a mistake).
-    def _convert_chunk(self, params: List[str], body: ast.AST) -> Optional[Column]:
+    def _convert_chunk(self, params: List[str], body: ast.AST) -> Column:
         match body:
             case None:
                 # Special case literal None, the implicit return None
@@ -125,6 +125,9 @@ class CatalystTranspiler(AbstractTranspiler):
                 # Insert columns referencing the param indexes for children
                 if name in params:
                     param_index = params.index(name)
+                    # Special hack for self on callables
+                    if params[0] == "self":
+                        param_index -= 1
                     return col(f"_udf_param_{param_index}")
                 else:
                     # TODO: Handle assignments, class vars, etc.
@@ -143,10 +146,14 @@ class CatalystTranspiler(AbstractTranspiler):
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
             return None
+        print(f"Attempting to transpile {src} with params {params}")
         function_body = function_ast.body
         if len(function_body) != 1:
             raise Exception("Currently only support functions with a single expression in the body")
-        return self._convert_chunk(params, function_body[0])
+        converted = self._convert_chunk(params, function_body[0])
+        # Now cast the type to the return type
+        print(f"Converted AST to {converted} adding cast to {returnType}")
+        return converted.cast(returnType)
 
 CatalystTranspiler.register()
 
@@ -245,13 +252,11 @@ def _transpile_func(
         transpilers = _get_transpilers(session)
         for transpiler in transpilers:
             try:
-                transpiled_result = transpiler._transpile_from_ast(
+                transpiled_column = transpiler._transpile_from_ast(
                     src, ast, function_ast, params, returnType)
-                transpiled.append(transpiled_result)
+                transpiled.append(transpiled_column)
             except Exception as e:
                 errors.append(str(e))
-                # temporarily raise
-                raise
         return (transpiled, errors)
     except Exception as e:
         # temporarily raise
