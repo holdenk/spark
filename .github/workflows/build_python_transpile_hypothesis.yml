@@ -19,33 +19,99 @@
 
 # Targeted CI for the experimental Python UDF transpiler (SPARK-54783).
 #
-# We run the differential / property-based hypothesis suite only on PRs
-# (and pushes to long-lived branches) that actually touch the transpiler
-# itself, the hypothesis test module, or this workflow file. This keeps
-# the wider CI matrix unaffected while still giving us coverage when the
-# code that needs it changes.
+# We deliberately avoid the GitHub-native `on: pull_request, paths:`
+# filter: that still spins up a job in the contributor's fork on every
+# PR push and burns their fork-level Action minutes. Instead we run on
+# every push (matching the rest of Spark's CI fan-out from
+# build_main.yml) and gate the expensive build/test job on a cheap
+# shell-level "did anything transpile-related change" check, in the
+# same shape that dev/is-changed.py uses for the wider CI matrix.
+#
+# Mainline (apache/spark master) compares against the previous commit
+# via github.event.before; forks compare against the latest upstream
+# master fetched at job start. If nothing relevant changed the
+# precondition step emits a notice and the hypothesis job is skipped
+# via `if:` -- no expensive runner is reserved.
 
 name: "Build / Python UDF transpile hypothesis"
 
 on:
-  pull_request:
-    paths:
-      - 'python/pyspark/sql/transpile.py'
-      - 'python/pyspark/sql/tests/test_udf_transpile_hypothesis.py'
-      - '.github/workflows/build_python_transpile_hypothesis.yml'
   push:
-    branches:
-      - 'master'
-      - 'branch-*'
-    paths:
-      - 'python/pyspark/sql/transpile.py'
-      - 'python/pyspark/sql/tests/test_udf_transpile_hypothesis.py'
-      - '.github/workflows/build_python_transpile_hypothesis.yml'
+    branches: ['**']
   workflow_dispatch:
 
 jobs:
+  preconditions:
+    name: "Detect transpile-related changes"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.detect.outputs.relevant }}
+    steps:
+      - name: Checkout Spark repository
+        uses: actions/checkout@v6
+        with:
+          # Need history so we can diff HEAD against the upstream master
+          # ref (forks) or the previous mainline commit (apache/spark).
+          fetch-depth: 0
+      - name: Detect transpile-related changes
+        id: detect
+        env:
+          GITHUB_PREV_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Files whose changes warrant running the hypothesis suite.
+          # Anything that affects how a Python UDF is transpiled at
+          # construction time, optimized into Catalyst, or test-driven.
+          read -r -d '' RELEVANT_PATTERN <<'EOF' || true
+          ^python/pyspark/sql/transpile\.py$
+          ^python/pyspark/sql/tests/test_udf_transpile_hypothesis\.py$
+          ^python/pyspark/sql/udf\.py$
+          ^sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/PythonUDF\.scala$
+          ^sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer\.scala$
+          ^sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/resolver/UDFTypeCoercesExpressionTypes\.scala$
+          ^sql/core/src/main/scala/org/apache/spark/sql/execution/python/UserDefinedPythonFunction\.scala$
+          ^\.github/workflows/build_python_transpile_hypothesis\.yml$
+          EOF
+
+          # Resolve the comparison base. On apache/spark master pushes
+          # GITHUB_PREV_SHA is the parent of the new commit. On a fork
+          # we fetch the current upstream master and diff against that
+          # so contributors don't pay for runs whose only changes are
+          # already on master.
+          if [ "${GITHUB_REPOSITORY}" = "apache/spark" ]; then
+            BASE="${GITHUB_PREV_SHA:-}"
+            if [ -z "${BASE}" ] || [ "${BASE}" = "0000000000000000000000000000000000000000" ]; then
+              echo "::notice::No prior mainline commit available; running hypothesis suite."
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            git remote add upstream https://github.com/apache/spark.git || true
+            git fetch --depth=1 upstream master
+            BASE="$(git rev-parse FETCH_HEAD)"
+          fi
+
+          echo "Diffing against ${BASE}"
+          CHANGED="$(git diff --name-only "${BASE}" HEAD || true)"
+          echo "Changed files:"
+          echo "${CHANGED}"
+
+          # Compact the heredoc into a single ERE for grep.
+          PATTERN="$(echo "${RELEVANT_PATTERN}" | tr '\n' '|' | sed 's/|$//')"
+          if [ -n "${CHANGED}" ] && echo "${CHANGED}" | grep -qE "${PATTERN}"; then
+            echo "Found transpile-related changes."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No transpile-related files changed since ${BASE} -- skipping hypothesis suite."
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
   hypothesis:
     name: "Run hypothesis-based UDF transpile tests"
+    needs: preconditions
+    if: needs.preconditions.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

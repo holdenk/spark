@@ -144,6 +144,43 @@ class BaseUDFTestsMixin(object):
             pudf = UserDefinedFunction(call, BooleanType())
             self.assertEqual([], pudf.transpiled)
 
+    def test_udf_transpile_requires_ansi(self):
+        # Transpilation targets ANSI semantics. With ANSI off the transpiler
+        # must skip rewriting (and warn the user) so we don't silently
+        # diverge from the Python interpretation; with ANSI on it should
+        # produce a Catalyst expression.
+        import warnings
+
+        def plus_four(x):
+            if x is not None:
+                return x + 4
+
+        with self.sql_conf({
+            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+            "spark.sql.ansi.enabled": False,
+        }):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                pudf = UserDefinedFunction(plus_four, LongType())
+            self.assertEqual([], pudf.transpiled)
+            ansi_warnings = [w for w in caught if "ANSI mode" in str(w.message)]
+            self.assertTrue(
+                ansi_warnings,
+                "expected an 'ANSI mode' warning when transpilation is "
+                "requested but ANSI is disabled",
+            )
+
+        with self.sql_conf({
+            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+            "spark.sql.ansi.enabled": True,
+        }):
+            pudf = UserDefinedFunction(plus_four, LongType())
+            self.assertTrue(
+                pudf.transpiled,
+                "expected transpilation to produce a Catalyst expression "
+                "when both transpilePyUDFS and ANSI mode are enabled",
+            )
+
     def test_udf_with_partial_function(self):
         data = self.spark.createDataFrame([(i, i**2) for i in range(10)], ["number", "squared"])
 

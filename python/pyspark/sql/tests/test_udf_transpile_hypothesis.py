@@ -69,6 +69,7 @@ Set ``RUN_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test example count
 
 import os
 import unittest
+import warnings
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
@@ -110,6 +111,18 @@ if _have_hypothesis:
     # Python and Spark stays in the safe LongType range.
     _LONG_BOUND = 2**31 - 1
     _long_strategy = st.one_of(st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND))
+    # `square` does ``x ** 2``. Spark's ``Column.__pow__`` returns a
+    # DoubleType, so the squared value has to stay within ``2**53`` (the
+    # largest integer that double precision can represent exactly) for
+    # the cast back to LongType to be lossless. ``2**26`` squared is
+    # ``2**52``, comfortably under that ceiling. Anything bigger and
+    # we'd start chasing off-by-one differences that aren't really
+    # transpilation bugs -- they're double rounding -- so we leave that
+    # gap (proper integer ** lowering) to a follow-up.
+    _SQUARE_BOUND = 2**26
+    _square_strategy = st.one_of(
+        st.none(), st.integers(min_value=-_SQUARE_BOUND, max_value=_SQUARE_BOUND)
+    )
     _bool_strategy = st.one_of(st.none(), st.booleans())
 
 
@@ -155,6 +168,49 @@ def add_then_mod(x):
         return (x + 7) % 5
 
 
+def minus_two(x):
+    # Exercises ast.Sub.
+    if x is not None:
+        return x - 2
+
+
+def times_three(x):
+    # Exercises ast.Mult.
+    if x is not None:
+        return x * 3
+
+
+def square(x):
+    # Exercises ast.Pow. Inputs are bounded by ``_square_strategy`` so
+    # the squared value stays in the LongType range under ANSI overflow.
+    if x is not None:
+        return x ** 2
+
+
+def negate_truthy(x):
+    # Exercises ast.UnaryOp(Not). Same NULL-as-falsy semantics as
+    # ``truthy_bool_branch`` above, just inverted.
+    if not x:
+        return 0
+    else:
+        return 1
+
+
+def add_two(x, y):
+    # Multi-arg UDF -- exercises the parameter-index plumbing for
+    # functions with more than one positional argument.
+    if x is not None and y is not None:
+        return x + y
+    else:
+        return 0
+
+
+# A lambda captured at module scope so ``inspect.getsource`` can read
+# its definition. Exercises the ``ast.Lambda`` branch in
+# ``_get_function_from_ast``.
+lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -162,41 +218,86 @@ def add_then_mod(x):
 class UDFTranspileHypothesisTests(ReusedSQLTestCase):
     """Compare transpiled vs. interpreted Python UDF output on Hypothesis-generated inputs."""
 
-    def _run(self, func, return_type, value, schema):
-        """Run ``func`` as a UDF with transpilation on and off, return both rows."""
-        df = self.spark.createDataFrame([Row(a=value)], schema=schema)
+    # Markers we treat as "transpilation didn't actually happen" -- if any
+    # warning matches one of these, the differential comparison would
+    # collapse to interpreted-vs-interpreted and pass meaninglessly, so we
+    # fail loudly.
+    _BAD_TRANSPILE_WARNING_MARKERS = (
+        "Unable to transpile",
+        "Errors encountered during transpilation",
+        "Exception transpiling",
+        "ANSI mode",
+    )
 
-        with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
-            transpiled_udf = UserDefinedFunction(func, return_type)
-            # Sanity: we expect each of these templates to be transpilable.
-            # If the transpiler bails out we still want the test to run (so
-            # the comparison just degrades to interpreted-vs-interpreted),
-            # but we surface it via a subTest message so it's visible.
-            transpiled_present = bool(transpiled_udf.transpiled)
-            transpiled_value = df.select(transpiled_udf("a")).collect()[0][0]
+    def _run(self, func, return_type, df, *udf_arg_columns):
+        """Run ``func`` as a UDF with transpilation on and off, return both rows.
+
+        Asserts the transpiled code path was actually exercised: ``transpiled``
+        must be non-empty after construction, and no transpilation-related
+        warning may fire. Without these checks both runs could silently fall
+        back to interpreted Python and the differential assertion would
+        succeed for the wrong reason.
+        """
+        func_name = getattr(func, "__name__", repr(func))
+
+        transpile_on_conf = {
+            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+            # Transpilation requires ANSI; pin it on so the test result
+            # doesn't depend on the surrounding session default.
+            "spark.sql.ansi.enabled": True,
+        }
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.sql_conf(transpile_on_conf):
+                transpiled_udf = UserDefinedFunction(func, return_type)
+                self.assertTrue(
+                    transpiled_udf.transpiled,
+                    f"transpilation produced no Catalyst expression for "
+                    f"{func_name!r} -- the differential comparison would be "
+                    "meaningless without it",
+                )
+                transpiled_value = df.select(
+                    transpiled_udf(*udf_arg_columns)
+                ).collect()[0][0]
+            bad = [
+                w for w in caught
+                if any(
+                    marker in str(w.message)
+                    for marker in self._BAD_TRANSPILE_WARNING_MARKERS
+                )
+            ]
+            self.assertFalse(
+                bad,
+                f"unexpected transpile warnings for {func_name!r}: "
+                f"{[str(w.message) for w in bad]}",
+            )
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             interpreted_udf = UserDefinedFunction(func, return_type)
-            interpreted_value = df.select(interpreted_udf("a")).collect()[0][0]
+            interpreted_value = df.select(
+                interpreted_udf(*udf_arg_columns)
+            ).collect()[0][0]
 
-        return transpiled_value, interpreted_value, transpiled_present
+        return transpiled_value, interpreted_value
+
+    def _single_arg_df(self, value, dtype):
+        schema = StructType([StructField("a", dtype, nullable=True)])
+        return self.spark.createDataFrame([Row(a=value)], schema=schema)
 
     if _have_hypothesis:
 
         @_hyp_settings
         @given(value=_long_strategy)
         def test_plus_four_matches_python(self, value):
-            schema = StructType([StructField("a", LongType(), nullable=True)])
-            transpiled, interpreted, _ = self._run(plus_four, LongType(), value, schema)
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(plus_four, LongType(), df, "a")
             self.assertEqual(transpiled, interpreted, f"plus_four mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_strategy)
         def test_plus_four_with_else_matches_python(self, value):
-            schema = StructType([StructField("a", LongType(), nullable=True)])
-            transpiled, interpreted, _ = self._run(
-                plus_four_with_else, LongType(), value, schema
-            )
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(plus_four_with_else, LongType(), df, "a")
             self.assertEqual(
                 transpiled, interpreted, f"plus_four_with_else mismatch on {value!r}"
             )
@@ -204,10 +305,8 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_hyp_settings
         @given(value=_long_strategy)
         def test_is_none_branch_matches_python(self, value):
-            schema = StructType([StructField("a", LongType(), nullable=True)])
-            transpiled, interpreted, _ = self._run(
-                is_none_branch, LongType(), value, schema
-            )
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(is_none_branch, LongType(), df, "a")
             self.assertEqual(
                 transpiled, interpreted, f"is_none_branch mismatch on {value!r}"
             )
@@ -215,14 +314,8 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_hyp_settings
         @given(value=_bool_strategy)
         def test_truthy_bool_branch_matches_python(self, value):
-            # Known fragile case: Python's ``if x:`` for ``x=None`` is False
-            # and takes the else branch; the transpiler has to coalesce the
-            # NULL test before the otherwise/else lowering or it'll return
-            # NULL instead of the else value.
-            schema = StructType([StructField("a", BooleanType(), nullable=True)])
-            transpiled, interpreted, _ = self._run(
-                truthy_bool_branch, LongType(), value, schema
-            )
+            df = self._single_arg_df(value, BooleanType())
+            transpiled, interpreted = self._run(truthy_bool_branch, LongType(), df, "a")
             self.assertEqual(
                 transpiled, interpreted, f"truthy_bool_branch mismatch on {value!r}"
             )
@@ -230,12 +323,70 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_hyp_settings
         @given(value=_long_strategy)
         def test_add_then_mod_matches_python(self, value):
-            schema = StructType([StructField("a", LongType(), nullable=True)])
-            transpiled, interpreted, _ = self._run(
-                add_then_mod, LongType(), value, schema
-            )
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(add_then_mod, LongType(), df, "a")
             self.assertEqual(
                 transpiled, interpreted, f"add_then_mod mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        def test_minus_two_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(minus_two, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"minus_two mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        def test_times_three_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(times_three, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"times_three mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_square_strategy)
+        def test_square_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(square, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"square mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_bool_strategy)
+        def test_negate_truthy_matches_python(self, value):
+            df = self._single_arg_df(value, BooleanType())
+            transpiled, interpreted = self._run(negate_truthy, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"negate_truthy mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy)
+        def test_add_two_matches_python(self, x, y):
+            schema = StructType([
+                StructField("a", LongType(), nullable=True),
+                StructField("b", LongType(), nullable=True),
+            ])
+            df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
+            transpiled, interpreted = self._run(add_two, LongType(), df, "a", "b")
+            self.assertEqual(
+                transpiled, interpreted, f"add_two mismatch on (x={x!r}, y={y!r})"
+            )
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        def test_lambda_plus_four_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(
+                lambda_plus_four, LongType(), df, "a"
+            )
+            self.assertEqual(
+                transpiled, interpreted, f"lambda_plus_four mismatch on {value!r}"
             )
 
 

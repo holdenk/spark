@@ -66,43 +66,102 @@ class CatalystTranspiler(AbstractTranspiler):
     #     x + x
     # should return None because there is no return statement
     # (although maybe we should log since it's likely a mistake).
+    def _convert_branch(
+            self, params: List[str], statements: List[ast.stmt], slot: str
+    ) -> Column:
+        """Lower a single-statement if-body / if-else block.
+
+        ``slot`` is just used to disambiguate the multi-statement error
+        message between the body and the else arm.
+        """
+        if len(statements) > 1:
+            raise Exception(
+                f"Currently only support if statements with at most one expression in the {slot}"
+            )
+        if len(statements) == 0:
+            return lit(None)
+        return self._convert_chunk(params, statements[0])
+
+    def _convert_if_like(
+            self,
+            test_col: Column,
+            body_col: Column,
+            else_col: Column,
+    ) -> Column:
+        # Python evaluates `if test:` by treating None as falsy first
+        # and then checking truthiness. Spark's `when` already routes
+        # NULL into the otherwise branch, so for boolean-typed tests
+        # (the common case after Compare / UnaryOp / IsNotNull) the
+        # cleanest mapping is `when(test, body).otherwise(else)`. We
+        # coalesce the test against `lit(False)` so that a NULL test
+        # deterministically takes the else branch: the previous
+        # double-wrapped form `otherwise(when(~test, else))` silently
+        # produced NULL when `test` itself was NULL (since `~NULL` is
+        # NULL), which doesn't match Python's `if None: ... else: ...`
+        # picking the else branch. Non-boolean tests (e.g. a bare
+        # `if some_int:`) still won't match Python truthiness exactly;
+        # doing that needs the actual input column type, which we
+        # don't currently thread through to the transpiler.
+        safe_test = coalesce(test_col, lit(False))
+        return when(safe_test, body_col).otherwise(else_col)
+
     def _convert_chunk(self, params: List[str], body: ast.AST) -> Column:
         match body:
             case None:
                 # Special case literal None, the implicit return None
                 return lit(None)
             case ast.UnaryOp(op=ast.Not(), operand=operand):
-                return self._convert_chunk(params, operand).__invert__()
+                # Python's `not None` is `True` (None is falsy), but Spark's
+                # `~NULL` is `NULL`. Coalesce against `lit(True)` so a NULL
+                # operand mirrors Python's "None is falsy" rule. For
+                # already-boolean operands the coalesce is a no-op on
+                # non-NULL values (`~True` and `~False` both stay
+                # non-NULL). Non-boolean operands aren't currently
+                # special-cased -- `not 0` against an int column will
+                # still rely on Spark's invert behavior.
+                return coalesce(self._convert_chunk(params, operand).__invert__(), lit(True))
+            case ast.UnaryOp(op=ast.USub(), operand=operand):
+                # `-x` -- handle both literal negative ints (USub on a
+                # Constant) and runtime negation of a column.
+                return self._convert_chunk(params, operand).__neg__()
+            case ast.UnaryOp(op=ast.UAdd(), operand=operand):
+                # `+x` -- identity, kept for symmetry with USub.
+                return self._convert_chunk(params, operand)
+            case ast.BoolOp(op=op, values=values):
+                # Python `and` / `or` short-circuit and return one of the
+                # operands rather than a strict boolean. For the booleans
+                # produced by Compare / UnaryOp(Not) / IsNotNull this maps
+                # cleanly onto Spark Column `&` / `|`. Non-boolean
+                # operands are not currently special-cased here -- if a
+                # user writes `x or 0` against an int column they'll
+                # get bitwise-style behaviour from Spark, not Python's
+                # truthiness fallback.
+                cols = [self._convert_chunk(params, v) for v in values]
+                if isinstance(op, ast.And):
+                    result = cols[0]
+                    for c in cols[1:]:
+                        result = result & c
+                    return result
+                if isinstance(op, ast.Or):
+                    result = cols[0]
+                    for c in cols[1:]:
+                        result = result | c
+                    return result
+                raise Exception(f"Unhandled BoolOp operator {op}")
+            case ast.IfExp(test=test, body=body_expr, orelse=orelse_expr):
+                # Ternary `body if test else orelse` -- shares the
+                # NULL-as-falsy lowering with the if-statement case.
+                return self._convert_if_like(
+                    self._convert_chunk(params, test),
+                    self._convert_chunk(params, body_expr),
+                    self._convert_chunk(params, orelse_expr),
+                )
             case ast.If(test, success, orelse):
-                test_col = self._convert_chunk(params, test)
-                if len(success) > 1:
-                    raise Exception("Currently only support if statements with at most one expression in the body")
-                elif len(success) == 0:
-                    body_col = lit(None)
-                else:
-                    body_col = self._convert_chunk(params, success[0])
-                if len(orelse) > 1:
-                    raise Exception("Currently only support if statements with at most one expression in the else body")
-                elif len(orelse) == 0:
-                    else_col = lit(None)
-                else:
-                    else_col = self._convert_chunk(params, orelse[0])
-                # Python evaluates `if test:` by treating None as falsy first
-                # and then checking truthiness. Spark's `when` already routes
-                # NULL into the otherwise branch, so for boolean-typed tests
-                # (the common case after Compare / UnaryOp / IsNotNull) the
-                # cleanest mapping is `when(test, body).otherwise(else)`. We
-                # coalesce the test against `lit(False)` so that a NULL test
-                # deterministically takes the else branch: the previous
-                # double-wrapped form `otherwise(when(~test, else))` silently
-                # produced NULL when `test` itself was NULL (since `~NULL` is
-                # NULL), which doesn't match Python's `if None: ... else: ...`
-                # picking the else branch. Non-boolean tests (e.g. a bare
-                # `if some_int:`) still won't match Python truthiness exactly;
-                # doing that needs the actual input column type, which we
-                # don't currently thread through to the transpiler.
-                safe_test = coalesce(test_col, lit(False))
-                return when(safe_test, body_col).otherwise(else_col)
+                return self._convert_if_like(
+                    self._convert_chunk(params, test),
+                    self._convert_branch(params, success, "body"),
+                    self._convert_branch(params, orelse, "else body"),
+                )
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
                     raise Exception("Currently only support simple comparisons with a single comparator")
@@ -176,13 +235,14 @@ class CatalystTranspiler(AbstractTranspiler):
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
             return None
-        print(f"Attempting to transpile {src} with params {params}")
         function_body = function_ast.body
         if len(function_body) != 1:
             raise Exception("Currently only support functions with a single expression in the body")
         converted = self._convert_chunk(params, function_body[0])
-        # Now cast the type to the return type
-        print(f"Converted AST to {converted} adding cast to {returnType}")
+        # Cast to the declared return type so the rewritten plan reports a
+        # known data type to the optimizer's plan validator (otherwise it
+        # sees an UnresolvedFunction tree and reports VOID, which fails
+        # the schema-stability check on this rule).
         return converted.cast(returnType)
 
 CatalystTranspiler.register()
@@ -229,31 +289,32 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
     * class with callable
  
     Returns ``None`` when no single unambiguous function can be identified.
-    Note yet handled: local class variables.
+    Not yet handled: local class variables.
     """
-    print("Extracting lambda from AST:")
-    print(ast.dump(body))
     if not body.body:
         return None
- 
+
     stmt = body.body[0]
- 
+
     # Grab the value side of a top level assign (e.g. x = lambda ...)
     if isinstance(stmt, ast.Assign):
         stmt = stmt.value
 
-    # --- bare lambda expression ---
+    # Bare ``lambda x: ...`` (when ``inspect.getsource`` returns a raw
+    # lambda expression at module top level) parses as ``Expr(Lambda)``.
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Lambda):
+        stmt = stmt.value
+
+    if isinstance(stmt, ast.Lambda):
         return ast.FunctionDef(
             name="<lambda>",
-            args=stmt.value.args,
-            body=[ast.Return(value=stmt.value.body)]
+            args=stmt.args,
+            body=[ast.Return(value=stmt.body)],
+            decorator_list=[],
         )
-                               
- 
+
     if isinstance(stmt, ast.FunctionDef):
         return stmt
-    print(f"Could not match on AST node type {type(stmt)}?")
     return None
 
 def _transpile_func(
@@ -289,6 +350,7 @@ def _transpile_func(
                 errors.append(str(e))
         return (transpiled, errors)
     except Exception as e:
-        # temporarily raise
-        raise
+        # Don't re-raise: an inability to transpile must never break a
+        # working UDF. The caller treats an empty `transpiled` list as a
+        # silent fall-back to interpreted Python.
         return ([], [str(e)])

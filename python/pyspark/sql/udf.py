@@ -249,9 +249,12 @@ class UserDefinedFunction:
                 if not transpiled:
                     warnings.warn(f"Unable to transpile UDF {func}")
             except Exception as e:
+                # An inability to transpile must never break a working
+                # UDF -- fall back to interpreted Python execution and
+                # surface the failure as a warning so users can opt to
+                # investigate without losing their query.
                 warnings.warn(f"Exception transpiling UDF {func}: {e}")
-                # Temporarily: re-throw everything during dev.
-                raise
+                transpiled = []
         self.transpiled = transpiled
 
     @staticmethod
