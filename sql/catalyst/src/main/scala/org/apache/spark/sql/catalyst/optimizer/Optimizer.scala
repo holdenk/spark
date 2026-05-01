@@ -1017,8 +1017,8 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
           s.transpiledOptions match {
             case Nil =>
               s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
-            // TODO: Add a way to pick the "best" transpiled expression if multiple (this might be better
-            // as a seperate rule though too).
+            // TODO: Add a way to pick the "best" transpiled expression if multiple
+            // (this might be better as a seperate rule though too).
             case catalystExpr :: _ =>
               // Recursively apply to the children first because we may use them as inputs in parent
               val withTranspiledChildren = catalystExpr.mapChildren(
