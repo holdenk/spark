@@ -29,19 +29,26 @@ Python's ``if x:`` semantics and SQL's ``CASE WHEN``). Failures here should
 be treated as real correctness gaps in the transpiler, not as test bugs to
 silence.
 
-Known failures at the time of writing (all pre-existing, also reproducible
-via the basic ``test_udf_transpile_basic`` test):
+Known failures at the time of writing:
 
-* The transpiled Catalyst expression contains ``UnresolvedFunction`` /
-  ``UnresolvedAttribute`` nodes that don't have data types until the
-  analyzer runs on them. The optimizer's plan-validation rule sees the
-  output schema flip from the UDF's declared type to ``VOID`` and raises
-  ``PLAN_VALIDATION_FAILED_RULE_IN_BATCH``. Fixing this needs the
-  transpiler to either emit resolved expressions or run the analyzer over
-  the rewritten plan before validation kicks in.
-* ``UnaryOp`` (e.g. negative integer literals like ``-1``) is not yet
-  handled by the transpiler, so any UDF body containing one currently
-  raises during transpilation.
+* ``test_add_then_mod_matches_python`` finds a real semantic mismatch
+  between Python's ``%`` and Spark SQL's ``%`` for negative dividends:
+  Python's ``%`` always returns a result with the sign of the divisor
+  (e.g. ``(-8 + 7) % 5 == 4``), while Spark SQL takes the sign of the
+  dividend (``-1``). The transpiler currently lowers ``%`` directly to
+  ``Column.__mod__`` without translating the semantics, so any UDF
+  doing modular arithmetic on potentially-negative inputs will diverge.
+  Fixing this needs an explicit Python-mod -> SQL-mod translation
+  (e.g. ``((a % b) + b) % b``) or a ``pmod``-style lowering.
+
+The other property tests in this suite -- ``plus_four``, ``plus_four
+_with_else``, ``is_none_branch``, and ``truthy_bool_branch`` -- all
+pass once the transpiler casts its rewritten expression to the UDF's
+declared return type and routes NULL through the otherwise branch
+(via the coalesce on the if-test). Earlier revisions of the transpiler
+had a ``PLAN_VALIDATION_FAILED_RULE_IN_BATCH`` issue and a
+truthiness/NULL leak that this suite was the first to surface; both
+have since been fixed in the transpiler proper.
 
 The suite is gated on two things, both required:
 
