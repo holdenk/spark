@@ -29,19 +29,40 @@ Python's ``if x:`` semantics and SQL's ``CASE WHEN``). Failures here should
 be treated as real correctness gaps in the transpiler, not as test bugs to
 silence.
 
-The suite is gated behind an explicit env var so it doesn't run as part of
-the default Python test rotation. The Hypothesis dependency is also
-optional: if it isn't installed the suite is skipped cleanly.
+Known failures at the time of writing (all pre-existing, also reproducible
+via the basic ``test_udf_transpile_basic`` test):
+
+* The transpiled Catalyst expression contains ``UnresolvedFunction`` /
+  ``UnresolvedAttribute`` nodes that don't have data types until the
+  analyzer runs on them. The optimizer's plan-validation rule sees the
+  output schema flip from the UDF's declared type to ``VOID`` and raises
+  ``PLAN_VALIDATION_FAILED_RULE_IN_BATCH``. Fixing this needs the
+  transpiler to either emit resolved expressions or run the analyzer over
+  the rewritten plan before validation kicks in.
+* ``UnaryOp`` (e.g. negative integer literals like ``-1``) is not yet
+  handled by the transpiler, so any UDF body containing one currently
+  raises during transpilation.
+
+The suite is gated on two things, both required:
+
+* the ``RUN_HYPOTHESIS`` env var must be present in the environment
+  (its value doesn't matter, only its presence), and
+* the ``hypothesis`` package must be installed.
+
+If either gate is unmet the entire suite is skipped cleanly so it never
+becomes a CI tax for folks who haven't opted in. A targeted GitHub Actions
+workflow (``.github/workflows/build_python_transpile_hypothesis.yml``)
+flips both gates on, but only fires on PRs that actually touch the
+transpiler or this test file.
 
 To run locally::
 
     pip install hypothesis
-    SPARK_TEST_TRANSPILE_HYPOTHESIS=1 \\
+    RUN_HYPOTHESIS=1 \\
         python/run-tests --testnames pyspark.sql.tests.test_udf_transpile_hypothesis
 
-Set ``SPARK_TEST_TRANSPILE_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test
-example count (default 25, kept small because every example spins up a
-Spark job).
+Set ``RUN_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test example count
+(default 25, kept small because every example spins up a Spark job).
 """
 
 import os
@@ -59,20 +80,20 @@ from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import have_package
 
 
-_HYPOTHESIS_ENV = "SPARK_TEST_TRANSPILE_HYPOTHESIS"
+_HYPOTHESIS_ENV = "RUN_HYPOTHESIS"
 _have_hypothesis = have_package("hypothesis")
-_hypothesis_enabled = os.environ.get(_HYPOTHESIS_ENV, "").lower() in ("1", "true", "yes")
+# Presence-based: any value (including empty) opts in. We just check for the
+# key being in os.environ so e.g. `RUN_HYPOTHESIS= python ...` still counts.
+_hypothesis_enabled = _HYPOTHESIS_ENV in os.environ
 _skip_reason = (
-    f"Set {_HYPOTHESIS_ENV}=1 to run; hypothesis must also be installed."
+    f"Set {_HYPOTHESIS_ENV} in the environment to run; hypothesis must also be installed."
 )
 
 
 if _have_hypothesis:
     from hypothesis import HealthCheck, given, settings, strategies as st
 
-    _DEFAULT_MAX_EXAMPLES = int(
-        os.environ.get("SPARK_TEST_TRANSPILE_HYPOTHESIS_MAX_EXAMPLES", "25")
-    )
+    _DEFAULT_MAX_EXAMPLES = int(os.environ.get("RUN_HYPOTHESIS_MAX_EXAMPLES", "25"))
 
     # Spark jobs are expensive so we keep the example count modest. The
     # ``function_scoped_fixture`` health check is suppressed because we

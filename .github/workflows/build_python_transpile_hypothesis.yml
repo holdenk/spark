@@ -1,0 +1,122 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Targeted CI for the experimental Python UDF transpiler (SPARK-54783).
+#
+# We run the differential / property-based hypothesis suite only on PRs
+# (and pushes to long-lived branches) that actually touch the transpiler
+# itself, the hypothesis test module, or this workflow file. This keeps
+# the wider CI matrix unaffected while still giving us coverage when the
+# code that needs it changes.
+
+name: "Build / Python UDF transpile hypothesis"
+
+on:
+  pull_request:
+    paths:
+      - 'python/pyspark/sql/transpile.py'
+      - 'python/pyspark/sql/tests/test_udf_transpile_hypothesis.py'
+      - '.github/workflows/build_python_transpile_hypothesis.yml'
+  push:
+    branches:
+      - 'master'
+      - 'branch-*'
+    paths:
+      - 'python/pyspark/sql/transpile.py'
+      - 'python/pyspark/sql/tests/test_udf_transpile_hypothesis.py'
+      - '.github/workflows/build_python_transpile_hypothesis.yml'
+  workflow_dispatch:
+
+jobs:
+  hypothesis:
+    name: "Run hypothesis-based UDF transpile tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Spark repository
+        uses: actions/checkout@v6
+      - name: Cache SBT and Maven
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+          key: build-spark-transpile-hypothesis-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
+          restore-keys: |
+            build-spark-transpile-hypothesis-
+      - name: Cache Coursier local repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/coursier
+          key: coursier-build-spark-transpile-hypothesis-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            coursier-build-spark-transpile-hypothesis-
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 17
+      - name: Install Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - name: Install Python dependencies
+        run: |
+          # Minimum set needed by ReusedSQLTestCase plus hypothesis itself.
+          # Hypothesis lives in dev/requirements.txt under the optional
+          # test dependencies section; pin range matches that file.
+          python -m pip install --upgrade pip
+          python -m pip install \
+            'py4j>=0.10.9.9' \
+            'numpy>=1.22' \
+            'pyarrow>=18.0.0' \
+            'pandas>=2.2.0' \
+            'hypothesis>=6,<7' \
+            unittest-xml-reporting
+      - name: List Python packages
+        run: python -m pip list
+      - name: Build Spark
+        run: |
+          ./build/sbt -Phive package
+      - name: Run UDF transpile hypothesis tests
+        env:
+          SPARK_TESTING: 1
+          # The test module is gated on this env var being present.
+          RUN_HYPOTHESIS: 1
+          # CI gets a few more examples than the local default since it has
+          # the time budget to spare; bump if we want broader coverage.
+          RUN_HYPOTHESIS_MAX_EXAMPLES: 50
+        run: |
+          ./python/run-tests \
+            --python-executables=python3 \
+            --testnames pyspark.sql.tests.test_udf_transpile_hypothesis
+      - name: Upload test results to report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-transpile-hypothesis
+          path: "**/target/test-reports/*.xml"
+      - name: Upload Spark logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: spark-logs-transpile-hypothesis
+          path: "**/target/unit-tests.log"
