@@ -48,7 +48,6 @@ import org.apache.spark.util.Utils
  * Abstract class all optimizers should inherit of, contains the standard batches (extending
  * Optimizers can override this.
  */
-// scalastyle:off println
 abstract class Optimizer(catalogManager: CatalogManager)
   extends RuleExecutor[LogicalPlan] with SQLConfHelper {
 
@@ -1008,7 +1007,6 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
   }
 
   def applyExpr(expression: Expression, parent_is_udf: Boolean = false): Expression = {
-    println(f"Applying mapping to $expression")
     expression match {
       case s: TranspiledPythonUDF =>
         // We should avoid converting a UDF node where that could break pipelining.
@@ -1019,9 +1017,9 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
           s.transpiledOptions match {
             case Nil =>
               s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
-            case catalystExpr :: extra =>
-              println(f"Huzzah we found a transpiled version of $s (is $catalystExpr) " +
-                f"but also got $extra")
+            // TODO: Add a way to pick the "best" transpiled expression if multiple (this might be better
+            // as a seperate rule though too).
+            case catalystExpr :: _ =>
               // Recursively apply to the children first because we may use them as inputs in parent
               val withTranspiledChildren = catalystExpr.mapChildren(
                 applyExpr(_, parent_is_udf = false))

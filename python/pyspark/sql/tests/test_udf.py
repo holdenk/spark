@@ -83,15 +83,12 @@ class BaseUDFTestsMixin(object):
             call = PlusFour()
             pudf = UserDefinedFunction(call, LongType())
             self.assertTrue(pudf.transpiled)
-            print(f"Transpiled alt is {pudf.transpiled[0]} of type {type(pudf.transpiled[0])}")
             # Now make sure we can run the transpiled UDF*
             input_df = self.spark.createDataFrame([Row(a=1)])
             transformed_df = input_df.select(pudf("a"))
             [row] = transformed_df.collect()
+            transformed_df.explain()
             self.assertEqual(row[0], 5)
-            self.assertEqual(
-                "notfound",
-                transformed_df.explain(extended=True))
 
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
@@ -116,7 +113,6 @@ class BaseUDFTestsMixin(object):
             call = PlusFour()
             pudf = UserDefinedFunction(call, LongType())
             self.assertTrue(pudf.transpiled)
-            print(f"Transpiled alt is {pudf.transpiled[0]} of type {type(pudf.transpiled[0])}")
             # Now make sure we can run the transpiled UDF*
             input_df = self.spark.createDataFrame([Row(a=1)])
             transformed_df = input_df.select(pudf("a"))

@@ -92,14 +92,12 @@ case class UserDefinedPythonFunction(
             val index = nameParts.head.stripPrefix("_udf_param_").toInt
             if (index >= 0 && index < children.length) {
               val result = children(index)
-              println(f"Swapped $index to $result")
               result
             } else {
               throw new Exception(f"Invalid UDF parameter index: $index")
             }
           case _ =>
             val ec = expression.getClass
-            println(f"No swapping on $expression of class ${ec}w/ children ${expression.children}")
             expression.mapChildren(resolveUDFParams(_, children))
         }
       }
