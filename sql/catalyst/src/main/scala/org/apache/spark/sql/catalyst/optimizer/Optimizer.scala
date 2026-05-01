@@ -1014,12 +1014,21 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
         // But if we can convert the first or the last in a chain we should.
         if (!parent_is_udf ||
           !s.children.forall { x => x.isInstanceOf[PythonUDF] }) {
-          s.transpiledOptions match {
-            case Nil =>
+          // Walk the full list of transpiled options and pick the first one
+          // that's actually usable, falling back to the original Python UDF
+          // if nothing fits. "Evaluable" here is intentionally loose -- we
+          // just skip null entries (a transpiler may register a slot but
+          // fail to produce a Column for a given UDF). If you're plugging
+          // in your own transpilation, please add a separate ConvertToX
+          // rule earlier in the optimizer chain rather than registering
+          // another transpiler entry here: a dedicated rule lets you opt
+          // your rewrite in or out independently of this default fallback,
+          // and keeps the selection logic simple.
+          val firstEvaluable = s.transpiledOptions.find(expr => expr != null)
+          firstEvaluable match {
+            case None =>
               s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
-            // TODO: Add a way to pick the "best" transpiled expression if multiple
-            // (this might be better as a seperate rule though too).
-            case catalystExpr :: _ =>
+            case Some(catalystExpr) =>
               // Recursively apply to the children first because we may use them as inputs in parent
               val withTranspiledChildren = catalystExpr.mapChildren(
                 applyExpr(_, parent_is_udf = false))

@@ -16,13 +16,22 @@
 #
 """
 Experimental tools for transpiling UDFS.
+
+Transpilation is only attempted when both
+``spark.sql.experimental.optimizer.transpilePyUDFS=true`` and
+``spark.sql.ansi.enabled=true``. The generated Catalyst expressions
+target ANSI-mode SQL semantics (overflow raises, divide-by-zero raises,
+etc.); running them under non-ANSI mode would silently diverge from the
+Python interpretation in ways we don't currently track. If you flip
+transpilation on with ANSI off the UDF will fall back to interpreted
+Python execution and a warning is logged at UDF construction time.
 """
 import ast
 from typing import Any, Callable, List, Optional, Tuple
 import inspect
 import textwrap
 from pyspark.sql.column import Column
-from pyspark.sql.functions import coalesce, lit, when, col
+from pyspark.sql.functions import abs as _abs, coalesce, col, lit, pmod, sign, when
 
 
 class AbstractTranspiler(object):
@@ -121,7 +130,18 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Mult():
                         return left_col.__mul__(right_col)
                     case ast.Mod():
-                        return left_col.__mod__(right_col)
+                        # Python's `%` returns a result with the sign of the
+                        # divisor; Spark's `%` returns the sign of the
+                        # dividend, and Spark's `pmod` is documented for
+                        # non-negative divisors only. The composition
+                        # `sign(b) * pmod(sign(b) * a, abs(b))` reproduces
+                        # Python's semantics for any non-zero divisor without
+                        # us having to reach into Catalyst internals --
+                        # `pmod` does the unsigned remainder, `sign` and
+                        # `abs` line the inputs and output up with the
+                        # divisor's sign.
+                        sb = sign(right_col)
+                        return sb * pmod(sb * left_col, _abs(right_col))
                     case ast.Pow():
                         return left_col.__pow__(right_col)
                     case _:

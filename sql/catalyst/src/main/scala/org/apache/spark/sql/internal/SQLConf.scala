@@ -515,7 +515,11 @@ object SQLConf {
 
   val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
     buildConf("spark.sql.experimental.optimizer.transpilePyUDFS")
-    .doc("When true, attempt to transpile Python UDFs to Catalyst expressions")
+    .doc("When true, attempt to transpile Python UDFs to Catalyst expressions. " +
+        "Transpilation also requires ANSI mode (spark.sql.ansi.enabled=true) -- " +
+        "the rewritten expressions target ANSI semantics, so with ANSI off the " +
+        "transpiler falls back to interpreted Python and a warning is logged at " +
+        "UDF construction.")
     .version("4.3.0")
     .booleanConf
     .createWithDefault(false)

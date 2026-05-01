@@ -218,6 +218,24 @@ class UserDefinedFunction:
             if session is None
             else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
         )
+        # Transpilation only attempts to reproduce ANSI-mode Spark SQL semantics
+        # (no silent integer overflow, divide-by-zero raises, etc.). Running it
+        # against non-ANSI Spark would balloon the test matrix we'd have to
+        # maintain to verify Python-vs-SQL equivalence, so we gate on ANSI here
+        # and warn the user instead of trying to transpile in a mode we don't
+        # claim to support yet.
+        if transpile_enabled:
+            ansi_enabled = session.conf.get("spark.sql.ansi.enabled") == "true"
+            if not ansi_enabled:
+                warnings.warn(
+                    "Python UDF transpilation "
+                    "(spark.sql.experimental.optimizer.transpilePyUDFS) is only "
+                    "supported when ANSI mode is enabled "
+                    "(spark.sql.ansi.enabled=true). Skipping transpilation for "
+                    f"{func} -- enable ANSI mode or set transpilePyUDFS=false to "
+                    "silence this warning."
+                )
+                transpile_enabled = False
         if transpile_enabled:
             # Import only if needed, also avoid circular import loops.
             from pyspark.sql.transpile import _transpile_func

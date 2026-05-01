@@ -29,26 +29,21 @@ Python's ``if x:`` semantics and SQL's ``CASE WHEN``). Failures here should
 be treated as real correctness gaps in the transpiler, not as test bugs to
 silence.
 
-Known failures at the time of writing:
+History of bugs this suite has caught (each since fixed in the transpiler
+proper -- listed for context, not as expected failures):
 
-* ``test_add_then_mod_matches_python`` finds a real semantic mismatch
-  between Python's ``%`` and Spark SQL's ``%`` for negative dividends:
-  Python's ``%`` always returns a result with the sign of the divisor
-  (e.g. ``(-8 + 7) % 5 == 4``), while Spark SQL takes the sign of the
-  dividend (``-1``). The transpiler currently lowers ``%`` directly to
-  ``Column.__mod__`` without translating the semantics, so any UDF
-  doing modular arithmetic on potentially-negative inputs will diverge.
-  Fixing this needs an explicit Python-mod -> SQL-mod translation
-  (e.g. ``((a % b) + b) % b``) or a ``pmod``-style lowering.
-
-The other property tests in this suite -- ``plus_four``, ``plus_four
-_with_else``, ``is_none_branch``, and ``truthy_bool_branch`` -- all
-pass once the transpiler casts its rewritten expression to the UDF's
-declared return type and routes NULL through the otherwise branch
-(via the coalesce on the if-test). Earlier revisions of the transpiler
-had a ``PLAN_VALIDATION_FAILED_RULE_IN_BATCH`` issue and a
-truthiness/NULL leak that this suite was the first to surface; both
-have since been fixed in the transpiler proper.
+* ``PLAN_VALIDATION_FAILED_RULE_IN_BATCH`` from the rewritten plan
+  reporting ``VOID`` output type. Fixed by casting the rewritten
+  expression to the UDF's declared return type.
+* A truthiness / NULL leak: ``if test:`` was lowered as
+  ``when(test, body).otherwise(when(~test, else))``, but ``~NULL`` is
+  ``NULL`` so a ``None`` test fell through both branches and yielded
+  ``NULL`` instead of the else value. Fixed by lowering as
+  ``when(coalesce(test, lit(False)), body).otherwise(else)``.
+* ``%`` semantic mismatch between Python (sign of divisor) and Spark
+  SQL (sign of dividend), e.g. ``(-8 + 7) % 5 == 4`` in Python vs
+  ``-1`` in Spark SQL. Fixed by lowering ``%`` as
+  ``sign(b) * pmod(sign(b) * a, abs(b))``.
 
 The suite is gated on two things, both required:
 
