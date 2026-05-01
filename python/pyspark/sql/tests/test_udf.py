@@ -105,7 +105,7 @@ class BaseUDFTestsMixin(object):
         # Test callable object
         class PlusFour:
             def __call__(self, col):
-                if col:
+                if col is None:
                     return col + 4
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
