@@ -1003,6 +1003,21 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
       !plan.containsPattern(PYTHON_UDF)) {
       return plan
     }
+    // Defense in depth: the Python construction-time gate skips
+    // transpilation when ANSI is off, but a UDF defined under ANSI=on
+    // can still be replayed against a session with ANSI=off, in which
+    // case the rewritten Catalyst expressions would silently diverge
+    // from the Python interpretation. Skip the rule and warn instead.
+    if (!conf.getConf(SQLConf.ANSI_ENABLED)) {
+      logWarning(
+        "Skipping Python UDF transpilation: " +
+        s"${SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS.key} is enabled but " +
+        s"${SQLConf.ANSI_ENABLED.key} is disabled. The transpiler targets " +
+        "ANSI semantics and refuses to rewrite plans under non-ANSI mode. " +
+        "Enable ANSI or disable transpilation to silence this warning."
+      )
+      return plan
+    }
     plan.mapExpressions(applyExpr(_, false))
   }
 

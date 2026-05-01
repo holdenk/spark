@@ -167,9 +167,9 @@ jobs:
           SPARK_TESTING: 1
           # The test module is gated on this env var being present.
           RUN_HYPOTHESIS: 1
-          # CI gets a few more examples than the local default since it has
-          # the time budget to spare; bump if we want broader coverage.
-          RUN_HYPOTHESIS_MAX_EXAMPLES: 50
+          # Inherit the suite's default max-examples (1000). Override here
+          # if a future tweak needs a different count; otherwise keeping
+          # the env un-set keeps the local and CI runs identical.
         run: |
           ./python/run-tests \
             --python-executables=python3 \

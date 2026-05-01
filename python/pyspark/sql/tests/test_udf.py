@@ -181,6 +181,94 @@ class BaseUDFTestsMixin(object):
                 "when both transpilePyUDFS and ANSI mode are enabled",
             )
 
+    def test_udf_transpile_falls_back_for_unsupported_patterns(self):
+        # The transpiler intentionally only handles a small subset of
+        # Python AST today. Everything outside that subset must
+        # gracefully fall back to interpreted Python (with an empty
+        # `transpiled` list and a UserWarning) rather than break the
+        # UDF -- the "don't break peoples Spark code" promise. This test
+        # walks the most common unsupported shapes, registers each as a
+        # UDF with transpilation on, and asserts (a) construction does
+        # not raise, (b) `transpiled == []`, (c) the UDF still produces
+        # the correct interpreted result.
+
+        def divide_by_two(x):  # `/` -- ast.Div, not handled.
+            if x is not None:
+                return x / 2
+
+        def floor_divide_by_two(x):  # `//` -- ast.FloorDiv, not handled.
+            if x is not None:
+                return x // 2
+
+        def bit_and_one(x):  # `&` -- ast.BitAnd, not handled.
+            if x is not None:
+                return x & 1
+
+        def bit_or_one(x):  # `|` -- ast.BitOr, not handled.
+            if x is not None:
+                return x | 1
+
+        def left_shift(x):  # `<<` -- ast.LShift, not handled.
+            if x is not None:
+                return x << 1
+
+        def less_than_zero(x):  # ast.Lt, not handled (only Is/IsNot supported).
+            if x is not None:
+                return x < 0
+
+        def multi_statement(x):  # > 1 top-level statement, not handled.
+            y = 1
+            return x + y if x is not None else 0
+
+        def closure_capture(x):
+            offset = 7  # noqa: F841 -- intentional free variable
+            if x is not None:
+                return x + offset
+
+        cases = [
+            ("divide_by_two", divide_by_two, DoubleType(), Row(a=4.0), 2.0),
+            ("floor_divide_by_two", floor_divide_by_two, LongType(), Row(a=5), 2),
+            ("bit_and_one", bit_and_one, LongType(), Row(a=5), 1),
+            ("bit_or_one", bit_or_one, LongType(), Row(a=4), 5),
+            ("left_shift", left_shift, LongType(), Row(a=3), 6),
+            ("less_than_zero", less_than_zero, BooleanType(), Row(a=-1), True),
+            ("multi_statement", multi_statement, LongType(), Row(a=5), 6),
+            ("closure_capture", closure_capture, LongType(), Row(a=10), 17),
+        ]
+
+        with self.sql_conf({
+            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+            "spark.sql.ansi.enabled": True,
+        }):
+            for label, func, return_type, row, expected in cases:
+                with self.subTest(case=label):
+                    import warnings as _warnings
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        pudf = UserDefinedFunction(func, return_type)
+                    self.assertEqual(
+                        [], pudf.transpiled,
+                        f"{label}: transpiler should not produce a Catalyst "
+                        "expression for this AST shape",
+                    )
+                    fallback = [
+                        w for w in caught
+                        if "Unable to transpile" in str(w.message)
+                        or "Errors encountered" in str(w.message)
+                        or "Exception transpiling" in str(w.message)
+                    ]
+                    self.assertTrue(
+                        fallback,
+                        f"{label}: expected a fallback warning when the "
+                        "transpiler can't lower the function",
+                    )
+                    df = self.spark.createDataFrame([row])
+                    [result] = df.select(pudf("a")).collect()
+                    self.assertEqual(
+                        result[0], expected,
+                        f"{label}: interpreted UDF result diverged from expected",
+                    )
+
     def test_udf_with_partial_function(self):
         data = self.spark.createDataFrame([(i, i**2) for i in range(10)], ["number", "squared"])
 
@@ -1822,6 +1910,20 @@ class UDFTests(BaseUDFTestsMixin, ReusedSQLTestCase):
     def setUpClass(cls):
         super(BaseUDFTestsMixin, cls).setUpClass()
         cls.spark.conf.set("spark.sql.execution.pythonUDF.arrow.enabled", "false")
+        # NOTE: an earlier attempt also flipped
+        # ``spark.sql.experimental.optimizer.transpilePyUDFS=true`` and
+        # ``spark.sql.ansi.enabled=true`` here so the entire UDF test
+        # surface ran under transpile-on. That surfaced ~9 real
+        # ``[INTERNAL_ERROR] Cannot generate code for expression:
+        # transpiledpythonudf(...)`` failures: the ``ConvertToCatalyst``
+        # optimizer rule doesn't reach into every plan shape these
+        # tests build (Project + alias + agg, SQL named arguments, the
+        # 256-arg case, decorator-style UDFs, etc.). Fixing the rule's
+        # reach is its own piece of work; until then the explicit
+        # ``test_udf_transpile_falls_back_for_unsupported_patterns``
+        # test below still exercises the graceful-fallback contract,
+        # and the differential hypothesis suite covers the supported
+        # subset under transpile-on.
 
     # We cannot check whether the batch size is effective or not. We just run the query with
     # various batch size and see whether the query runs successfully, and the output is

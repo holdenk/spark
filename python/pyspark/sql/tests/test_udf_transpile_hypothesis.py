@@ -94,13 +94,17 @@ _skip_reason = (
 
 
 if _have_hypothesis:
-    from hypothesis import HealthCheck, given, settings, strategies as st
+    from hypothesis import HealthCheck, example, given, settings, strategies as st
 
-    _DEFAULT_MAX_EXAMPLES = int(os.environ.get("RUN_HYPOTHESIS_MAX_EXAMPLES", "25"))
+    _DEFAULT_MAX_EXAMPLES = int(os.environ.get("RUN_HYPOTHESIS_MAX_EXAMPLES", "1000"))
 
-    # Spark jobs are expensive so we keep the example count modest. The
-    # ``function_scoped_fixture`` health check is suppressed because we
-    # intentionally reuse the class-level SparkSession across examples.
+    # Spark jobs are expensive but coverage at ~25 examples per case felt
+    # too thin for a property-based suite -- 1k gives hypothesis room to
+    # explore boundary regions properly. The ``function_scoped_fixture``
+    # health check is suppressed because we intentionally reuse the
+    # class-level SparkSession across examples; the per-example
+    # ``deadline`` is disabled because a JVM round-trip is much slower
+    # than hypothesis's default budget.
     _hyp_settings = settings(
         max_examples=_DEFAULT_MAX_EXAMPLES,
         deadline=None,
@@ -124,6 +128,47 @@ if _have_hypothesis:
         st.none(), st.integers(min_value=-_SQUARE_BOUND, max_value=_SQUARE_BOUND)
     )
     _bool_strategy = st.one_of(st.none(), st.booleans())
+
+    # ---- Edge-case seeds (scalacheck-style) -----------------------------
+    #
+    # Hypothesis already biases toward "interesting" boundary values, but
+    # explicit ``@example`` decorators make a regression on a specific
+    # value -- e.g. NULL, zero, the type's max -- deterministic across
+    # runs. These are the values we always want to try, before random
+    # generation kicks in.
+    _LONG_EDGES = (None, 0, 1, -1, 7, -7, _LONG_BOUND, -_LONG_BOUND)
+    _SQUARE_EDGES = (None, 0, 1, -1, _SQUARE_BOUND, -_SQUARE_BOUND)
+    # Bool space is exhaustive (only three values) so the @example
+    # decorators here serve more as documentation of the NULL handling
+    # we care about than as new coverage on top of hypothesis's
+    # generator.
+    _BOOL_EDGES = (None, True, False)
+    # Multi-arg edges -- nulls plus the four sign-combos for non-zero
+    # values. Catches off-by-one errors in parameter-index plumbing
+    # better than random generation alone.
+    _LONG_PAIR_EDGES = (
+        (None, None), (None, 0), (0, None),
+        (0, 0), (1, -1), (-1, 1),
+        (_LONG_BOUND, 1), (1, -_LONG_BOUND),
+    )
+
+    def _seed_examples(values, key="value"):
+        """Stack one ``@example`` decorator per seed value."""
+
+        def wrapper(method):
+            for v in reversed(values):
+                method = example(**{key: v})(method)
+            return method
+
+        return wrapper
+
+    def _seed_pair_examples(pairs, keys=("x", "y")):
+        def wrapper(method):
+            for v0, v1 in reversed(pairs):
+                method = example(**{keys[0]: v0, keys[1]: v1})(method)
+            return method
+
+        return wrapper
 
 
 # ---- The UDF templates we exercise --------------------------------------
@@ -229,16 +274,23 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         "ANSI mode",
     )
 
-    def _run(self, func, return_type, df, *udf_arg_columns):
+    def _run(self, func, return_type, df, *udf_arg_columns, kwargs=None):
         """Run ``func`` as a UDF with transpilation on and off, return both rows.
 
-        Asserts the transpiled code path was actually exercised: ``transpiled``
-        must be non-empty after construction, and no transpilation-related
-        warning may fire. Without these checks both runs could silently fall
-        back to interpreted Python and the differential assertion would
-        succeed for the wrong reason.
+        ``udf_arg_columns`` and ``kwargs`` mirror what a caller would
+        write at the dataframe API: positional column names go in
+        ``udf_arg_columns`` and named-argument bindings go in ``kwargs``
+        (e.g. ``kwargs={"y": "b", "x": "a"}`` to bind UDF parameter ``y``
+        to column ``b`` and ``x`` to column ``a``). Use either, or both.
+
+        Asserts the transpiled code path was actually exercised:
+        ``transpiled`` must be non-empty after construction, and no
+        transpilation-related warning may fire. Without these checks both
+        runs could silently fall back to interpreted Python and the
+        differential assertion would succeed for the wrong reason.
         """
         func_name = getattr(func, "__name__", repr(func))
+        kwargs = kwargs or {}
 
         transpile_on_conf = {
             "spark.sql.experimental.optimizer.transpilePyUDFS": True,
@@ -257,7 +309,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                     "meaningless without it",
                 )
                 transpiled_value = df.select(
-                    transpiled_udf(*udf_arg_columns)
+                    transpiled_udf(*udf_arg_columns, **kwargs)
                 ).collect()[0][0]
             bad = [
                 w for w in caught
@@ -275,7 +327,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             interpreted_udf = UserDefinedFunction(func, return_type)
             interpreted_value = df.select(
-                interpreted_udf(*udf_arg_columns)
+                interpreted_udf(*udf_arg_columns, **kwargs)
             ).collect()[0][0]
 
         return transpiled_value, interpreted_value
@@ -288,6 +340,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_plus_four_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four, LongType(), df, "a")
@@ -295,6 +348,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_plus_four_with_else_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four_with_else, LongType(), df, "a")
@@ -304,6 +358,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_is_none_branch_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(is_none_branch, LongType(), df, "a")
@@ -313,6 +368,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_bool_strategy)
+        @_seed_examples(_BOOL_EDGES)
         def test_truthy_bool_branch_matches_python(self, value):
             df = self._single_arg_df(value, BooleanType())
             transpiled, interpreted = self._run(truthy_bool_branch, LongType(), df, "a")
@@ -322,6 +378,11 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        # add_then_mod is the case that surfaced the Python-vs-SQL mod
+        # sign mismatch; the seed values cover the four sign combinations
+        # of `(x + 7) % 5` so we always re-prove the pmod fix on every
+        # run regardless of the random seed.
+        @_seed_examples((*_LONG_EDGES, -2, -8, 8, 100, -100))
         def test_add_then_mod_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(add_then_mod, LongType(), df, "a")
@@ -331,6 +392,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_minus_two_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(minus_two, LongType(), df, "a")
@@ -340,6 +402,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_times_three_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(times_three, LongType(), df, "a")
@@ -349,6 +412,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_square_strategy)
+        @_seed_examples(_SQUARE_EDGES)
         def test_square_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(square, LongType(), df, "a")
@@ -358,6 +422,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(value=_bool_strategy)
+        @_seed_examples(_BOOL_EDGES)
         def test_negate_truthy_matches_python(self, value):
             df = self._single_arg_df(value, BooleanType())
             transpiled, interpreted = self._run(negate_truthy, LongType(), df, "a")
@@ -367,6 +432,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
 
         @_hyp_settings
         @given(x=_long_strategy, y=_long_strategy)
+        @_seed_pair_examples(_LONG_PAIR_EDGES)
         def test_add_two_matches_python(self, x, y):
             schema = StructType([
                 StructField("a", LongType(), nullable=True),
@@ -379,7 +445,32 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             )
 
         @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy)
+        @_seed_pair_examples(_LONG_PAIR_EDGES)
+        def test_add_two_named_args_matches_python(self, x, y):
+            # Same UDF as above but called with kwargs (and intentionally
+            # in reversed order) to exercise the named-argument codepath
+            # documented in the udf() reference. The Python side resolves
+            # the kwargs to the function's positional params; the
+            # transpiled side has to align ``_udf_param_0`` /
+            # ``_udf_param_1`` with the same resolved positions, so any
+            # mistake here produces a swapped-argument bug.
+            schema = StructType([
+                StructField("a", LongType(), nullable=True),
+                StructField("b", LongType(), nullable=True),
+            ])
+            df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
+            transpiled, interpreted = self._run(
+                add_two, LongType(), df, kwargs={"y": "b", "x": "a"},
+            )
+            self.assertEqual(
+                transpiled, interpreted,
+                f"add_two named-args mismatch on (x={x!r}, y={y!r})",
+            )
+
+        @_hyp_settings
         @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
         def test_lambda_plus_four_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(

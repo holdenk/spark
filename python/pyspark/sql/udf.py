@@ -210,6 +210,11 @@ class UserDefinedFunction:
         ast_info = None
         ast_dumped = None
         transpiled = []
+        # When we have a transpiled rewrite, ``__call__`` resolves any
+        # user-supplied kwargs against this positional parameter list so
+        # the JVM-side ``_udf_param_N`` substitution sees the inputs in
+        # the right order. Empty list when transpilation didn't happen.
+        transpiled_param_names: list = []
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession
@@ -240,7 +245,7 @@ class UserDefinedFunction:
             # Import only if needed, also avoid circular import loops.
             from pyspark.sql.transpile import _transpile_func
             try:
-                transpiled, errors = _transpile_func(
+                transpiled, errors, transpiled_param_names = _transpile_func(
                     session,
                     func,
                     returnType)
@@ -255,7 +260,9 @@ class UserDefinedFunction:
                 # investigate without losing their query.
                 warnings.warn(f"Exception transpiling UDF {func}: {e}")
                 transpiled = []
+                transpiled_param_names = []
         self.transpiled = transpiled
+        self._transpiled_param_names = transpiled_param_names
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
@@ -481,6 +488,32 @@ class UserDefinedFunction:
         from pyspark.sql.classic.column import _to_java_column, _to_seq
 
         sc = get_active_spark_context()
+
+        # Transpilation rewrites the UDF into a Catalyst expression that
+        # references its inputs positionally via ``_udf_param_N`` (see
+        # ``UserDefinedPythonFunction.builder.resolveUDFParams``). If the
+        # caller used kwargs, the JVM-side substitution would otherwise
+        # splice ``NamedArgumentExpression`` wrappers into the rewritten
+        # tree (and into nested function calls like ``isnotnull``, which
+        # rejects named arguments). Resolve kwargs to positional here
+        # using the parameter list captured at transpilation time so the
+        # rewritten expression sees plain column refs in declared order.
+        if kwargs and self.transpiled and self._transpiled_param_names:
+            params = self._transpiled_param_names
+            ordered: list = list(args)
+            remaining_kwargs = dict(kwargs)
+            for pname in params[len(args):]:
+                if pname in remaining_kwargs:
+                    ordered.append(remaining_kwargs.pop(pname))
+                else:
+                    # Caller didn't supply this param positionally or by
+                    # name -- bail out of the rewrite and let the regular
+                    # JVM-side path raise a user-facing error.
+                    break
+            else:
+                if not remaining_kwargs:
+                    args = tuple(ordered)
+                    kwargs = {}
 
         assert sc._jvm is not None
         jcols = [_to_java_column(arg) for arg in args] + [

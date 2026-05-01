@@ -75,8 +75,9 @@ class CatalystTranspiler(AbstractTranspiler):
         message between the body and the else arm.
         """
         if len(statements) > 1:
-            raise Exception(
-                f"Currently only support if statements with at most one expression in the {slot}"
+            raise NotImplementedError(
+                f"if statements with more than one expression in the {slot} "
+                "are not currently supported by the transpiler"
             )
         if len(statements) == 0:
             return lit(None)
@@ -147,7 +148,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     for c in cols[1:]:
                         result = result | c
                     return result
-                raise Exception(f"Unhandled BoolOp operator {op}")
+                raise NotImplementedError(f"BoolOp operator {op} is not supported")
             case ast.IfExp(test=test, body=body_expr, orelse=orelse_expr):
                 # Ternary `body if test else orelse` -- shares the
                 # NULL-as-falsy lowering with the if-statement case.
@@ -164,7 +165,10 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
-                    raise Exception("Currently only support simple comparisons with a single comparator")
+                    raise NotImplementedError(
+                        "chained comparisons (e.g. `a < b < c`) are not "
+                        "supported by the transpiler"
+                    )
                 left_col = self._convert_chunk(params, left)
                 match ops[0]:
                     case ast.IsNot():
@@ -172,14 +176,17 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Is():
                         return left_col.isNull()
                     case _:
-                        raise Exception(f"Found unhandled comparison operator {ops[0]}")
+                        raise NotImplementedError(
+                            f"comparison operator {type(ops[0]).__name__} "
+                            "is not supported by the transpiler"
+                        )
             case ast.BinOp(left=left, op=op, right=right):
                 left_col = self._convert_chunk(params, left)
                 if left_col is None:
-                    raise Exception("Could not find left param for addition")
+                    raise ValueError("BinOp left operand could not be lowered to a Column")
                 right_col = self._convert_chunk(params, right)
                 if right_col is None:
-                    raise Exception("Could not find right column for addition")
+                    raise ValueError("BinOp right operand could not be lowered to a Column")
                 match op:
                     # TODO: Maybe use one of the try functions so we can control errors and map topython exceptional cases better.
                     case ast.Add():
@@ -204,7 +211,10 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Pow():
                         return left_col.__pow__(right_col)
                     case _:
-                        raise Exception(f"Found unhandled binary operator {op}")
+                        raise NotImplementedError(
+                            f"binary operator {type(op).__name__} is not "
+                            "supported by the transpiler"
+                        )
             case ast.Return(value=value):
                 return self._convert_chunk(params, value)
             case ast.Constant(value=value):
@@ -220,9 +230,15 @@ class CatalystTranspiler(AbstractTranspiler):
                     return col(f"_udf_param_{param_index}")
                 else:
                     # TODO: Handle assignments, class vars, etc.
-                    raise Exception("Variable referenced not found in inputs")
+                    raise NotImplementedError(
+                        f"name {name!r} is not in the UDF's parameter list "
+                        "and free variables / closures are not supported"
+                    )
             case _:
-                raise Exception(f"Found unhandled Python component {body}")
+                raise NotImplementedError(
+                    f"AST node {type(body).__name__} is not supported by the "
+                    f"transpiler ({ast.dump(body)[:120]})"
+                )
 
     def _transpile_from_ast(
             self,
@@ -237,7 +253,10 @@ class CatalystTranspiler(AbstractTranspiler):
             return None
         function_body = function_ast.body
         if len(function_body) != 1:
-            raise Exception("Currently only support functions with a single expression in the body")
+            raise NotImplementedError(
+                "functions with more than one top-level statement are not "
+                "supported by the transpiler"
+            )
         converted = self._convert_chunk(params, function_body[0])
         # Cast to the declared return type so the rewritten plan reports a
         # known data type to the optimizer's plan validator (otherwise it
@@ -319,24 +338,32 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
 
 def _transpile_func(
         session: "SparkSession",
-        func: Callable[..., Any],        
+        func: Callable[..., Any],
         returnType: "DataTypeOrString",
-    ) -> Tuple[List[Column], List[str]]:
+    ) -> Tuple[List[Column], List[str], List[str]]:
     """
     An experimental internal function that attempts to transpile a callable function.
 
     Returns
     -------
     list of transpiled functions
-    list fo errors as strings
+    list of errors as strings
+    list of positional parameter names (excluding ``self`` for callable
+    instances) -- needed so the caller can resolve named-argument
+    invocations to positional order at call time, since the ``_udf_param_N``
+    substitution in :class:`UserDefinedPythonFunction` is positional.
     """
     try:
         src, ast = _get_src_ast_from_func(func)
         if ast is None:
-            return ([], ["Error getting ast for function, can not transpile"])
+            return ([], ["Error getting ast for function, can not transpile"], [])
         # Get the lambda body and parameters
         function_ast = _get_function_from_ast(ast)
         params = _get_parameter_list(function_ast)
+        # Strip ``self`` for the caller-facing param list -- callers will
+        # match user-supplied kwargs against this, and the user doesn't
+        # name ``self`` at the call site.
+        public_params = params[1:] if params and params[0] == "self" else list(params)
         transpiled = []
         errors = []
         # Maybe multiple transpilers (think CUDA, etc.).
@@ -348,9 +375,9 @@ def _transpile_func(
                 transpiled.append(transpiled_column)
             except Exception as e:
                 errors.append(str(e))
-        return (transpiled, errors)
+        return (transpiled, errors, public_params)
     except Exception as e:
         # Don't re-raise: an inability to transpile must never break a
-        # working UDF. The caller treats an empty `transpiled` list as a
+        # working UDF. The caller treats an empty ``transpiled`` list as a
         # silent fall-back to interpreted Python.
-        return ([], [str(e)])
+        return ([], [str(e)], [])
