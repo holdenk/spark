@@ -22,7 +22,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import inspect
 import textwrap
 from pyspark.sql.column import Column
-from pyspark.sql.functions import lit, when, col
+from pyspark.sql.functions import coalesce, lit, when, col
 
 
 class AbstractTranspiler(object):
@@ -66,9 +66,6 @@ class CatalystTranspiler(AbstractTranspiler):
                 return self._convert_chunk(params, operand).__invert__()
             case ast.If(test, success, orelse):
                 test_col = self._convert_chunk(params, test)
-                inverse_test_col = self._convert_chunk(
-                    params,
-                    ast.UnaryOp(op=ast.Not(), operand=test))
                 if len(success) > 1:
                     raise Exception("Currently only support if statements with at most one expression in the body")
                 elif len(success) == 0:
@@ -81,9 +78,22 @@ class CatalystTranspiler(AbstractTranspiler):
                     else_col = lit(None)
                 else:
                     else_col = self._convert_chunk(params, orelse[0])
-                # Since otherwise acts on all nulls we double check.
-                return when(test_col, body_col).otherwise(
-                    when(inverse_test_col, else_col))
+                # Python evaluates `if test:` by treating None as falsy first
+                # and then checking truthiness. Spark's `when` already routes
+                # NULL into the otherwise branch, so for boolean-typed tests
+                # (the common case after Compare / UnaryOp / IsNotNull) the
+                # cleanest mapping is `when(test, body).otherwise(else)`. We
+                # coalesce the test against `lit(False)` so that a NULL test
+                # deterministically takes the else branch: the previous
+                # double-wrapped form `otherwise(when(~test, else))` silently
+                # produced NULL when `test` itself was NULL (since `~NULL` is
+                # NULL), which doesn't match Python's `if None: ... else: ...`
+                # picking the else branch. Non-boolean tests (e.g. a bare
+                # `if some_int:`) still won't match Python truthiness exactly;
+                # doing that needs the actual input column type, which we
+                # don't currently thread through to the transpiler.
+                safe_test = coalesce(test_col, lit(False))
+                return when(safe_test, body_col).otherwise(else_col)
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
                     raise Exception("Currently only support simple comparisons with a single comparator")
@@ -107,13 +117,13 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Add():
                         return left_col.__add__(right_col)
                     case ast.Sub():
-                        return left_col.__subtract__(right_col)
+                        return left_col.__sub__(right_col)
                     case ast.Mult():
                         return left_col.__mul__(right_col)
                     case ast.Mod():
                         return left_col.__mod__(right_col)
                     case ast.Pow():
-                        return left_col.__mod__(right_col)
+                        return left_col.__pow__(right_col)
                     case _:
                         raise Exception(f"Found unhandled binary operator {op}")
             case ast.Return(value=value):
