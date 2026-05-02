@@ -81,9 +81,21 @@ case class UserDefinedPythonFunction(
     } else {
       PythonUDF(name, func, dataType, e, pythonEvalType, udfDeterministic)
     }
+    // The ``_udf_param_N`` substitution below is positional, so a UDF
+    // call site that supplied named arguments (e.g. SQL ``name => val``
+    // or pyspark ``udf(b=col)``) would splice ``NamedArgumentExpression``
+    // wrappers into the rewritten Catalyst tree and confuse downstream
+    // function resolution (``isnotnull`` etc. reject named parameters).
+    // The Python ``__call__`` shim resolves kwargs to positional before
+    // they reach this builder; SQL named arguments don't go through that
+    // shim, so we conservatively skip transpilation here when any child
+    // is a ``NamedArgumentExpression`` and let the regular Python UDF
+    // path execute.
+    val transpiledExprsForUse =
+      if (e.exists(_.isInstanceOf[NamedArgumentExpression])) Nil else transpiledExprs
     // If we have a possible transpiled expression insert that node so we can choose later
-    if (transpiledExprs.nonEmpty) {
-      val tpu = TranspiledPythonUDF(name, udfExpr, transpiledExprs)
+    if (transpiledExprsForUse.nonEmpty) {
+      val tpu = TranspiledPythonUDF(name, udfExpr, transpiledExprsForUse)
       // Resolve the UDF parameters to match the original UDF children
       def resolveUDFParams(expression: Expression, children: Array[Expression]): Expression = {
         expression match {
