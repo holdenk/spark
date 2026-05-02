@@ -1564,10 +1564,17 @@ jobs:
 
   transpile:
     name: "Run hypothesis-based UDF transpile tests"
-    needs: preconditions
-    if: needs.preconditions.outputs.transpile == 'true'
+    needs: [precondition, infra-image]
+    if: (!cancelled()) && (fromJson(needs.preconditions.outputs.required).transpile == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    container:
+      image: ${{ needs.precondition.outputs.image_pyspark_url_link }}
+      options: >-
+        --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined
+    strategy:
+      fail-fast: false
     steps:
       - name: Checkout Spark repository
         uses: actions/checkout@v6
@@ -1588,6 +1595,9 @@ jobs:
           key: coursier-build-spark-transpile-hypothesis-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             coursier-build-spark-transpile-hypothesis-
+      - name: Free up disk space
+        shell: 'script -q -e -c "bash {0}"'
+        run: ./dev/free_disk_space_container
       - name: Install Java 17
         uses: actions/setup-java@v5
         with:
