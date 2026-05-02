@@ -610,6 +610,7 @@ jobs:
       METASPACE_SIZE: 1g
       BRANCH: ${{ inputs.branch }}
       PYSPARK_TEST_TIMEOUT: 450
+      RUN_HYPOTHESIS: fromJson(needs.precondition.outputs.required).transpile
     steps:
     - name: Checkout Spark repository
       uses: actions/checkout@v6
@@ -1561,92 +1562,3 @@ jobs:
           cd ui-test
           npm install --save-dev
           node --experimental-vm-modules node_modules/.bin/jest
-
-  transpile:
-    name: "Run hypothesis-based UDF transpile tests"
-    needs: [precondition, infra-image]
-    if: (!cancelled()) && (fromJson(needs.preconditions.outputs.required).transpile == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    container:
-      image: ${{ needs.precondition.outputs.image_pyspark_url_link }}
-      options: >-
-        --cap-add=SYS_PTRACE
-        --security-opt seccomp=unconfined
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout Spark repository
-        uses: actions/checkout@v6
-      - name: Cache SBT and Maven
-        uses: actions/cache@v5
-        with:
-          path: |
-            build/apache-maven-*
-            build/*.jar
-            ~/.sbt
-          key: build-spark-transpile-hypothesis-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
-          restore-keys: |
-            build-spark-transpile-hypothesis-
-      - name: Cache Coursier local repository
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/coursier
-          key: coursier-build-spark-transpile-hypothesis-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            coursier-build-spark-transpile-hypothesis-
-      - name: Free up disk space
-        shell: 'script -q -e -c "bash {0}"'
-        run: ./dev/free_disk_space_container
-      - name: Install Java 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: zulu
-          java-version: 17
-      - name: Install Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          architecture: x64
-      - name: Install Python dependencies
-        run: |
-          # Minimum set needed by ReusedSQLTestCase plus hypothesis itself.
-          # Hypothesis lives in dev/requirements.txt under the optional
-          # test dependencies section; pin range matches that file.
-          python -m pip install --upgrade pip
-          python -m pip install \
-            'py4j>=0.10.9.9' \
-            'numpy>=1.22' \
-            'pyarrow>=18.0.0' \
-            'pandas>=2.2.0' \
-            'hypothesis>=6,<7' \
-            unittest-xml-reporting
-      - name: List Python packages
-        run: python -m pip list
-      - name: Build Spark
-        run: |
-          ./build/sbt -Phive package
-      - name: Run UDF transpile hypothesis tests
-        env:
-          SPARK_TESTING: 1
-          # The test module is gated on this env var being present.
-          RUN_HYPOTHESIS: 1
-          # Inherit the suite's default max-examples (1000). Override here
-          # if a future tweak needs a different count; otherwise keeping
-          # the env un-set keeps the local and CI runs identical.
-        run: |
-          ./python/run-tests \
-            --python-executables=python3 \
-            --testnames pyspark.sql.tests.test_udf_transpile_hypothesis
-      - name: Upload test results to report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: test-results-transpile-hypothesis
-          path: "**/target/test-reports/*.xml"
-      - name: Upload Spark logs
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: spark-logs-transpile-hypothesis
-          path: "**/target/unit-tests.log"
