@@ -522,6 +522,7 @@ object SQLConf {
 
   val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
     buildConf("spark.sql.experimental.optimizer.transpilePyUDFS")
+    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .doc("When true, attempt to transpile Python UDFs to Catalyst expressions. " +
         "Transpilation also requires ANSI mode (spark.sql.ansi.enabled=true) -- " +
         "the rewritten expressions target ANSI semantics, so with ANSI off the " +
@@ -529,17 +530,16 @@ object SQLConf {
         "UDF construction.")
     .version("4.2.0")
     .booleanConf
-    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .createWithDefault(false)
 
 
   val PYTHON_UDF_TRANSPILERS =
     buildConf("spark.sql.experimental.optimizer.pyTranspilers")
+    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .doc("Which transpilers to use for transpiling UDFS. Without the default optimizer " +
       " the first successful result will be the one used.")
     .version("4.2.0")
     .stringConf
-    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .createWithDefault("catalyst")
 
   val OPTIMIZER_EXCLUDED_RULES = buildConf("spark.sql.optimizer.excludedRules")
