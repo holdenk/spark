@@ -527,8 +527,9 @@ object SQLConf {
         "the rewritten expressions target ANSI semantics, so with ANSI off the " +
         "transpiler falls back to interpreted Python and a warning is logged at " +
         "UDF construction.")
-    .version("4.3.0")
+    .version("4.2.0")
     .booleanConf
+    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .createWithDefault(false)
 
 
@@ -536,8 +537,9 @@ object SQLConf {
     buildConf("spark.sql.experimental.optimizer.pyTranspilers")
     .doc("Which transpilers to use for transpiling UDFS. Without the default optimizer " +
       " the first successful result will be the one used.")
-    .version("4.3.0")
+    .version("4.2.0")
     .stringConf
+    .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .createWithDefault("catalyst")
 
   val OPTIMIZER_EXCLUDED_RULES = buildConf("spark.sql.optimizer.excludedRules")

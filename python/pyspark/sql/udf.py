@@ -206,6 +206,7 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
+        self.transpiled = []
         # Extract Python UDF details if transpilation is enabled.
         ast_info = None
         ast_dumped = None
@@ -223,6 +224,7 @@ class UserDefinedFunction:
             if session is None
             else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
         )
+        self._transpile_errors = []
         # Transpilation only attempts to reproduce ANSI-mode Spark SQL semantics
         # (no silent integer overflow, divide-by-zero raises, etc.). Running it
         # against non-ANSI Spark would balloon the test matrix we'd have to
@@ -240,6 +242,7 @@ class UserDefinedFunction:
                     f"{func} -- enable ANSI mode or set transpilePyUDFS=false to "
                     "silence this warning."
                 )
+                self._transpile_errors.append("Transpilation only functions in ANSI mode.")
                 transpile_enabled = False
         if transpile_enabled:
             # Import only if needed, also avoid circular import loops.
@@ -251,8 +254,10 @@ class UserDefinedFunction:
                     returnType)
                 if errors:
                     warnings.warn(f"Errors encountered during transpilation attempts: {errors}")
+                    self._transpile_errors.extend(errors)
                 if not transpiled:
                     warnings.warn(f"Unable to transpile UDF {func}")
+                    self._transpile_errors.append("Transpilation attempted but no result")
             except Exception as e:
                 # An inability to transpile must never break a working
                 # UDF -- fall back to interpreted Python execution and
@@ -261,6 +266,7 @@ class UserDefinedFunction:
                 warnings.warn(f"Exception transpiling UDF {func}: {e}")
                 transpiled = []
                 transpiled_param_names = []
+                self._transpile_errors.append(f"Exception during transpilation: {e}")
         self.transpiled = transpiled
         self._transpiled_param_names = transpiled_param_names
 
