@@ -30,9 +30,9 @@ import ast
 from typing import Any, Callable, List, Optional, Tuple
 import inspect
 import textwrap
+from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
 from pyspark.sql.functions import abs as _abs, coalesce, col, lit, pmod, sign, when
-
 
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
@@ -75,7 +75,7 @@ class CatalystTranspiler(AbstractTranspiler):
         message between the body and the else arm.
         """
         if len(statements) > 1:
-            raise NotImplementedError(
+            raise UnsupportedOperationException(
                 f"if statements with more than one expression in the {slot} "
                 "are not currently supported by the transpiler"
             )
@@ -148,7 +148,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     for c in cols[1:]:
                         result = result | c
                     return result
-                raise NotImplementedError(f"BoolOp operator {op} is not supported")
+                raise UnsupportedOperationException(f"BoolOp operator {op} is not supported")
             case ast.IfExp(test=test, body=body_expr, orelse=orelse_expr):
                 # Ternary `body if test else orelse` -- shares the
                 # NULL-as-falsy lowering with the if-statement case.
@@ -165,7 +165,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
-                    raise NotImplementedError(
+                    raise UnsupportedOperationException(
                         "chained comparisons (e.g. `a < b < c`) are not "
                         "supported by the transpiler"
                     )
@@ -176,7 +176,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Is():
                         return left_col.isNull()
                     case _:
-                        raise NotImplementedError(
+                        raise UnsupportedOperationException(
                             f"comparison operator {type(ops[0]).__name__} "
                             "is not supported by the transpiler"
                         )
@@ -211,7 +211,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Pow():
                         return left_col.__pow__(right_col)
                     case _:
-                        raise NotImplementedError(
+                        raise UnsupportedOperationException(
                             f"binary operator {type(op).__name__} is not "
                             "supported by the transpiler"
                         )
@@ -230,12 +230,12 @@ class CatalystTranspiler(AbstractTranspiler):
                     return col(f"_udf_param_{param_index}")
                 else:
                     # TODO: Handle assignments, class vars, etc.
-                    raise NotImplementedError(
+                    raise UnsupportedOperationException(
                         f"name {name!r} is not in the UDF's parameter list "
                         "and free variables / closures are not supported"
                     )
             case _:
-                raise NotImplementedError(
+                raise UnsupportedOperationException(
                     f"AST node {type(body).__name__} is not supported by the "
                     f"transpiler ({ast.dump(body)[:120]})"
                 )
@@ -253,7 +253,7 @@ class CatalystTranspiler(AbstractTranspiler):
             return None
         function_body = function_ast.body
         if len(function_body) != 1:
-            raise NotImplementedError(
+            raise UnsupportedOperationException(
                 "functions with more than one top-level statement are not "
                 "supported by the transpiler"
             )
