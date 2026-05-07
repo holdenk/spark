@@ -60,7 +60,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             transformed_df.explain()
             self.assertEqual(row[0], 5)
 
-
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             call = PlusFour()
             pudf = UserDefinedFunction(call, LongType())
@@ -88,10 +87,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             transformed_df = input_df.select(pudf("a"))
             [row] = transformed_df.collect()
             self.assertEqual(row[0], 5)
-            self.assertEqual(
-                "notfound",
-                transformed_df.explain(extended=True))
-
+            self.assertEqual("notfound", transformed_df.explain(extended=True))
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             call = PlusFour()
@@ -103,12 +99,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             [row] = transformed_df.collect()
             self.assertEqual(row[0], 5)
 
-
     def test_udf_not_transpilable(self):
         class UnsupportedEx:
             def __call__(self, col):
                 if col is not None:
                     return col in "4"
+
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": True}):
             call = UnsupportedEx()
             pudf = UserDefinedFunction(call, BooleanType())
@@ -125,10 +121,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             if x is not None:
                 return x + 4
 
-        with self.sql_conf({
-            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
-            "spark.sql.ansi.enabled": False,
-        }):
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": False,
+            }
+        ):
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 pudf = UserDefinedFunction(plus_four, LongType())
@@ -140,10 +138,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 "requested but ANSI is disabled",
             )
 
-        with self.sql_conf({
-            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
-            "spark.sql.ansi.enabled": True,
-        }):
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
             pudf = UserDefinedFunction(plus_four, LongType())
             self.assertTrue(
                 pudf.transpiled,
@@ -206,23 +206,28 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("func_closure_capture", func_closure_capture, LongType(), Row(a=10), 17),
         ]
 
-        with self.sql_conf({
-            "spark.sql.experimental.optimizer.transpilePyUDFS": True,
-            "spark.sql.ansi.enabled": True,
-        }):
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
             for label, func, return_type, row, expected in cases:
                 with self.subTest(case=label):
                     import warnings as _warnings
+
                     with _warnings.catch_warnings(record=True) as caught_warnings:
                         _warnings.simplefilter("always")
                         pudf = UserDefinedFunction(func, return_type)
                     self.assertEqual(
-                        [], pudf.transpiled,
+                        [],
+                        pudf.transpiled,
                         f"{label}: transpiler should not produce a Catalyst "
                         "expression for this AST shape",
                     )
                     fallback = [
-                        w for w in caught_warnings
+                        w
+                        for w in caught_warnings
                         if "Unable to transpile" in str(w.message)
                         or "Errors encountered" in str(w.message)
                         or "Exception transpiling" in str(w.message)
@@ -235,11 +240,13 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     df = self.spark.createDataFrame([row])
                     [result] = df.select(pudf("a")).collect()
                     self.assertEqual(
-                        result[0], expected,
+                        result[0],
+                        expected,
                         f"{label}: interpreted UDF result diverged from expected",
                     )
 
 
 if __name__ == "__main__":
     from pyspark.testing import main
+
     main()

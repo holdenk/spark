@@ -119,7 +119,9 @@ if _have_hypothesis:
     # 64-bit signed range, kept clear of overflow so arithmetic in both
     # Python and Spark stays in the safe LongType range.
     _LONG_BOUND = 2**31 - 1
-    _long_strategy = st.one_of(st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND))
+    _long_strategy = st.one_of(
+        st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND)
+    )
     # `square` does ``x ** 2``. Spark's ``Column.__pow__`` returns a
     # DoubleType, so the squared value has to stay within ``2**53`` (the
     # largest integer that double precision can represent exactly) for
@@ -152,9 +154,14 @@ if _have_hypothesis:
     # values. Catches off-by-one errors in parameter-index plumbing
     # better than random generation alone.
     _LONG_PAIR_EDGES = (
-        (None, None), (None, 0), (0, None),
-        (0, 0), (1, -1), (-1, 1),
-        (_LONG_BOUND, 1), (1, -_LONG_BOUND),
+        (None, None),
+        (None, 0),
+        (0, None),
+        (0, 0),
+        (1, -1),
+        (-1, 1),
+        (_LONG_BOUND, 1),
+        (1, -_LONG_BOUND),
     )
 
     def _seed_examples(values, key="value"):
@@ -234,7 +241,7 @@ def square(x):
     # Exercises ast.Pow. Inputs are bounded by ``_square_strategy`` so
     # the squared value stays in the LongType range under ANSI overflow.
     if x is not None:
-        return x ** 2
+        return x**2
 
 
 def negate_truthy(x):
@@ -264,9 +271,7 @@ lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 # ----------------------------------------------------------------------------
 
 
-@unittest.skipUnless(
-    _have_hypothesis and _hypothesis_enabled and _regular_spark, _skip_reason
-)
+@unittest.skipUnless(_have_hypothesis and _hypothesis_enabled and _regular_spark, _skip_reason)
 class UDFTranspileHypothesisTests(ReusedSQLTestCase):
     """Compare transpiled vs. interpreted Python UDF output on Hypothesis-generated inputs."""
 
@@ -315,27 +320,24 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                     f"{func_name!r} -- the differential comparison would be "
                     "meaningless without it",
                 )
-                transpiled_value = df.select(
-                    transpiled_udf(*udf_arg_columns, **kwargs)
-                ).collect()[0][0]
+                transpiled_value = df.select(transpiled_udf(*udf_arg_columns, **kwargs)).collect()[
+                    0
+                ][0]
             bad = [
-                w for w in caught
-                if any(
-                    marker in str(w.message)
-                    for marker in self._BAD_TRANSPILE_WARNING_MARKERS
-                )
+                w
+                for w in caught
+                if any(marker in str(w.message) for marker in self._BAD_TRANSPILE_WARNING_MARKERS)
             ]
             self.assertFalse(
                 bad,
-                f"unexpected transpile warnings for {func_name!r}: "
-                f"{[str(w.message) for w in bad]}",
+                f"unexpected transpile warnings for {func_name!r}: {[str(w.message) for w in bad]}",
             )
 
         with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFS": False}):
             interpreted_udf = UserDefinedFunction(func, return_type)
-            interpreted_value = df.select(
-                interpreted_udf(*udf_arg_columns, **kwargs)
-            ).collect()[0][0]
+            interpreted_value = df.select(interpreted_udf(*udf_arg_columns, **kwargs)).collect()[0][
+                0
+            ]
 
         return transpiled_value, interpreted_value
 
@@ -359,9 +361,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_plus_four_with_else_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four_with_else, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"plus_four_with_else mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"plus_four_with_else mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_strategy)
@@ -369,9 +369,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_is_none_branch_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(is_none_branch, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"is_none_branch mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"is_none_branch mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_bool_strategy)
@@ -379,9 +377,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_truthy_bool_branch_matches_python(self, value):
             df = self._single_arg_df(value, BooleanType())
             transpiled, interpreted = self._run(truthy_bool_branch, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"truthy_bool_branch mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"truthy_bool_branch mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_strategy)
@@ -393,9 +389,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_add_then_mod_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(add_then_mod, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"add_then_mod mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"add_then_mod mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_strategy)
@@ -403,9 +397,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_minus_two_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(minus_two, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"minus_two mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"minus_two mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_strategy)
@@ -413,9 +405,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_times_three_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(times_three, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"times_three mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"times_three mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_square_strategy)
@@ -423,9 +413,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_square_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(square, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"square mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"square mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_bool_strategy)
@@ -433,23 +421,21 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         def test_negate_truthy_matches_python(self, value):
             df = self._single_arg_df(value, BooleanType())
             transpiled, interpreted = self._run(negate_truthy, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"negate_truthy mismatch on {value!r}"
-            )
+            self.assertEqual(transpiled, interpreted, f"negate_truthy mismatch on {value!r}")
 
         @_hyp_settings
         @given(x=_long_strategy, y=_long_strategy)
         @_seed_pair_examples(_LONG_PAIR_EDGES)
         def test_add_two_matches_python(self, x, y):
-            schema = StructType([
-                StructField("a", LongType(), nullable=True),
-                StructField("b", LongType(), nullable=True),
-            ])
+            schema = StructType(
+                [
+                    StructField("a", LongType(), nullable=True),
+                    StructField("b", LongType(), nullable=True),
+                ]
+            )
             df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
             transpiled, interpreted = self._run(add_two, LongType(), df, "a", "b")
-            self.assertEqual(
-                transpiled, interpreted, f"add_two mismatch on (x={x!r}, y={y!r})"
-            )
+            self.assertEqual(transpiled, interpreted, f"add_two mismatch on (x={x!r}, y={y!r})")
 
         @_hyp_settings
         @given(x=_long_strategy, y=_long_strategy)
@@ -462,16 +448,22 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             # transpiled side has to align ``_udf_param_0`` /
             # ``_udf_param_1`` with the same resolved positions, so any
             # mistake here produces a swapped-argument bug.
-            schema = StructType([
-                StructField("a", LongType(), nullable=True),
-                StructField("b", LongType(), nullable=True),
-            ])
+            schema = StructType(
+                [
+                    StructField("a", LongType(), nullable=True),
+                    StructField("b", LongType(), nullable=True),
+                ]
+            )
             df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
             transpiled, interpreted = self._run(
-                add_two, LongType(), df, kwargs={"y": "b", "x": "a"},
+                add_two,
+                LongType(),
+                df,
+                kwargs={"y": "b", "x": "a"},
             )
             self.assertEqual(
-                transpiled, interpreted,
+                transpiled,
+                interpreted,
                 f"add_two named-args mismatch on (x={x!r}, y={y!r})",
             )
 
@@ -480,12 +472,8 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_seed_examples(_LONG_EDGES)
         def test_lambda_plus_four_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(
-                lambda_plus_four, LongType(), df, "a"
-            )
-            self.assertEqual(
-                transpiled, interpreted, f"lambda_plus_four mismatch on {value!r}"
-            )
+            transpiled, interpreted = self._run(lambda_plus_four, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"lambda_plus_four mismatch on {value!r}")
 
 
 class UDFTranspileHypothesisGatingTests(unittest.TestCase):

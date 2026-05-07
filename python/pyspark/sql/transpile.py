@@ -26,6 +26,7 @@ Python interpretation in ways we don't currently track. If you flip
 transpilation on with ANSI off the UDF will fall back to interpreted
 Python execution and a warning is logged at UDF construction time.
 """
+
 import ast
 from typing import Any, Callable, List, Optional, Tuple, TYPE_CHECKING
 import inspect
@@ -39,8 +40,10 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from pyspark.sql._typing import DataTypeOrString
 
+
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
+
     varieties = {}
     # Specify the "friendly" name a user can add to spark.sql.experimental.optimizer.transpilers
     # to enable this transpiler.
@@ -51,19 +54,20 @@ class AbstractTranspiler(object):
         AbstractTranspiler.varieties[cls.variety] = cls
 
     def _transpile_from_ast(
-            self,
-            src: str,
-            ast_info: ast.AST,
-            function_ast: ast.FunctionDef,
-            params: List[str],
-            returnType: "DataTypeOrString"
+        self,
+        src: str,
+        ast_info: ast.AST,
+        function_ast: ast.FunctionDef,
+        params: List[str],
+        returnType: "DataTypeOrString",
     ) -> Optional[Column]:
         pass
 
+
 class CatalystTranspiler(AbstractTranspiler):
     """Transpiler that attempts to convert a Python UDF into native Spark SQL expressions."""
-    variety = "catalyst"
 
+    variety = "catalyst"
 
     # TODO:
     # handle
@@ -71,9 +75,7 @@ class CatalystTranspiler(AbstractTranspiler):
     #     x + x
     # should return None because there is no return statement
     # (although maybe we should log since it's likely a mistake).
-    def _convert_branch(
-            self, params: List[str], statements: List[ast.stmt], slot: str
-    ) -> Column:
+    def _convert_branch(self, params: List[str], statements: List[ast.stmt], slot: str) -> Column:
         """Lower a single-statement if-body / if-else block.
 
         ``slot`` is just used to disambiguate the multi-statement error
@@ -89,10 +91,10 @@ class CatalystTranspiler(AbstractTranspiler):
         return self._convert_chunk(params, statements[0])
 
     def _convert_if_like(
-            self,
-            test_col: Column,
-            body_col: Column,
-            else_col: Column,
+        self,
+        test_col: Column,
+        body_col: Column,
+        else_col: Column,
     ) -> Column:
         # Python evaluates `if test:` by treating None as falsy first
         # and then checking truthiness. Spark's `when` already routes
@@ -171,8 +173,7 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
                     raise UnsupportedOperationException(
-                        "chained comparisons (e.g. `a < b < c`) are not "
-                        "supported by the transpiler"
+                        "chained comparisons (e.g. `a < b < c`) are not supported by the transpiler"
                     )
                 left_col = self._convert_chunk(params, left)
                 match ops[0]:
@@ -188,10 +189,14 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.BinOp(left=left, op=op, right=right):
                 left_col = self._convert_chunk(params, left)
                 if left_col is None:
-                    raise UnsupportedOperationException("BinOp left operand could not be lowered to a Column")
+                    raise UnsupportedOperationException(
+                        "BinOp left operand could not be lowered to a Column"
+                    )
                 right_col = self._convert_chunk(params, right)
                 if right_col is None:
-                    raise UnsupportedOperationException("BinOp right operand could not be lowered to a Column")
+                    raise UnsupportedOperationException(
+                        "BinOp right operand could not be lowered to a Column"
+                    )
                 match op:
                     # TODO: Maybe use one of the try functions so we can control errors and map topython exceptional cases better.
                     case ast.Add():
@@ -246,12 +251,12 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
 
     def _transpile_from_ast(
-            self,
-            src: str,
-            ast_info: ast.AST,
-            function_ast: ast.FunctionDef,
-            params: List[str],
-            returnType: "DataTypeOrString"
+        self,
+        src: str,
+        ast_info: ast.AST,
+        function_ast: ast.FunctionDef,
+        params: List[str],
+        returnType: "DataTypeOrString",
     ) -> Optional[Column]:
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
@@ -269,12 +274,18 @@ class CatalystTranspiler(AbstractTranspiler):
         # the schema-stability check on this rule).
         return converted.cast(returnType)
 
+
 CatalystTranspiler.register()
+
 
 def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     """Get the transpilers we should try."""
     transpiler_names = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers").split(",")
-    return [AbstractTranspiler.varieties[name]() for name in transpiler_names if name in AbstractTranspiler.varieties]
+    return [
+        AbstractTranspiler.varieties[name]()
+        for name in transpiler_names
+        if name in AbstractTranspiler.varieties
+    ]
 
 
 def _get_src_ast_from_func(func) -> Tuple[Optional[str], Optional[ast.AST]]:
@@ -293,25 +304,26 @@ def _get_src_ast_from_func(func) -> Tuple[Optional[str], Optional[ast.AST]]:
         ast_info = ast.parse(src)
     return src, ast_info
 
+
 def _get_parameter_list(node: ast.FunctionDef) -> list[str]:
     """Return the positional argument names of in order."""
     return [arg.arg for arg in node.args.args]
- 
- 
+
+
 def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
     """
     Extract a :class:`ast.FunctionDef` node from an AST produced by
     ``ast.parse(inspect.getsource(udf_func))``.
- 
+
     Handles the following source patterns (in order):
- 
+
     * ``f = lambda x: x + 1``  — direct assignment
     * ``f = some_wrapper(lambda x: x + 1, ...)``  — lambda as first positional
       arg of a call (e.g. ``functools.partial``)
     * ``lambda x: x + 1``  — bare expression (getsource on a raw lambda)
     * ``def f(x): ... return x + 1``
     * class with callable
- 
+
     Returns ``None`` when no single unambiguous function can be identified.
     Not yet handled: local class variables.
     """
@@ -341,11 +353,12 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
         return stmt
     return None
 
+
 def _transpile_func(
-        session: "SparkSession",
-        func: Callable[..., Any],
-        returnType: "DataTypeOrString",
-    ) -> Tuple[List[Column], List[str], List[str]]:
+    session: "SparkSession",
+    func: Callable[..., Any],
+    returnType: "DataTypeOrString",
+) -> Tuple[List[Column], List[str], List[str]]:
     """
     An experimental internal function that attempts to transpile a callable function.
 
@@ -376,7 +389,8 @@ def _transpile_func(
         for transpiler in transpilers:
             try:
                 transpiled_column = transpiler._transpile_from_ast(
-                    src, ast, function_ast, params, returnType)
+                    src, ast, function_ast, params, returnType
+                )
                 transpiled.append(transpiled_column)
             except Exception as e:
                 errors.append(str(e))
