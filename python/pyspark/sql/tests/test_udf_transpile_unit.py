@@ -190,8 +190,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             y = 1
             return x + y if x is not None else 0
 
-        def closure_capture(x):
-            offset = 7  # noqa: F841 -- intentional free variable
+        def func_closure_capture(x):
+            offset = 7
             if x is not None:
                 return x + offset
 
@@ -203,7 +203,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("left_shift", left_shift, LongType(), Row(a=3), 6),
             ("less_than_zero", less_than_zero, BooleanType(), Row(a=-1), True),
             ("multi_statement", multi_statement, LongType(), Row(a=5), 6),
-            ("closure_capture", closure_capture, LongType(), Row(a=10), 17),
+            ("func_closure_capture", func_closure_capture, LongType(), Row(a=10), 17),
         ]
 
         with self.sql_conf({
@@ -213,7 +213,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             for label, func, return_type, row, expected in cases:
                 with self.subTest(case=label):
                     import warnings as _warnings
-                    with _warnings.catch_warnings(record=True) as caught:
+                    with _warnings.catch_warnings(record=True) as caught_warnings:
                         _warnings.simplefilter("always")
                         pudf = UserDefinedFunction(func, return_type)
                     self.assertEqual(
@@ -222,7 +222,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         "expression for this AST shape",
                     )
                     fallback = [
-                        w for w in caught
+                        w for w in caught_warnings
                         if "Unable to transpile" in str(w.message)
                         or "Errors encountered" in str(w.message)
                         or "Exception transpiling" in str(w.message)

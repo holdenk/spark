@@ -27,12 +27,17 @@ transpilation on with ANSI off the UDF will fall back to interpreted
 Python execution and a warning is logged at UDF construction time.
 """
 import ast
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, TYPE_CHECKING
 import inspect
 import textwrap
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
 from pyspark.sql.functions import abs as _abs, coalesce, col, lit, pmod, sign, when
+
+
+if TYPE_CHECKING:
+    from pyspark.sql import SparkSession
+    from pyspark.sql._typing import DataTypeOrString
 
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""

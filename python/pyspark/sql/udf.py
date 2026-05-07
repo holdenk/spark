@@ -208,8 +208,6 @@ class UserDefinedFunction:
         self.deterministic = deterministic
         self.transpiled = []
         # Extract Python UDF details if transpilation is enabled.
-        ast_info = None
-        ast_dumped = None
         transpiled = []
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
