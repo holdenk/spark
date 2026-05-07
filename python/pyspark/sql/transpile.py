@@ -183,10 +183,10 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.BinOp(left=left, op=op, right=right):
                 left_col = self._convert_chunk(params, left)
                 if left_col is None:
-                    raise ValueError("BinOp left operand could not be lowered to a Column")
+                    raise UnsupportedOperationException("BinOp left operand could not be lowered to a Column")
                 right_col = self._convert_chunk(params, right)
                 if right_col is None:
-                    raise ValueError("BinOp right operand could not be lowered to a Column")
+                    raise UnsupportedOperationException("BinOp right operand could not be lowered to a Column")
                 match op:
                     # TODO: Maybe use one of the try functions so we can control errors and map topython exceptional cases better.
                     case ast.Add():
