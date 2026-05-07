@@ -81,6 +81,7 @@ from pyspark.sql.types import (
 from pyspark.sql.udf import UserDefinedFunction
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import have_package
+from pyspark.util import is_remote_only
 
 
 _HYPOTHESIS_ENV = "RUN_HYPOTHESIS"
@@ -88,8 +89,12 @@ _have_hypothesis = have_package("hypothesis")
 # Presence-based: any value (including empty) opts in. We just check for the
 # key being in os.environ so e.g. `RUN_HYPOTHESIS= python ...` still counts.
 _hypothesis_enabled = _HYPOTHESIS_ENV in os.environ
+# Transpilation is only supported in regular (non-Connect) Spark for now,
+# so the hypothesis suite skips cleanly under a pyspark-client-only install.
+_regular_spark = not is_remote_only()
 _skip_reason = (
-    f"Set {_HYPOTHESIS_ENV} in the environment to run; hypothesis must also be installed."
+    f"Set {_HYPOTHESIS_ENV} in the environment to run; hypothesis must also be installed, "
+    "and the suite only runs under regular (non-Connect) Spark."
 )
 
 
@@ -259,7 +264,9 @@ lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 # ----------------------------------------------------------------------------
 
 
-@unittest.skipUnless(_have_hypothesis and _hypothesis_enabled, _skip_reason)
+@unittest.skipUnless(
+    _have_hypothesis and _hypothesis_enabled and _regular_spark, _skip_reason
+)
 class UDFTranspileHypothesisTests(ReusedSQLTestCase):
     """Compare transpiled vs. interpreted Python UDF output on Hypothesis-generated inputs."""
 
