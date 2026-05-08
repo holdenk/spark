@@ -550,11 +550,15 @@ processClosure <- function(node, oldEnv, defVars, checkedFuncs, newEnv) {
               funcList <- mget(nodeChar, envir = checkedFuncs, inherits = F,
                                ifnotfound = list(list(NULL)))[[1]]
               found <- sapply(funcList, function(func) {
-                ifelse(
-                  identical(func, obj) &&
-                    # Also check if the parent environment is identical to current parent
-                    identical(parent.env(environment(func)), func.env),
-                  TRUE, FALSE)
+                if (!identical(func, obj)) {
+                  return(FALSE)
+                }
+                # Primitive functions have no R-level environment; identity is enough.
+                if (is.primitive(func)) {
+                  return(TRUE)
+                }
+                # Also check if the parent environment is identical to current parent
+                identical(parent.env(environment(func)), func.env)
               })
               if (sum(found) > 0) {
                 # If function has been examined ignore
