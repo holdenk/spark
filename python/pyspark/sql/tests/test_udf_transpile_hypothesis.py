@@ -253,6 +253,21 @@ def negate_truthy(x):
         return 1
 
 
+def both_positive(x, y):
+    # Exercises ast.BoolOp(And) over Compare operands -- both operands
+    # are statically boolean, so the transpiler should lower to `&`.
+    if x is not None and y is not None:
+        return x > 0 and y > 0
+    return False
+
+
+def either_positive(x, y):
+    # Exercises ast.BoolOp(Or) over Compare operands.
+    if x is not None and y is not None:
+        return x > 0 or y > 0
+    return False
+
+
 def add_two(x, y):
     # Multi-arg UDF -- exercises the parameter-index plumbing for
     # functions with more than one positional argument.
@@ -465,6 +480,38 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 transpiled,
                 interpreted,
                 f"add_two named-args mismatch on (x={x!r}, y={y!r})",
+            )
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy)
+        @_seed_pair_examples(_LONG_PAIR_EDGES)
+        def test_both_positive_matches_python(self, x, y):
+            schema = StructType(
+                [
+                    StructField("a", LongType(), nullable=True),
+                    StructField("b", LongType(), nullable=True),
+                ]
+            )
+            df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
+            transpiled, interpreted = self._run(both_positive, BooleanType(), df, "a", "b")
+            self.assertEqual(
+                transpiled, interpreted, f"both_positive mismatch on (x={x!r}, y={y!r})"
+            )
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy)
+        @_seed_pair_examples(_LONG_PAIR_EDGES)
+        def test_either_positive_matches_python(self, x, y):
+            schema = StructType(
+                [
+                    StructField("a", LongType(), nullable=True),
+                    StructField("b", LongType(), nullable=True),
+                ]
+            )
+            df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
+            transpiled, interpreted = self._run(either_positive, BooleanType(), df, "a", "b")
+            self.assertEqual(
+                transpiled, interpreted, f"either_positive mismatch on (x={x!r}, y={y!r})"
             )
 
         @_hyp_settings

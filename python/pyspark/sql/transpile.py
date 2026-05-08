@@ -64,6 +64,41 @@ class AbstractTranspiler(object):
         pass
 
 
+def _is_definitely_non_boolean(node: ast.AST) -> bool:
+    """Return True when ``node`` is statically guaranteed to evaluate to a
+    value that is *not* a Python ``bool``.
+
+    Used to gate the bitwise lowering of ``and`` / ``or`` / ``not``: Python's
+    short-circuit operators return one of their operands rather than a strict
+    bool, so ``x or 0`` against an int column would silently get
+    bitwise-style behaviour from Spark's ``|`` instead of Python's truthiness
+    fallback. We can't always tell statically (a bare ``ast.Name`` could be
+    bound to any type), so we conservatively only refuse to lower when an
+    operand is *provably* non-boolean -- numeric / string literals, an
+    arithmetic ``BinOp``, a numeric ``UnaryOp(USub/UAdd)``. Everything else
+    (Names, Compare, Not, nested BoolOps, IfExp, conservative cases) is
+    treated as "possibly boolean" and we let the bitwise lowering proceed,
+    relying on the input being a boolean column at runtime.
+    """
+    match node:
+        case ast.Constant(value=v):
+            # ``True`` and ``False`` are themselves bool; ``None`` we
+            # accept (it round-trips through coalesce). Everything else
+            # is definitely not bool.
+            return not (v is None or isinstance(v, bool))
+        case ast.BinOp():
+            # All BinOps we lower (Add/Sub/Mult/Mod/Pow) produce numeric
+            # results, so they're never the result of a Python boolean.
+            return True
+        case ast.UnaryOp(op=ast.USub()) | ast.UnaryOp(op=ast.UAdd()):
+            return True
+        case ast.IfExp(body=body, orelse=orelse):
+            # Conditional only known non-boolean if both branches are.
+            return _is_definitely_non_boolean(body) and _is_definitely_non_boolean(orelse)
+        case _:
+            return False
+
+
 class CatalystTranspiler(AbstractTranspiler):
     """Transpiler that attempts to convert a Python UDF into native Spark SQL expressions."""
 
@@ -121,12 +156,20 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.UnaryOp(op=ast.Not(), operand=operand):
                 # Python's `not None` is `True` (None is falsy), but Spark's
                 # `~NULL` is `NULL`. Coalesce against `lit(True)` so a NULL
-                # operand mirrors Python's "None is falsy" rule. For
-                # already-boolean operands the coalesce is a no-op on
-                # non-NULL values (`~True` and `~False` both stay
-                # non-NULL). Non-boolean operands aren't currently
-                # special-cased -- `not 0` against an int column will
-                # still rely on Spark's invert behavior.
+                # operand mirrors Python's "None is falsy" rule. We only
+                # accept operands that are statically known to be boolean;
+                # for non-boolean operands (e.g. `not 0` against an int
+                # column) Spark's `~` is bitwise, not Python truthiness, so
+                # we bail and let the caller fall back to interpreted
+                # Python rather than silently diverge.
+                if _is_definitely_non_boolean(operand):
+                    raise UnsupportedOperationException(
+                        "`not` operand is statically non-boolean (numeric / "
+                        "string literal or arithmetic expression); Spark's "
+                        "`~` is bitwise, not Python truthiness, so the "
+                        "transpiler refuses to lower this and the UDF "
+                        "falls back to interpreted Python"
+                    )
                 return coalesce(self._convert_chunk(params, operand).__invert__(), lit(True))
             case ast.UnaryOp(op=ast.USub(), operand=operand):
                 # `-x` -- handle both literal negative ints (USub on a
@@ -138,12 +181,24 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.BoolOp(op=op, values=values):
                 # Python `and` / `or` short-circuit and return one of the
                 # operands rather than a strict boolean. For the booleans
-                # produced by Compare / UnaryOp(Not) / IsNotNull this maps
-                # cleanly onto Spark Column `&` / `|`. Non-boolean
-                # operands are not currently special-cased here -- if a
-                # user writes `x or 0` against an int column they'll
-                # get bitwise-style behaviour from Spark, not Python's
-                # truthiness fallback.
+                # produced by Compare / UnaryOp(Not) / nested BoolOps this
+                # maps cleanly onto Spark Column `&` / `|`. For
+                # non-boolean operands the right semantics would require
+                # Python's truthiness rules (0 / "" / None / [] all
+                # falsy), which we can't faithfully reproduce without the
+                # input column types -- Spark's `&` / `|` would silently
+                # do bitwise instead. Bail out here so the caller falls
+                # back to interpreted Python rather than producing a plan
+                # whose results disagree with the original UDF.
+                if any(_is_definitely_non_boolean(v) for v in values):
+                    raise UnsupportedOperationException(
+                        "`and` / `or` operand is statically non-boolean "
+                        "(numeric / string literal or arithmetic "
+                        "expression); Spark's `&` / `|` are bitwise, not "
+                        "Python truthiness, so the transpiler refuses to "
+                        "lower this and the UDF falls back to interpreted "
+                        "Python"
+                    )
                 cols = [self._convert_chunk(params, v) for v in values]
                 if isinstance(op, ast.And):
                     result = cols[0]
@@ -397,7 +452,7 @@ def _transpile_func(
                 transpiled_column = transpiler._transpile_from_ast(
                     src, ast, function_ast, params, returnType
                 )
-                if transpiled_column:
+                if transpiled_column is not None:
                     transpiled.append(transpiled_column)
                 else:
                     errors.append(f"Transpiler {transpiler} returned no column")

@@ -249,6 +249,112 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     )
 
 
+    def test_udf_transpile_boolean_and_or_lowered(self):
+        # When `and`/`or` operands are syntactically boolean (Compare
+        # results in this case), the transpiler should lower to bitwise
+        # `&`/`|` and produce results matching the interpreted UDF.
+        def both_positive(x, y):
+            if x is not None and y is not None:
+                return x > 0 and y > 0
+            return False
+
+        def either_positive(x, y):
+            if x is not None and y is not None:
+                return x > 0 or y > 0
+            return False
+
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
+            for func, x, y, expected in [
+                (both_positive, 1, 2, True),
+                (both_positive, 1, -1, False),
+                (both_positive, None, 1, False),
+                (either_positive, -1, 2, True),
+                (either_positive, -1, -1, False),
+                (either_positive, None, None, False),
+            ]:
+                with self.subTest(func=func.__name__, x=x, y=y):
+                    pudf = UserDefinedFunction(func, BooleanType())
+                    self.assertTrue(
+                        pudf.transpiled,
+                        f"{func.__name__}: bool-typed and/or should transpile",
+                    )
+                    df = self.spark.createDataFrame([Row(a=x, b=y)])
+                    [row] = df.select(pudf("a", "b")).collect()
+                    self.assertEqual(row[0], expected)
+
+    def test_udf_transpile_falls_back_for_non_boolean_short_circuit(self):
+        # Python's `x or 0` returns x if truthy else 0; Spark's `|` is
+        # bitwise, so we'd silently produce wrong results. The transpiler
+        # must refuse, fall back to interpreted Python, and still produce
+        # the correct result.
+        import warnings as _warnings
+
+        def or_zero(x):
+            return x or 0
+
+        def and_one(x):
+            return x and 1
+
+        def not_int(x):
+            return not 0 + x  # operand is BinOp, statically non-boolean
+
+        cases = [
+            ("or_zero", or_zero, LongType(), Row(a=5), 5),
+            ("or_zero_none", or_zero, LongType(), Row(a=None), 0),
+            ("and_one", and_one, LongType(), Row(a=5), 1),
+            ("and_one_zero", and_one, LongType(), Row(a=0), 0),
+            ("not_int", not_int, BooleanType(), Row(a=0), True),
+            ("not_int_nonzero", not_int, BooleanType(), Row(a=3), False),
+        ]
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
+            for label, func, return_type, row, expected in cases:
+                with self.subTest(case=label):
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        pudf = UserDefinedFunction(func, return_type)
+                    self.assertEqual(
+                        [],
+                        pudf.transpiled,
+                        f"{label}: non-boolean and/or/not must NOT be lowered",
+                    )
+                    fallback = [
+                        w
+                        for w in caught
+                        if "Unable to transpile" in str(w.message)
+                        or "Errors encountered" in str(w.message)
+                    ]
+                    self.assertTrue(fallback, f"{label}: expected a fallback warning")
+                    df = self.spark.createDataFrame([row])
+                    [result] = df.select(pudf("a")).collect()
+                    self.assertEqual(result[0], expected, f"{label}: interpreted mismatch")
+
+    def test_cannot_convert_column_into_bool_includes_column_repr(self):
+        # The error fired by ``Column.__bool__`` should name the offending
+        # column so users can see which expression triggered the fallback.
+        from pyspark.errors import PySparkValueError
+
+        df = self.spark.createDataFrame([Row(a=1, b=2)])
+        col_a = df["a"]
+        with self.assertRaises(PySparkValueError) as ctx:
+            bool(col_a)
+        message = str(ctx.exception)
+        self.assertIn("Cannot convert column into bool", message)
+        # Column's stringification is JVM-side and may render the column
+        # as ``a`` (unresolved) or with a backtick variant, so we just
+        # require the column name appears somewhere in the message.
+        self.assertIn("a", message)
+
+
 if __name__ == "__main__":
     from pyspark.testing import main
 
