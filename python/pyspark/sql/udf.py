@@ -213,7 +213,6 @@ class UserDefinedFunction:
         # user-supplied kwargs against this positional parameter list so
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
         # the right order. Empty list when transpilation didn't happen.
-        transpiled_param_names: list = []
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession

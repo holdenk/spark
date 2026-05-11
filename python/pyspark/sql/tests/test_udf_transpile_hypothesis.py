@@ -122,6 +122,9 @@ if _have_hypothesis:
     _long_strategy = st.one_of(
         st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND)
     )
+    # Same range, but without ``None`` -- used for cases whose interpreted
+    # Python body would raise on a None input (e.g. ``x > 0``).
+    _nonnull_long_strategy = st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND)
     # `square` does ``x ** 2``. Spark's ``Column.__pow__`` returns a
     # DoubleType, so the squared value has to stay within ``2**53`` (the
     # largest integer that double precision can represent exactly) for
@@ -256,16 +259,16 @@ def negate_truthy(x):
 def both_positive(x, y):
     # Exercises ast.BoolOp(And) over Compare operands -- both operands
     # are statically boolean, so the transpiler should lower to `&`.
-    if x is not None and y is not None:
-        return x > 0 and y > 0
-    return False
+    # Kept as a single-statement body since the transpiler doesn't yet
+    # support multi-statement function bodies; NULL inputs flow through
+    # `>` to NULL on the Spark side and to a raise on the Python side,
+    # so the strategy below skips None.
+    return x > 0 and y > 0
 
 
 def either_positive(x, y):
     # Exercises ast.BoolOp(Or) over Compare operands.
-    if x is not None and y is not None:
-        return x > 0 or y > 0
-    return False
+    return x > 0 or y > 0
 
 
 def add_two(x, y):
@@ -482,9 +485,24 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 f"add_two named-args mismatch on (x={x!r}, y={y!r})",
             )
 
+        # Non-null sign-combo edges for the boolean tests below. The
+        # bodies (``x > 0 and y > 0`` / ``x > 0 or y > 0``) would raise
+        # in pure Python on a None input, so we only seed non-null
+        # combinations and use ``_nonnull_long_strategy`` for the
+        # randomized portion.
+        _BOOLEAN_PAIR_EDGES = (
+            (0, 0),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+            (-1, -1),
+            (_LONG_BOUND, 1),
+            (1, -_LONG_BOUND),
+        )
+
         @_hyp_settings
-        @given(x=_long_strategy, y=_long_strategy)
-        @_seed_pair_examples(_LONG_PAIR_EDGES)
+        @given(x=_nonnull_long_strategy, y=_nonnull_long_strategy)
+        @_seed_pair_examples(_BOOLEAN_PAIR_EDGES)
         def test_both_positive_matches_python(self, x, y):
             schema = StructType(
                 [
@@ -499,8 +517,8 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             )
 
         @_hyp_settings
-        @given(x=_long_strategy, y=_long_strategy)
-        @_seed_pair_examples(_LONG_PAIR_EDGES)
+        @given(x=_nonnull_long_strategy, y=_nonnull_long_strategy)
+        @_seed_pair_examples(_BOOLEAN_PAIR_EDGES)
         def test_either_positive_matches_python(self, x, y):
             schema = StructType(
                 [

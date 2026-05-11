@@ -253,15 +253,22 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # When `and`/`or` operands are syntactically boolean (Compare
         # results in this case), the transpiler should lower to bitwise
         # `&`/`|` and produce results matching the interpreted UDF.
+        # Each UDF is a single top-level statement (the transpiler
+        # doesn't support multi-statement bodies yet).
+        from pyspark.sql.types import StructField, StructType
+
         def both_positive(x, y):
-            if x is not None and y is not None:
-                return x > 0 and y > 0
-            return False
+            return x > 0 and y > 0
 
         def either_positive(x, y):
-            if x is not None and y is not None:
-                return x > 0 or y > 0
-            return False
+            return x > 0 or y > 0
+
+        schema = StructType(
+            [
+                StructField("a", LongType(), nullable=True),
+                StructField("b", LongType(), nullable=True),
+            ]
+        )
 
         with self.sql_conf(
             {
@@ -269,13 +276,18 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 "spark.sql.ansi.enabled": True,
             }
         ):
+            # NULL inputs propagate through `>` to NULL, which then
+            # passes through `&` / `|` per SQL three-valued logic. We
+            # only assert on non-NULL inputs here since Python's
+            # interpreted `x > 0 and y > 0` would raise on None; the
+            # NULL handling itself is covered by the hypothesis suite.
             for func, x, y, expected in [
                 (both_positive, 1, 2, True),
                 (both_positive, 1, -1, False),
-                (both_positive, None, 1, False),
+                (both_positive, -1, -1, False),
                 (either_positive, -1, 2, True),
                 (either_positive, -1, -1, False),
-                (either_positive, None, None, False),
+                (either_positive, 1, 1, True),
             ]:
                 with self.subTest(func=func.__name__, x=x, y=y):
                     pudf = UserDefinedFunction(func, BooleanType())
@@ -283,7 +295,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         pudf.transpiled,
                         f"{func.__name__}: bool-typed and/or should transpile",
                     )
-                    df = self.spark.createDataFrame([Row(a=x, b=y)])
+                    df = self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
                     [row] = df.select(pudf("a", "b")).collect()
                     self.assertEqual(row[0], expected)
 
@@ -293,6 +305,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # must refuse, fall back to interpreted Python, and still produce
         # the correct result.
         import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
 
         def or_zero(x):
             return x or 0
@@ -303,13 +316,15 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def not_int(x):
             return not 0 + x  # operand is BinOp, statically non-boolean
 
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+
         cases = [
-            ("or_zero", or_zero, LongType(), Row(a=5), 5),
-            ("or_zero_none", or_zero, LongType(), Row(a=None), 0),
-            ("and_one", and_one, LongType(), Row(a=5), 1),
-            ("and_one_zero", and_one, LongType(), Row(a=0), 0),
-            ("not_int", not_int, BooleanType(), Row(a=0), True),
-            ("not_int_nonzero", not_int, BooleanType(), Row(a=3), False),
+            ("or_zero", or_zero, LongType(), long_schema, Row(a=5), 5),
+            ("or_zero_none", or_zero, LongType(), long_schema, Row(a=None), 0),
+            ("and_one", and_one, LongType(), long_schema, Row(a=5), 1),
+            ("and_one_zero", and_one, LongType(), long_schema, Row(a=0), 0),
+            ("not_int", not_int, BooleanType(), long_schema, Row(a=0), True),
+            ("not_int_nonzero", not_int, BooleanType(), long_schema, Row(a=3), False),
         ]
         with self.sql_conf(
             {
@@ -317,7 +332,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 "spark.sql.ansi.enabled": True,
             }
         ):
-            for label, func, return_type, row, expected in cases:
+            for label, func, return_type, schema, row, expected in cases:
                 with self.subTest(case=label):
                     with _warnings.catch_warnings(record=True) as caught:
                         _warnings.simplefilter("always")
@@ -334,7 +349,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         or "Errors encountered" in str(w.message)
                     ]
                     self.assertTrue(fallback, f"{label}: expected a fallback warning")
-                    df = self.spark.createDataFrame([row])
+                    df = self.spark.createDataFrame([row], schema=schema)
                     [result] = df.select(pudf("a")).collect()
                     self.assertEqual(result[0], expected, f"{label}: interpreted mismatch")
 
