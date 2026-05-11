@@ -222,9 +222,7 @@ class UserDefinedFunction:
             else session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFS") == "true"
         )
         ansi_enabled = (
-            False
-            if session is None
-            else session.conf.get("spark.sql.ansi.enabled") == "true"
+            False if session is None else session.conf.get("spark.sql.ansi.enabled") == "true"
         )
         self._transpile_errors = []
         # Transpilation only attempts to reproduce ANSI-mode Spark SQL semantics

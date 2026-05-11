@@ -248,7 +248,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         f"{label}: interpreted UDF result diverged from expected",
                     )
 
-
     def test_udf_transpile_boolean_and_or_lowered(self):
         # When `and`/`or` operands are syntactically boolean (Compare
         # results in this case), the transpiler should lower to bitwise
