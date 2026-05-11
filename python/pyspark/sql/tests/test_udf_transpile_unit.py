@@ -185,10 +185,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             if x is not None:
                 return x << 1
 
-        def less_than_zero(x):  # ast.Lt, not handled (only Is/IsNot supported).
-            if x is not None:
-                return x < 0
-
         def multi_statement(x):  # > 1 top-level statement, not handled.
             y = 1
             return x + y if x is not None else 0
@@ -204,7 +200,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("bit_and_one", bit_and_one, LongType(), Row(a=5), 1),
             ("bit_or_one", bit_or_one, LongType(), Row(a=4), 5),
             ("left_shift", left_shift, LongType(), Row(a=3), 6),
-            ("less_than_zero", less_than_zero, BooleanType(), Row(a=-1), True),
             ("multi_statement", multi_statement, LongType(), Row(a=5), 6),
             ("func_closure_capture", func_closure_capture, LongType(), Row(a=10), 17),
         ]

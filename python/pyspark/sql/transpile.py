@@ -236,6 +236,18 @@ class CatalystTranspiler(AbstractTranspiler):
                         return left_col.isNotNull()
                     case ast.Is():
                         return left_col.isNull()
+                    case ast.Eq():
+                        return left_col == self._convert_chunk(params, comps[0])
+                    case ast.NotEq():
+                        return left_col != self._convert_chunk(params, comps[0])
+                    case ast.Lt():
+                        return left_col < self._convert_chunk(params, comps[0])
+                    case ast.LtE():
+                        return left_col <= self._convert_chunk(params, comps[0])
+                    case ast.Gt():
+                        return left_col > self._convert_chunk(params, comps[0])
+                    case ast.GtE():
+                        return left_col >= self._convert_chunk(params, comps[0])
                     case _:
                         raise UnsupportedOperationException(
                             f"comparison operator {type(ops[0]).__name__} "
@@ -401,11 +413,18 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
         stmt = stmt.value
 
     if isinstance(stmt, ast.Lambda):
+        # Synthesize a one-statement FunctionDef wrapping the lambda body so
+        # the rest of the transpiler can treat lambdas and ``def`` uniformly.
+        # The list annotations help mypy pick the ast.FunctionDef overload --
+        # without them an empty literal infers as ``list[Never]`` which
+        # doesn't match either documented signature.
+        empty_decorators: List[ast.expr] = []
+        body_stmts: List[ast.stmt] = [ast.Return(value=stmt.body)]
         return ast.FunctionDef(
             name="<lambda>",
             args=stmt.args,
-            body=[ast.Return(value=stmt.body)],
-            decorator_list=[],
+            body=body_stmts,
+            decorator_list=empty_decorators,
         )
 
     if isinstance(stmt, ast.FunctionDef):
