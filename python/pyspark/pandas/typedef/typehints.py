@@ -803,8 +803,8 @@ def _new_type_holders(
             not isinstance(param, slice)
             and (
                 not isinstance(param, Iterable)
-                or isinstance(param, typing.GenericAlias)
-                or isinstance(param, typing._GenericAlias)
+                or isinstance(param, typing.GenericAlias)  # type: ignore[attr-defined]
+                or isinstance(param, typing._GenericAlias)  # type: ignore[attr-defined]
             )
             for param in params
         )
