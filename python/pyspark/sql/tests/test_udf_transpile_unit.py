@@ -293,6 +293,58 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     [row] = df.select(pudf("a", "b")).collect()
                     self.assertEqual(row[0], expected)
 
+    def test_udf_transpile_less_than_zero(self):
+        # Restored from the unsupported-patterns matrix: now that the
+        # transpiler handles ast.Lt, `x < 0` should lower to a Catalyst
+        # expression and match interpreted Python. The ``is not None``
+        # guard short-circuits None inputs through the else branch, so
+        # the comparison itself never sees a NULL in this UDF.
+        from pyspark.sql.types import StructField, StructType
+
+        def less_than_zero(x):
+            if x is not None:
+                return x < 0
+
+        schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
+            pudf = UserDefinedFunction(less_than_zero, BooleanType())
+            self.assertTrue(pudf.transpiled, "less_than_zero should now transpile")
+            for value, expected in [(-1, True), (0, False), (5, False), (None, None)]:
+                with self.subTest(value=value):
+                    df = self.spark.createDataFrame([Row(a=value)], schema=schema)
+                    [row] = df.select(pudf("a")).collect()
+                    self.assertEqual(row[0], expected)
+
+    def test_udf_transpile_compare_with_none_raises(self):
+        # When a comparison's operand is NULL in Spark, Python would have
+        # raised TypeError ('>' not supported between NoneType and int).
+        # The transpiler wraps Compare ops with a raise_error guard so
+        # the rewritten plan fails loudly instead of silently producing
+        # NULL three-valued-logic results.
+        from pyspark.sql.types import StructField, StructType
+
+        def gt_zero(x):
+            return x > 0
+
+        schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFS": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
+            pudf = UserDefinedFunction(gt_zero, BooleanType())
+            self.assertTrue(pudf.transpiled, "gt_zero should transpile")
+            df = self.spark.createDataFrame([Row(a=None)], schema=schema)
+            with self.assertRaises(Exception) as ctx:
+                df.select(pudf("a")).collect()
+            self.assertIn("cannot compare NULL", str(ctx.exception))
+
     def test_udf_transpile_falls_back_for_non_boolean_short_circuit(self):
         # Python's `x or 0` returns x if truthy else 0; Spark's `|` is
         # bitwise, so we'd silently produce wrong results. The transpiler

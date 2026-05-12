@@ -33,7 +33,16 @@ import inspect
 import textwrap
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
-from pyspark.sql.functions import abs as _abs, coalesce, col, lit, pmod, sign, when
+from pyspark.sql.functions import (
+    abs as _abs,
+    coalesce,
+    col,
+    lit,
+    pmod,
+    raise_error,
+    sign,
+    when,
+)
 
 
 if TYPE_CHECKING:
@@ -148,6 +157,34 @@ class CatalystTranspiler(AbstractTranspiler):
         safe_test = coalesce(test_col, lit(False))
         return when(safe_test, body_col).otherwise(else_col)
 
+    def _lower_value_compare(
+        self,
+        params: List[str],
+        left_col: Column,
+        right_node: ast.AST,
+        op: Callable[[Column, Column], Column],
+        op_repr: str,
+    ) -> Column:
+        """Lower a value comparison (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``).
+
+        Python raises ``TypeError`` when an operand of these operators is
+        ``None`` (e.g. ``None > 0``), whereas Spark's three-valued logic
+        returns ``NULL``. To stay faithful to the source UDF we guard the
+        comparison: if either operand is ``NULL`` we raise via
+        ``raise_error``, otherwise we evaluate ``left op right`` as usual.
+        Callers that have already proven the operand non-null (``if x is
+        not None: x > 0``) take the otherwise branch, so they never trip
+        the raise.
+        """
+        right_col = self._convert_chunk(params, right_node)
+        null_guard = left_col.isNull() | right_col.isNull()
+        err = lit(
+            "Python UDF transpiler: cannot compare NULL with operator "
+            f"`{op_repr}`; Python would raise TypeError here. Add an "
+            "`is not None` guard or filter NULLs upstream."
+        )
+        return when(null_guard, raise_error(err)).otherwise(op(left_col, right_col))
+
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
         match body:
             case None:
@@ -237,17 +274,29 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Is():
                         return left_col.isNull()
                     case ast.Eq():
-                        return left_col == self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l == r, "=="
+                        )
                     case ast.NotEq():
-                        return left_col != self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l != r, "!="
+                        )
                     case ast.Lt():
-                        return left_col < self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l < r, "<"
+                        )
                     case ast.LtE():
-                        return left_col <= self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l <= r, "<="
+                        )
                     case ast.Gt():
-                        return left_col > self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l > r, ">"
+                        )
                     case ast.GtE():
-                        return left_col >= self._convert_chunk(params, comps[0])
+                        return self._lower_value_compare(
+                            params, left_col, comps[0], lambda l, r: l >= r, ">="
+                        )
                     case _:
                         raise UnsupportedOperationException(
                             f"comparison operator {type(ops[0]).__name__} "
