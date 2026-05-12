@@ -60,7 +60,11 @@ SPARK_VERSION=$(grep Version "../DESCRIPTION" | awk '{print $NF}')
 # Update url
 sed "s/{SPARK_VERSION}/$SPARK_VERSION/" ../pkgdown/_pkgdown_template.yml > ../_pkgdown.yml
 
-"$R_SCRIPT_PATH/Rscript" -e 'libDir <- "../../lib"; library(SparkR, lib.loc=libDir); pkgdown::build_site("..")'
+# build_site renders vignettes which require a running Spark session (jars). Use
+# build_reference to generate only the API reference pages, which is what the
+# Spark docs site actually serves under api/R/.
+# devel=FALSE avoids pkgload::load_all() which conflicts with the installed SparkR S4 classes.
+"$R_SCRIPT_PATH/Rscript" -e 'libDir <- "../../lib"; library(SparkR, lib.loc=libDir); pkgdown::build_reference("..", lazy=FALSE, preview=FALSE, devel=FALSE)'
 
 # Clean temporary config
 rm ../_pkgdown.yml

@@ -32,8 +32,8 @@ ENV PATH "$PATH:/usr/local/bin"
 
 RUN timeout 5 bash -c 'exec 3<>/dev/tcp/archive.ubuntu.com/80 && printf "HEAD /ubuntu/ HTTP/1.1\r\nHost: archive.ubuntu.com\r\nConnection: close\r\n\r\n" >&3 && IFS= read -r s <&3 && [[ "$s" =~ ^HTTP/.*[[:space:]](2|3)[0-9][0-9] ]]' || find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i.bak -e 's|archive\.ubuntu\.com|mirror.fcix.net|g' -e 's|security\.ubuntu\.com|mirror.fcix.net|g' {} +
 RUN apt-get clean && apt-get update
-RUN PKGS="software-properties-common git libxml2-dev pkg-config curl wget openjdk-8-jdk libpython3-dev python3-pip python3-setuptools build-essential gfortran libopenblas-dev liblapack-dev gpg gpg-agent software-properties-common gcc g++ make libc6-dev libffi-dev libcurl4-openssl-dev libssl-dev openssl zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev tk-dev uuid-dev pandoc libuv1-dev libuv1"; $APT_INSTALL $PKGS || (apt-get update && $APT_INSTALL $PKGS)
-RUN update-alternatives --set java /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java
+RUN PKGS="software-properties-common git libxml2-dev pkg-config curl wget openjdk-8-jdk libpython3-dev python3-pip python3-setuptools build-essential gfortran libopenblas-dev liblapack-dev gpg gpg-agent software-properties-common gcc g++ make libc6-dev libffi-dev libcurl4-openssl-dev libssl-dev openssl zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev tk-dev uuid-dev pandoc libuv1-dev libuv1 libgit2-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev"; $APT_INSTALL $PKGS || (apt-get update && $APT_INSTALL $PKGS)
+RUN update-alternatives --set java /usr/lib/jvm/java-8-openjdk-$(dpkg --print-architecture)/jre/bin/java
 
 # We also want Python 3.8 since that's the oldest supported version for Spark 3.5
 # Also ubuntu is under a DDoS so retry adding, and finally fallback to python.org 3.8 release
@@ -91,6 +91,13 @@ RUN Rscript -e "remotes::install_version('pkgload',  version = '1.3.2', repos = 
     remotes::install_version('purrr',    version = '1.0.1', repos = 'https://cloud.r-project.org')"
 RUN Rscript -e "remotes::install_version('roxygen2', version='7.2.0', repos='https://cloud.r-project.org')"
 
+# ragg is a pkgdown dependency; install before pkgdown so it builds from source with our system libs
+RUN Rscript -e "remotes::install_version('ragg', version='1.2.5', repos='https://cloud.r-project.org')"
+RUN Rscript -e "remotes::install_version('pkgdown', version='2.0.1', repos='https://cloud.r-project.org')"
+RUN Rscript -e "remotes::install_version('preferably', version='0.4', repos='https://cloud.r-project.org')"
+RUN Rscript -e "remotes::install_version('lintr', version='2.0.1', repos='https://cloud.r-project.org')"
+RUN Rscript -e "install.packages(c('ggplot2', 'mvtnorm', 'statmod'), repos='https://cloud.r-project.org/')"
+
 # Sanity check the R install
 RUN Rscript -e " \
   library(testthat); \
@@ -98,6 +105,7 @@ RUN Rscript -e " \
   library(markdown); \
   library(rmarkdown); \
   library(roxygen2); \
+  library(pkgdown); \
   library(xml2);"
 
 # See more in SPARK-39735
