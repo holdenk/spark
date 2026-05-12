@@ -95,9 +95,24 @@ def _is_definitely_non_boolean(node: ast.AST) -> bool:
             # accept (it round-trips through coalesce). Everything else
             # is definitely not bool.
             return not (v is None or isinstance(v, bool))
-        case ast.BinOp():
-            # All BinOps we lower (Add/Sub/Mult/Mod/Pow) produce numeric
-            # results, so they're never the result of a Python boolean.
+        case ast.BinOp(
+            op=ast.Add()
+            | ast.Sub()
+            | ast.Mult()
+            | ast.Div()
+            | ast.FloorDiv()
+            | ast.Mod()
+            | ast.Pow()
+            | ast.LShift()
+            | ast.RShift()
+            | ast.MatMult()
+        ):
+            # Arithmetic / shift BinOps produce numeric (or matrix) results,
+            # never booleans, so they're provably non-boolean. Bitwise
+            # ``&`` / ``|`` / ``^`` are deliberately NOT matched: they
+            # produce a boolean when both operands are boolean (e.g.
+            # ``(x > 0) & (y > 0)``), so leaving them in the "possibly
+            # boolean" bucket lets the BoolOp / Not lowering proceed.
             return True
         case ast.UnaryOp(op=ast.USub()) | ast.UnaryOp(op=ast.UAdd()):
             return True
@@ -156,6 +171,39 @@ class CatalystTranspiler(AbstractTranspiler):
         # don't currently thread through to the transpiler.
         safe_test = coalesce(test_col, lit(False))
         return when(safe_test, body_col).otherwise(else_col)
+
+    def _lower_eq(
+        self,
+        params: List[str],
+        left_col: Column,
+        right_node: ast.AST,
+        equal: bool,
+    ) -> Column:
+        """Lower ``==`` / ``!=`` with Python's None-equality semantics.
+
+        Unlike ordering operators, Python doesn't raise on ``None == x`` /
+        ``None != x``: ``None == None`` is True, ``None == 0`` is False,
+        and ``!=`` is the negation. Spark's ``==`` returns NULL on NULL
+        operands (three-valued logic), which would round-trip through
+        the UDF as ``None`` rather than the bool Python would have
+        produced. Hand-roll the four cases via ``when`` branches.
+        """
+        right_col = self._convert_chunk(params, right_node)
+        left_null = left_col.isNull()
+        right_null = right_col.isNull()
+        if equal:
+            both_null_val: Column = lit(True)
+            one_null_val: Column = lit(False)
+            value_cmp = left_col == right_col
+        else:
+            both_null_val = lit(False)
+            one_null_val = lit(True)
+            value_cmp = left_col != right_col
+        return (
+            when(left_null & right_null, both_null_val)
+            .when(left_null | right_null, one_null_val)
+            .otherwise(value_cmp)
+        )
 
     def _lower_value_compare(
         self,
@@ -274,13 +322,9 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Is():
                         return left_col.isNull()
                     case ast.Eq():
-                        return self._lower_value_compare(
-                            params, left_col, comps[0], lambda l, r: l == r, "=="
-                        )
+                        return self._lower_eq(params, left_col, comps[0], equal=True)
                     case ast.NotEq():
-                        return self._lower_value_compare(
-                            params, left_col, comps[0], lambda l, r: l != r, "!="
-                        )
+                        return self._lower_eq(params, left_col, comps[0], equal=False)
                     case ast.Lt():
                         return self._lower_value_compare(
                             params, left_col, comps[0], lambda l, r: l < r, "<"

@@ -170,6 +170,23 @@ if _have_hypothesis:
         (_LONG_BOUND, 1),
         (1, -_LONG_BOUND),
     )
+    # Sign-combo edges (plus NULL combinations) for the boolean tests.
+    # The bodies (``x > 0 and y > 0`` / ``x > 0 or y > 0``) raise in
+    # pure Python on a None input (``TypeError``), and the transpiler's
+    # NULL-guarded Compare also raises -- so the ``_run`` helper's "both
+    # raised" equivalence covers the NULL cases here.
+    _BOOLEAN_PAIR_EDGES = (
+        (None, None),
+        (None, 0),
+        (0, None),
+        (0, 0),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+        (-1, -1),
+        (_LONG_BOUND, 1),
+        (1, -_LONG_BOUND),
+    )
 
     def _seed_examples(values, key="value"):
         """Stack one ``@example`` decorator per seed value."""
@@ -512,25 +529,6 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 interpreted,
                 f"add_two named-args mismatch on (x={x!r}, y={y!r})",
             )
-
-        # Sign-combo edges (plus NULL combinations) for the boolean
-        # tests below. The bodies (``x > 0 and y > 0`` /
-        # ``x > 0 or y > 0``) raise in pure Python on a None input
-        # (``TypeError``), and the transpiler's NULL-guarded Compare
-        # also raises -- so the ``_run`` helper's "both raised"
-        # equivalence covers the NULL cases here.
-        _BOOLEAN_PAIR_EDGES = (
-            (None, None),
-            (None, 0),
-            (0, None),
-            (0, 0),
-            (1, -1),
-            (-1, 1),
-            (1, 1),
-            (-1, -1),
-            (_LONG_BOUND, 1),
-            (1, -_LONG_BOUND),
-        )
 
         @_hyp_settings
         @given(x=_long_strategy, y=_long_strategy)

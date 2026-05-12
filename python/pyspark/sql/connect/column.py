@@ -623,7 +623,7 @@ class Column(ParentColumn):
 
     def __nonzero__(self) -> None:
         try:
-            column_repr = self._expr.__repr__()
+            column_repr = repr(self._expr)
         except Exception:
             column_repr = "<unknown>"
         raise PySparkValueError(
