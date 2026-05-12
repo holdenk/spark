@@ -415,16 +415,19 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
     if isinstance(stmt, ast.Lambda):
         # Synthesize a one-statement FunctionDef wrapping the lambda body so
         # the rest of the transpiler can treat lambdas and ``def`` uniformly.
-        # The list annotations help mypy pick the ast.FunctionDef overload --
-        # without them an empty literal infers as ``list[Never]`` which
-        # doesn't match either documented signature.
-        empty_decorators: List[ast.expr] = []
-        body_stmts: List[ast.stmt] = [ast.Return(value=stmt.body)]
-        return ast.FunctionDef(
+        # ``ast.FunctionDef``'s overloads in mypy's typeshed require
+        # keyword-only ``type_params`` on 3.12+, which doesn't exist at
+        # runtime on every Python we support (the field was added in
+        # 3.12 -- before that, passing it raises). Drop to ``Any`` so we
+        # avoid the overload resolution entirely; constructing the node
+        # via keyword args is well-defined at runtime even when the typed
+        # overloads disagree.
+        fn_ctor: Any = ast.FunctionDef
+        return fn_ctor(
             name="<lambda>",
             args=stmt.args,
-            body=body_stmts,
-            decorator_list=empty_decorators,
+            body=[ast.Return(value=stmt.body)],
+            decorator_list=[],
         )
 
     if isinstance(stmt, ast.FunctionDef):
