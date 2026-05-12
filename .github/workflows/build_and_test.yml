@@ -100,7 +100,7 @@ jobs:
               \"build\": \"$build\",
               \"pyspark\": \"$pyspark\",
               \"pyspark-pandas\": \"$pandas\",
-              \"sparkr\": \"false\",
+              \"sparkr\": \"$sparkr\",
               \"tpcds-1g\": \"$tpcds\",
               \"docker-integration-tests\": \"$docker\",
               \"scala-213\": \"$build\",
@@ -688,17 +688,11 @@ jobs:
       run: ./dev/lint-js
     - name: Install R linter dependencies and SparkR
       run: |
-        apt update
-        apt-get install -y libcurl4-openssl-dev libgit2-dev libssl-dev libxml2-dev \
-          libfontconfig1-dev libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev \
-          libtiff5-dev libjpeg-dev
-        Rscript -e "install.packages(c('remotes'), repos='https://cloud.r-project.org/')"
-        Rscript -e "remotes::install_version('lintr', version='2.0.1', repos='https://cloud.r-project.org')"
         ./R/install-dev.sh
     - name: Install dependencies for documentation generation
       run: |
         # pandoc is required to generate PySpark APIs as well in nbsphinx.
-        apt-get install -y libcurl4-openssl-dev pandoc
+        apt-get install -y pandoc
         # TODO(SPARK-32407): Sphinx 3.1+ does not correctly index nested classes.
         #   See also https://github.com/sphinx-doc/sphinx/issues/7551.
         # Jinja2 3.0.0+ causes error when building with Sphinx.
@@ -711,9 +705,6 @@ jobs:
         python3.9 -m pip install 'docutils<0.18.0' # See SPARK-39421
         apt-get update -y
         apt-get install -y ruby ruby-dev
-        Rscript -e "install.packages(c('remotes', 'testthat', 'knitr', 'rmarkdown', 'markdown', 'e1071', 'roxygen2', 'ggplot2', 'mvtnorm', 'statmod'), repos='https://cloud.r-project.org/')"
-        Rscript -e "remotes::install_version('pkgdown', version='2.0.1', repos='https://cloud.r-project.org')"
-        Rscript -e "remotes::install_version('preferably', version='0.4', repos='https://cloud.r-project.org')"
         gem install bundler -v 2.4.22
         cd docs
         bundle install
@@ -721,10 +712,6 @@ jobs:
       run: ./dev/lint-r
     - name: Run documentation build
       run: |
-        # SparkR is disabled in this fork's CI (see precondition above), so
-        # always skip the R API doc build to avoid pulling pkgdown / R toolchain
-        # into the docs job.
-        export SKIP_RDOC=1
         if [ -f "./dev/is-changed.py" ]; then
           # Skip PySpark docs when no PySpark module changed; keep Scala/Java/SQL docs
           pyspark_modules=`cd dev && python3.9 -c "import sparktestsupport.modules as m; print(','.join(m.name for m in m.all_modules if m.name.startswith('pyspark')))"`
