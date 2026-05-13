@@ -39,8 +39,10 @@ else
 fi
 
 if [ -d "$SPARK_JARS_DIR" ]; then
-  # Build a zip file containing the source package with vignettes
-  SPARK_HOME="${SPARK_HOME}" "$R_SCRIPT_PATH/R" CMD build "$FWDIR/pkg"
+  # Build a zip file containing the source package with vignettes.
+  # Set GITHUB_ACTIONS=true so the vignette's EVAL_CHUNK guard disables Spark-dependent
+  # chunks when building outside a real Spark environment.
+  SPARK_HOME="${SPARK_HOME}" GITHUB_ACTIONS=true "$R_SCRIPT_PATH/R" CMD build "$FWDIR/pkg"
 
   find pkg/vignettes/. -not -name '.' -not -name '*.Rmd' -not -name '*.md' -not -name '*.pdf' -not -name '*.html' -delete
 else

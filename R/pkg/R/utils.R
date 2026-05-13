@@ -545,8 +545,10 @@ processClosure <- function(node, oldEnv, defVars, checkedFuncs, newEnv) {
           if (tryCatch(exists(nodeChar, envir = func.env, inherits = FALSE),
                        error = function(e) { FALSE })) {
             obj <- get(nodeChar, envir = func.env, inherits = FALSE)
-            if (is.function(obj)) {
+            if (is.function(obj) && !is.primitive(obj)) {
               # If the node is a function call.
+              # Primitive functions have no R-level environment; skip them to avoid
+              # "argument is not an environment" errors from environment(func).
               funcList <- mget(nodeChar, envir = checkedFuncs, inherits = F,
                                ifnotfound = list(list(NULL)))[[1]]
               found <- sapply(funcList, function(func) {

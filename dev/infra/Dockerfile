@@ -21,7 +21,7 @@ FROM ubuntu:jammy
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ENV FULL_REFRESH_DATE 20260420
+ENV FULL_REFRESH_DATE 20260513
 
 ENV DEBIAN_FRONTEND noninteractive
 ENV DEBCONF_NONINTERACTIVE_SEEN true
@@ -32,7 +32,8 @@ ENV PATH "$PATH:/usr/local/bin"
 
 RUN timeout 5 bash -c 'exec 3<>/dev/tcp/archive.ubuntu.com/80 && printf "HEAD /ubuntu/ HTTP/1.1\r\nHost: archive.ubuntu.com\r\nConnection: close\r\n\r\n" >&3 && IFS= read -r s <&3 && [[ "$s" =~ ^HTTP/.*[[:space:]](2|3)[0-9][0-9] ]]' || find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i.bak -e 's|archive\.ubuntu\.com|mirror.fcix.net|g' -e 's|security\.ubuntu\.com|mirror.fcix.net|g' {} +
 RUN apt-get clean && apt-get update
-RUN PKGS="software-properties-common git libxml2-dev pkg-config curl wget openjdk-8-jdk libpython3-dev python3-pip python3-setuptools build-essential gfortran libopenblas-dev liblapack-dev gpg gpg-agent software-properties-common gcc g++ make libc6-dev libffi-dev libcurl4-openssl-dev libssl-dev openssl zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev tk-dev uuid-dev pandoc libuv1-dev libuv1 libgit2-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev"; $APT_INSTALL $PKGS || (apt-get update && $APT_INSTALL $PKGS)
+RUN PKGS="software-properties-common git libxml2-dev pkg-config curl wget openjdk-8-jdk libpython3-dev python3-pip python3-setuptools build-essential gfortran libopenblas-dev liblapack-dev gpg gpg-agent software-properties-common gcc g++ make libc6-dev libffi-dev libcurl4-openssl-dev libssl-dev openssl zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev tk-dev uuid-dev pandoc libuv1-dev libuv1 libgit2-dev libfontconfig1-dev libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev locales libcairo2-dev libxt-dev qpdf"; $APT_INSTALL $PKGS || (apt-get update && $APT_INSTALL $PKGS)
+RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8
 RUN update-alternatives --set java /usr/lib/jvm/java-8-openjdk-$(dpkg --print-architecture)/jre/bin/java
 
 # We also want Python 3.8 since that's the oldest supported version for Spark 3.5
@@ -60,11 +61,20 @@ RUN curl -sS https://bootstrap.pypa.io/pip/3.9/get-pip.py | python3.9
 
 RUN curl -sS https://bootstrap.pypa.io/pip/3.8/get-pip.py | python3.8
 
-RUN echo 'deb https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/' >> /etc/apt/sources.list
-RUN gpg --keyserver hkps://keyserver.ubuntu.com --recv-key E298A3A825C0D65DFD57CBB651716619E084DAB9
-RUN gpg -a --export E084DAB9 | apt-key add -
-RUN apt update
-RUN $APT_INSTALL r-base
+# Build R 4.3.3 from source — pins to branch-3.5 era to avoid CRAN check regressions from newer R.
+# The CRAN ubuntu repo (jammy-cran40) only tracks the latest R release; older versions must be
+# built from source tarball.
+RUN R_VERSION=4.3.3; \
+    curl -O https://cran.r-project.org/src/base/R-4/R-${R_VERSION}.tar.gz && \
+    tar -xzf R-${R_VERSION}.tar.gz && \
+    cd R-${R_VERSION} && \
+    ./configure --with-blas --with-lapack --enable-R-shlib \
+        --with-cairo=yes --with-libpng=yes --with-jpeglib=yes --with-libtiff=yes \
+        --with-readline=yes --with-pcre2 \
+        CFLAGS="-g -O2" CXXFLAGS="-g -O2" && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf R-${R_VERSION} R-${R_VERSION}.tar.gz
 RUN Rscript -e "install.packages(c('remotes'), repos='https://cloud.r-project.org/')"
 
 RUN Rscript -e "remotes::install_cran('testthat');" && Rscript -e "library(testthat);"

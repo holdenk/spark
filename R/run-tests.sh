@@ -58,10 +58,11 @@ if [[ $FAILED != 0 || $NUM_TEST_WARNING != 0 ]]; then
     echo -en "\033[0m"  # No color
     exit -1
 else
-    # We have 2 NOTEs: for RoxygenNote and one in Jenkins only "No repository set"
+    # We have 3 NOTEs: for RoxygenNote, one in Jenkins only "No repository set",
+    # and one for class()-comparison style (introduced as a NOTE in R 4.3.x).
     # For non-latest version branches, one WARNING for package version
-    if [[ ($NUM_CRAN_WARNING != 0 || $NUM_CRAN_ERROR != 0 || $NUM_CRAN_NOTES -gt 2) &&
-          ($HAS_PACKAGE_VERSION_WARN != 1 || $NUM_CRAN_WARNING != 1 || $NUM_CRAN_ERROR != 0 || $NUM_CRAN_NOTES -gt 1) ]]; then
+    if [[ ($NUM_CRAN_WARNING != 0 || $NUM_CRAN_ERROR != 0 || $NUM_CRAN_NOTES -gt 3) &&
+          ($HAS_PACKAGE_VERSION_WARN != 1 || $NUM_CRAN_WARNING != 1 || $NUM_CRAN_ERROR != 0 || $NUM_CRAN_NOTES -gt 2) ]]; then
       cat $CRAN_CHECK_LOG_FILE
       echo -en "\033[31m"  # Red
       echo "Had CRAN check errors; see logs."

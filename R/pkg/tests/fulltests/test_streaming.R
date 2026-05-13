@@ -181,11 +181,11 @@ test_that("PartitionBy", {
 
   df <- read.stream(path = parquetPath, schema = stringSchema)
 
-  expect_error(write.stream(df, "json", path = textPath, checkpointLocation = "append",
+  expect_error(write.stream(df, "json", path = textPath, checkpointLocation = checkpointPath,
                             partitionBy = c(1, 2)),
                             "All partitionBy column names should be characters")
 
-  q <- write.stream(df, "json", path = textPath, checkpointLocation = "append",
+  q <- write.stream(df, "json", path = textPath, checkpointLocation = checkpointPath,
                     partitionBy = "name")
   awaitTermination(q, 5 * 1000)
   callJMethod(q@ssq, "processAllAvailable")
