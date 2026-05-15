@@ -21,7 +21,7 @@ FROM ubuntu:jammy
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ENV FULL_REFRESH_DATE 20260420
+ENV FULL_REFRESH_DATE 20260514
 
 ENV DEBIAN_FRONTEND noninteractive
 ENV DEBCONF_NONINTERACTIVE_SEEN true
@@ -64,7 +64,7 @@ RUN echo 'deb https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/' >> /et
 RUN gpg --keyserver hkps://keyserver.ubuntu.com --recv-key E298A3A825C0D65DFD57CBB651716619E084DAB9
 RUN gpg -a --export E084DAB9 | apt-key add -
 RUN apt update
-RUN $APT_INSTALL r-base
+RUN $APT_INSTALL r-base-core=4.3.3-1.2204.0 r-base-dev=4.3.3-1.2204.0
 RUN Rscript -e "install.packages(c('remotes'), repos='https://cloud.r-project.org/')"
 
 RUN Rscript -e "remotes::install_cran('testthat');" && Rscript -e "library(testthat);"
