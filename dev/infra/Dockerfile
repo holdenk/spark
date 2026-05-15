@@ -72,6 +72,9 @@ RUN Rscript -e "remotes::install_cran('testthat');" && Rscript -e "library(testt
 RUN Rscript -e "remotes::install_cran('fs');library(fs)"
 RUN Rscript -e "remotes::install_cran('sass');library(sass)"
 
+# MASS is "special" but needed for e17071
+RUN Rscript -e "remotes::install_version('MASS',     version = '7.3-60', repos = 'https://cloud.r-project.org')"
+
 # Install generic packages we let float
 
 RUN Rscript -e " \
@@ -88,7 +91,7 @@ RUN Rscript -e "remotes::install_version('pkgload',  version = '1.3.2', repos = 
     remotes::install_version('desc',     version = '1.4.2', repos = 'https://cloud.r-project.org'); \
     remotes::install_version('rlang',    version = '1.1.1', repos = 'https://cloud.r-project.org'); \
     remotes::install_version('cli',      version = '3.6.1', repos = 'https://cloud.r-project.org'); \
-    remotes::install_version('purrr',    version = '1.0.1', repos = 'https://cloud.r-project.org')"
+    remotes::install_version('purrr',    version = '1.0.1', repos = 'https://cloud.r-project.org');"
 RUN Rscript -e "remotes::install_version('roxygen2', version='7.2.0', repos='https://cloud.r-project.org')"
 
 # Sanity check the R install
