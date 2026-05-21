@@ -410,6 +410,7 @@ class TorchDistributorLocalUnitTestsMixin:
             test_file_path, learning_rate_str
         )
 
+    @unittest.skipIf(not have_torch, torch_requirement_message)
     @unittest.skipIf(
         sys.version_info > (3, 12), "SPARK-46078: Fails with dev torch with Python 3.12"
     )
@@ -510,6 +511,7 @@ class TorchDistributorDistributedUnitTestsMixin:
             test_file_path, learning_rate_str
         )
 
+    @unittest.skipIf(not have_torch, torch_requirement_message)
     def test_end_to_end_run_distributedly(self) -> None:
         train_fn = create_training_function(self.mnist_dir_path)
         output = TorchDistributor(num_processes=2, local_mode=False, use_gpu=False).run(
