@@ -174,6 +174,9 @@ abstract class Optimizer(catalogManager: CatalogManager)
         PushDownPredicates))
 
     val batches: Seq[Batch] = flattenBatches(Seq(
+    // UDF substitution rules should be executed before any other rules.
+    // This is so that the optimizer can optimize the substituted results.
+    Batch("Convert python UDFs to Catalyst", Once, ConvertToCatalyst),
     Batch("Finish Analysis", FixedPoint(1), FinishAnalysis),
     // We must run this batch after `ReplaceExpressions`, as `RuntimeReplaceable` expression
     // may produce `With` expressions that need to be rewritten.
@@ -987,6 +990,72 @@ object LimitPushDown extends Rule[LogicalPlan] {
       LocalLimit(le, udf.copy(child = maybePushLocalLimit(le, udf.child)))
     case LocalLimit(le, p @ Project(_, udf: ArrowEvalPython)) =>
       LocalLimit(le, p.copy(child = udf.copy(child = maybePushLocalLimit(le, udf.child))))
+  }
+}
+
+/**
+ * Attempt to convert UDFS to Catalyst expressions.
+ */
+object ConvertToCatalyst extends Rule[LogicalPlan] {
+  // TODO: Can we remove?
+  val UDFTypeCoercesExpressionTypes = new resolver.UDFTypeCoercesExpressionTypes()
+  def apply(plan: LogicalPlan): LogicalPlan = {
+    // Short circuit if there are no Transpiled Python UDFs in the plan.
+    if (!plan.containsPattern(TRANSPILED_PYTHON_UDF)) {
+      return plan
+    }
+    plan.mapExpressions(applyExpr(_, false))
+  }
+
+  def applyExpr(expression: Expression, parent_is_udf: Boolean = false): Expression = {
+    expression match {
+      case s: TranspiledPythonUDF =>
+        // We _shouldn't_ have these nodes if ANSI is not enabled or transpilation is disabled
+        // but if someone changed it while running we'll want to strip the nodes out.
+        if (!conf.getConf(SQLConf.ANSI_ENABLED)) {
+          logWarning(
+            "Skipping Python UDF transpilation: " +
+              s"${SQLConf.ANSI_ENABLED.key} is disabled. The transpiler targets " +
+              "ANSI semantics and refuses to rewrite plans under non-ANSI mode. " +
+              "Enable ANSI or disable transpilation to silence this warning."
+          )
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
+        } else if (!conf.getConf(SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS)) {
+          logWarning(
+            "Skipping Python UDF transpilation: " +
+              s"${SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS.key} is disabled but " +
+              "we still got TranspiledPythonUDFs in our plan."
+          )
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
+        } else if (!parent_is_udf ||
+          !s.children.forall { x => x.isInstanceOf[PythonUDF] }) {
+          // Walk the full list of transpiled options and pick the first one
+          // that's actually usable, falling back to the original Python UDF
+          // if nothing fits. If you're plugging in your own transpilation, please add a
+          // separate ConvertToX so you can choose your desired transpiled nodes.
+          val firstEvaluable = s.transpiledOptions.find(expr => expr != null)
+          firstEvaluable match {
+            case None =>
+              s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
+            case Some(catalystExpr) =>
+              // Recursively apply to the children first because we may use them as inputs in parent
+              val withTranspiledChildren = catalystExpr.mapChildren(
+                applyExpr(_, parent_is_udf = false))
+              // Upgrade the types here since Python duct-typing means that
+              // in Python the types get automatically upgraded (e.g. 4 -> 4L or 4.0 automatically).
+              val catalystExprUpgraded = UDFTypeCoercesExpressionTypes.runCoercionTransformations(
+                withTranspiledChildren, false)
+              catalystExprUpgraded
+          }
+        } else {
+          // We should avoid converting a UDF node where that could break pipelining.
+          // For example: (UDF -> UDF -> UDF) is often cheaper than UDF -> Catalyst -> UDF.
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parent_is_udf = true))
+        }
+      case _ =>
+        // Not a PythonUDF, just recurse down
+        expression.mapChildren(applyExpr(_, parent_is_udf = false))
+    }
   }
 }
 
