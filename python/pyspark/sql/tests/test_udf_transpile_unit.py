@@ -1337,12 +1337,13 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(idf.select(pf("a")).first()[0], "n=5")
             self.assertEqual(idf.select(rp("a")).first()[0], "ababababab")  # "ab" * 5
 
-    def test_udf_transpile_string_column_arithmetic_known_divergence(self):
-        # KNOWN LIMITATION: a string *column* combined with a number can't be
-        # detected statically, so it transpiles and diverges from Python --
-        # Spark coerces the string to a number, while Python would concatenate,
-        # repeat, or raise. Pinned so schema-aware handling (if it ever lands)
-        # trips this test.
+    def test_udf_transpile_string_column_arithmetic(self):
+        # A string *column* combined with a number can't be detected at
+        # transpile time (no schema info). For `+` this stays a documented
+        # divergence: Spark coerces "10" + 5 -> 15 where Python raises
+        # TypeError. For `*` the transpiler now guards at runtime so a string
+        # operand raises loudly instead of silently miscomputing ("2" * 3 used
+        # to yield 6, not Python's "222").
         def col_plus_5(a):
             if a is not None:
                 return a + 5
@@ -1354,16 +1355,36 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         with self.sql_conf(_TRANSPILE_ON):
             plus_udf = UserDefinedFunction(col_plus_5, LongType())
             times_udf = UserDefinedFunction(col_times_3, StringType())
-            self.assertTrue(
-                plus_udf.transpiled and times_udf.transpiled,
-                "string-column arithmetic still transpiles today (no schema info)",
-            )
-            # "10" + 5 -> Spark coerces to 15; interpreted Python raises TypeError.
+            self.assertTrue(plus_udf.transpiled and times_udf.transpiled)
+            # `+`: KNOWN DIVERGENCE -- Spark coerces "10" + 5 to 15; Python raises.
             num_df = self.spark.createDataFrame([("10",)], "a string")
             self.assertEqual(num_df.select(plus_udf("a")).first()[0], 15)
-            # "2" * 3 -> Spark coerces to "6"; interpreted Python gives "222".
-            two_df = self.spark.createDataFrame([("2",)], "a string")
-            self.assertEqual(two_df.select(times_udf("a")).first()[0], "6")
+            # `*`: a string operand now raises rather than silently coercing
+            # (both a numeric-looking "2" and a non-numeric "ab").
+            for val in ["2", "ab"]:
+                with self.subTest(times_value=val):
+                    sdf = self.spark.createDataFrame([(val,)], "a string")
+                    with self.assertRaises(Exception) as ctx:
+                        sdf.select(times_udf("a")).collect()
+                    self.assertIn("numeric", str(ctx.exception).lower())
+
+    def test_udf_transpile_power_precision_known_divergence(self):
+        # KNOWN DIVERGENCE: `**` lowers to Spark `pow`, which returns DOUBLE, so
+        # beyond ~2**53 the exact integer can't be represented and the
+        # transpiled result is off by rounding where Python keeps the exact int.
+        # Values within the safe range still match (see the param-order test);
+        # this pins the boundary behavior as a documented limitation.
+        def square(x):
+            if x is not None:
+                return x ** 2
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(square, LongType())
+            self.assertTrue(pudf.transpiled)
+            x = 134217729  # 2**27 + 1; exact square exceeds double's 2**53 range
+            df = self.spark.createDataFrame([(x,)], "a long")
+            self.assertEqual(df.select(pudf("a")).first()[0], 18014398777917440)
+            self.assertNotEqual(x * x, 18014398777917440)  # Python's exact value differs
 
     def test_udf_transpile_unguarded_arithmetic_on_null_known_divergence(self):
         # KNOWN DIVERGENCE: arithmetic is not null-guarded (unlike the ordering

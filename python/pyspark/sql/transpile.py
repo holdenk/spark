@@ -41,6 +41,7 @@ from pyspark.sql.functions import (
     pmod,
     raise_error,
     sign,
+    typeof,
     when,
 )
 
@@ -428,12 +429,12 @@ class CatalystTranspiler(AbstractTranspiler):
                 # arithmetic meaning -- e.g. `a + "!"`, `"%d" % x`, `"ab" * n`.
                 # A string/bytes literal operand is therefore never arithmetic,
                 # so refuse it and fall back to interpreted Python. A string
-                # *column* operand can't be detected here (no schema info), so
-                # e.g. `a + 5` or `a * 3` on a string column still transpiles
-                # and diverges: a non-numeric value raises a Catalyst cast
-                # error, while a numeric-looking value is silently coerced
-                # (e.g. "2" * 3 -> 6, not "222"). Fixing that needs schema-aware
-                # transpilation; until then it is a documented limitation.
+                # *column* operand can't be detected here (no schema info):
+                # `+` / `-` still transpile and diverge (Spark coerces a
+                # numeric-looking "10" + 5 -> 15, or raises a cast error), while
+                # `*` is guarded at runtime in the Mult case below to raise
+                # rather than silently coerce ("2" * 3). Fully resolving the
+                # column cases needs schema-aware transpilation.
                 if _is_str_or_bytes_constant(left) or _is_str_or_bytes_constant(right):
                     raise UnsupportedOperationException(
                         "binary operator with a string/bytes literal operand "
@@ -471,7 +472,26 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Sub():
                         return left_col.__sub__(right_col)
                     case ast.Mult():
-                        return left_col.__mul__(right_col)
+                        # Python's `*` repeats str/bytes (e.g. "ab" * 3 ->
+                        # "ababab"), and Spark would otherwise silently coerce a
+                        # numeric-looking string ("2" * 3 -> 6, not "222") -- a
+                        # silent wrong value. We can't see operand types at
+                        # transpile time, so guard at runtime: a single Catalyst
+                        # expression can't return both the string repetition and
+                        # the numeric product, so raise loudly rather than
+                        # miscompute when an operand is textual.
+                        textual = typeof(left_col).isin("string", "binary") | typeof(
+                            right_col
+                        ).isin("string", "binary")
+                        mult_err = raise_error(
+                            lit(
+                                "Python UDF transpiler: `*` requires numeric "
+                                "operands; Python's str/bytes repetition (e.g. "
+                                '"ab" * n) is not supported -- guard or rewrite '
+                                "the UDF."
+                            )
+                        )
+                        return when(textual, mult_err).otherwise(left_col.__mul__(right_col))
                     case ast.Mod():
                         # Python's `%` returns a result with the sign of the
                         # divisor; Spark's `%` returns the sign of the
@@ -486,6 +506,12 @@ class CatalystTranspiler(AbstractTranspiler):
                         sb = sign(right_col)
                         return sb * pmod(sb * left_col, _abs(right_col))
                     case ast.Pow():
+                        # `**` lowers to Spark `pow`, which returns DOUBLE.
+                        # Beyond ~2**53 a double can't hold the result exactly,
+                        # so a large integer base/exponent loses precision
+                        # (e.g. (2**27 + 1) ** 2 is off by one) where Python
+                        # keeps arbitrary-precision ints. Documented limitation;
+                        # fixing it would need a dedicated integer-power path.
                         return left_col.__pow__(right_col)
                     case _:
                         raise UnsupportedOperationException(
