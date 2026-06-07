@@ -1105,7 +1105,7 @@ object DependencyOverrides {
     dependencyOverrides += "xerces" % "xercesImpl" % "2.12.2",
     dependencyOverrides += "jline" % "jline" % "2.14.6",
     dependencyOverrides += "org.apache.avro" % "avro" % "1.11.5",
-    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.23.0")
+    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.27.1")
 }
 
 /**
