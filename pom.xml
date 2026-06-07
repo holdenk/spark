@@ -147,10 +147,12 @@
     <jakartaservlet.version>4.0.3</jakartaservlet.version>
     <chill.version>0.10.0</chill.version>
     <!--
-      SPARK-44968: don't upgrade Ivy to version 2.5.2 until the test aborted of
-      `HiveExternalCatalogVersionsSuite` in Java 11/17 daily tests is resolved.
+      Ivy 2.5.3 resolves the `HiveExternalCatalogVersionsSuite` retrieve regression
+      that previously forced a downgrade to 2.5.1 (SPARK-44968), as adopted on master
+      in SPARK-50794, and fixes CVE-2022-46751 (XXE). The Java 11/17 daily tests should
+      be confirmed on this branch before release.
     -->
-    <ivy.version>2.5.1</ivy.version>
+    <ivy.version>2.5.3</ivy.version>
     <oro.version>2.0.8</oro.version>
     <!--
     If you changes codahale.metrics.version, you also need to change
