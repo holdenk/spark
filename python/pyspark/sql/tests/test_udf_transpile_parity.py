@@ -34,12 +34,12 @@ the transpiler directly live in ``test_udf_transpile_unit.py`` and
 ``test_udf_transpile_hypothesis.py``.
 
 Note on configuration: enabling transpilation requires ANSI mode, so an "on"
-run is unavoidably also an ANSI run. A handful of inherited tests are overridden
-with a documented ``unittest.skip`` because they assert non-ANSI semantics or
-observe Python-side execution that transpilation legitimately bypasses (e.g. a
-trivially simple UDF that gets rewritten into native Catalyst). Those skips do
-not change the inherited test bodies; the same tests still run in the default
-"off" suites.
+run is unavoidably also an ANSI run. All inherited tests currently pass as-is
+under this configuration, so no per-test overrides are defined here. If a future
+change makes an inherited test diverge purely due to ANSI semantics or because
+transpilation bypasses a Python-side effect (rather than a genuine result
+change), override it here with a documented ``unittest.skip`` rather than
+editing the inherited test body.
 """
 
 import unittest

@@ -283,6 +283,46 @@ class CatalystTranspiler(AbstractTranspiler):
         )
         return when(null_guard, raise_error(err)).otherwise(op(left_col, right_col))
 
+    def _guard_numeric_binop(
+        self,
+        left: ast.AST,
+        left_col: Column,
+        right: ast.AST,
+        right_col: Column,
+        result: Column,
+        op_repr: str,
+    ) -> Column:
+        """Guard an arithmetic result against textual column operands at runtime.
+
+        The transpiler has no column types, and Python overloads ``+`` / ``*`` /
+        ``%`` for text (concatenation / repetition / %-formatting) while ``-`` /
+        ``**`` reject it; Spark would instead silently coerce a numeric-looking
+        string (``"2" * 3 -> 6``, not ``"222"``) or raise a cast error. A single
+        Catalyst expression can't return both the textual and numeric outcomes,
+        so for any operand that is not a numeric literal we check its runtime
+        type and raise loudly when it is string/binary. String/bytes *literals*
+        never reach here -- they force a fall back to interpreted Python earlier.
+        """
+        checks = [
+            typeof(col).isin("string", "binary")
+            for node, col in ((left, left_col), (right, right_col))
+            if not isinstance(node, ast.Constant)
+        ]
+        if not checks:
+            return result
+        textual = checks[0]
+        for extra in checks[1:]:
+            textual = textual | extra
+        err = raise_error(
+            lit(
+                f"Python UDF transpiler: `{op_repr}` requires numeric operands; "
+                "a string/bytes operand has no arithmetic meaning here (Python "
+                "would concatenate, repeat, format, or raise). Guard or rewrite "
+                "the UDF."
+            )
+        )
+        return when(textual, err).otherwise(result)
+
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
         match body:
             case None:
@@ -423,18 +463,17 @@ class CatalystTranspiler(AbstractTranspiler):
                             "is not supported by the transpiler"
                         )
             case ast.BinOp(left=left, op=op, right=right):
-                # The arithmetic operators below assume *numeric* operands.
-                # Python overloads `+` / `*` / `%` for str/bytes (text
-                # concatenation, repetition, %-formatting), which have no
-                # arithmetic meaning -- e.g. `a + "!"`, `"%d" % x`, `"ab" * n`.
-                # A string/bytes literal operand is therefore never arithmetic,
-                # so refuse it and fall back to interpreted Python. A string
-                # *column* operand can't be detected here (no schema info):
-                # `+` / `-` still transpile and diverge (Spark coerces a
-                # numeric-looking "10" + 5 -> 15, or raises a cast error), while
-                # `*` is guarded at runtime in the Mult case below to raise
-                # rather than silently coerce ("2" * 3). Fully resolving the
-                # column cases needs schema-aware transpilation.
+                # Arithmetic operators assume *numeric* operands, but Python
+                # overloads `+` / `*` / `%` for text (concatenation, repetition,
+                # %-formatting) and rejects `-` / `**` on text. Two layers guard
+                # this: (1) a string/bytes *literal* operand is statically
+                # detectable and forces a fall back to interpreted Python, so
+                # `a + "!"` or `"%d" % x` still runs correctly; (2) a non-literal
+                # operand's type is unknown at transpile time, so
+                # `_guard_numeric_binop` adds a runtime check that raises rather
+                # than let Spark silently coerce `"2" * 3 -> 6` or `"10" + 5 ->
+                # 15`. Fully correct text handling would need schema-aware
+                # transpilation; until then we fail loudly instead of wrong.
                 if _is_str_or_bytes_constant(left) or _is_str_or_bytes_constant(right):
                     raise UnsupportedOperationException(
                         "binary operator with a string/bytes literal operand "
@@ -452,67 +491,46 @@ class CatalystTranspiler(AbstractTranspiler):
                         "BinOp right operand could not be lowered to a Column"
                     )
                 match op:
-                    # These operators assume numeric operands and ANSI mode.
-                    # Known divergences from Python (they need runtime
-                    # type/value info the transpiler doesn't have, so they are
-                    # documented rather than guarded):
-                    #  * overflow -- under ANSI Spark raises ARITHMETIC_OVERFLOW
-                    #    where Python promotes to an arbitrary-precision int;
-                    #  * NULL -- arithmetic is NOT null-guarded (unlike the
-                    #    ordering comparisons above), so `x + 1` on a NULL input
-                    #    yields NULL whereas Python raises TypeError; guard with
-                    #    `is not None` for parity;
-                    #  * `**` lowers to Spark `pow`, which returns DOUBLE, so a
-                    #    large integer base/exponent can lose precision.
-                    # TODO (SPARK-55210): use try-variant functions to map Python
-                    # exceptional cases (overflow, divide-by-zero) to Catalyst
-                    # errors more precisely.
+                    # Value-level divergences remain documented (they need
+                    # runtime value info, not just type): overflow raises
+                    # ARITHMETIC_OVERFLOW under ANSI where Python promotes to a
+                    # big int; arithmetic is not NULL-guarded, so `x + 1` on a
+                    # NULL input yields NULL where Python raises TypeError; and
+                    # `**` lowers to Spark `pow` (DOUBLE), losing precision for
+                    # large integers (e.g. (2**27 + 1) ** 2 is off by one).
+                    # TODO (SPARK-55210): map overflow / divide-by-zero to
+                    # Catalyst errors via try-variant functions.
                     case ast.Add():
-                        return left_col.__add__(right_col)
-                    case ast.Sub():
-                        return left_col.__sub__(right_col)
-                    case ast.Mult():
-                        # Python's `*` repeats str/bytes (e.g. "ab" * 3 ->
-                        # "ababab"), and Spark would otherwise silently coerce a
-                        # numeric-looking string ("2" * 3 -> 6, not "222") -- a
-                        # silent wrong value. We can't see operand types at
-                        # transpile time, so guard at runtime: a single Catalyst
-                        # expression can't return both the string repetition and
-                        # the numeric product, so raise loudly rather than
-                        # miscompute when an operand is textual.
-                        textual = typeof(left_col).isin("string", "binary") | typeof(
-                            right_col
-                        ).isin("string", "binary")
-                        mult_err = raise_error(
-                            lit(
-                                "Python UDF transpiler: `*` requires numeric "
-                                "operands; Python's str/bytes repetition (e.g. "
-                                '"ab" * n) is not supported -- guard or rewrite '
-                                "the UDF."
-                            )
+                        return self._guard_numeric_binop(
+                            left, left_col, right, right_col, left_col.__add__(right_col), "+"
                         )
-                        return when(textual, mult_err).otherwise(left_col.__mul__(right_col))
+                    case ast.Sub():
+                        return self._guard_numeric_binop(
+                            left, left_col, right, right_col, left_col.__sub__(right_col), "-"
+                        )
+                    case ast.Mult():
+                        return self._guard_numeric_binop(
+                            left, left_col, right, right_col, left_col.__mul__(right_col), "*"
+                        )
                     case ast.Mod():
-                        # Python's `%` returns a result with the sign of the
-                        # divisor; Spark's `%` returns the sign of the
-                        # dividend, and Spark's `pmod` is documented for
-                        # non-negative divisors only. The composition
-                        # `sign(b) * pmod(sign(b) * a, abs(b))` reproduces
-                        # Python's semantics for any non-zero divisor without
-                        # us having to reach into Catalyst internals --
-                        # `pmod` does the unsigned remainder, `sign` and
-                        # `abs` line the inputs and output up with the
-                        # divisor's sign.
+                        # Python's `%` takes the sign of the divisor; Spark's
+                        # takes the dividend's. `sign(b) * pmod(sign(b) * a,
+                        # abs(b))` reproduces Python for any non-zero divisor.
                         sb = sign(right_col)
-                        return sb * pmod(sb * left_col, _abs(right_col))
+                        return self._guard_numeric_binop(
+                            left,
+                            left_col,
+                            right,
+                            right_col,
+                            sb * pmod(sb * left_col, _abs(right_col)),
+                            "%",
+                        )
                     case ast.Pow():
-                        # `**` lowers to Spark `pow`, which returns DOUBLE.
-                        # Beyond ~2**53 a double can't hold the result exactly,
-                        # so a large integer base/exponent loses precision
-                        # (e.g. (2**27 + 1) ** 2 is off by one) where Python
-                        # keeps arbitrary-precision ints. Documented limitation;
-                        # fixing it would need a dedicated integer-power path.
-                        return left_col.__pow__(right_col)
+                        # `**` lowers to Spark `pow` (DOUBLE); see the precision
+                        # note above.
+                        return self._guard_numeric_binop(
+                            left, left_col, right, right_col, left_col.__pow__(right_col), "**"
+                        )
                     case _:
                         raise UnsupportedOperationException(
                             f"binary operator {type(op).__name__} is not "
