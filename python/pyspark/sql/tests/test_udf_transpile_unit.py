@@ -1286,6 +1286,155 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(df.select(pudf("a")).first()[0], 5)  # b defaults to 0
             self.assertEqual(df.select(pudf("a", "a")).first()[0], 55)  # 5 + 10 * 5
 
+    # ------------------------------------------------------------------
+    # Incorrect-transpilation hazards (correctness audit). Python overloads
+    # +, *, % for text and treats NULL / NaN / overflow differently from
+    # Spark, and the transpiler has no column-type info, so it assumes numeric
+    # operands. String/bytes *literal* operands are now refused (fall back);
+    # the cases that still transpile are pinned here as documented divergences
+    # so a future change to any of them is noticed.
+    # ------------------------------------------------------------------
+
+    def test_udf_transpile_string_literal_operator_overloading_falls_back(self):
+        # Python's +, *, % over text (concatenation, repetition, %-formatting)
+        # are NOT arithmetic. A string/bytes literal operand makes that
+        # statically detectable, so the transpiler falls back rather than emit
+        # a numeric op over text (which Spark would reject or miscompute).
+        def concat_right(a):
+            if a is not None:
+                return a + "!"
+
+        def concat_left(a):
+            if a is not None:
+                return "pre-" + a
+
+        def percent_format(x):
+            if x is not None:
+                return "n=%d" % x
+
+        def repeat(x):
+            if x is not None:
+                return "ab" * x
+
+        with self.sql_conf(_TRANSPILE_ON):
+            cr = UserDefinedFunction(concat_right, StringType())
+            cl = UserDefinedFunction(concat_left, StringType())
+            pf = UserDefinedFunction(percent_format, StringType())
+            rp = UserDefinedFunction(repeat, StringType())
+            for label, pudf in [
+                ("concat_right", cr),
+                ("concat_left", cl),
+                ("percent_format", pf),
+                ("repeat", rp),
+            ]:
+                with self.subTest(case=label):
+                    self.assertEqual([], pudf.transpiled, f"{label}: must fall back")
+            # Interpreted Python still produces the right text.
+            sdf = self.spark.createDataFrame([("hi",)], "a string")
+            self.assertEqual(sdf.select(cr("a")).first()[0], "hi!")
+            self.assertEqual(sdf.select(cl("a")).first()[0], "pre-hi")
+            idf = self.spark.createDataFrame([(5,)], "a long")
+            self.assertEqual(idf.select(pf("a")).first()[0], "n=5")
+            self.assertEqual(idf.select(rp("a")).first()[0], "ababababab")  # "ab" * 5
+
+    def test_udf_transpile_string_column_arithmetic_known_divergence(self):
+        # KNOWN LIMITATION: a string *column* combined with a number can't be
+        # detected statically, so it transpiles and diverges from Python --
+        # Spark coerces the string to a number, while Python would concatenate,
+        # repeat, or raise. Pinned so schema-aware handling (if it ever lands)
+        # trips this test.
+        def col_plus_5(a):
+            if a is not None:
+                return a + 5
+
+        def col_times_3(a):
+            if a is not None:
+                return a * 3
+
+        with self.sql_conf(_TRANSPILE_ON):
+            plus_udf = UserDefinedFunction(col_plus_5, LongType())
+            times_udf = UserDefinedFunction(col_times_3, StringType())
+            self.assertTrue(
+                plus_udf.transpiled and times_udf.transpiled,
+                "string-column arithmetic still transpiles today (no schema info)",
+            )
+            # "10" + 5 -> Spark coerces to 15; interpreted Python raises TypeError.
+            num_df = self.spark.createDataFrame([("10",)], "a string")
+            self.assertEqual(num_df.select(plus_udf("a")).first()[0], 15)
+            # "2" * 3 -> Spark coerces to "6"; interpreted Python gives "222".
+            two_df = self.spark.createDataFrame([("2",)], "a string")
+            self.assertEqual(two_df.select(times_udf("a")).first()[0], "6")
+
+    def test_udf_transpile_unguarded_arithmetic_on_null_known_divergence(self):
+        # KNOWN DIVERGENCE: arithmetic is not null-guarded (unlike the ordering
+        # comparisons, which raise to mirror Python). An UNguarded `x + 1` thus
+        # yields NULL on a NULL input, whereas interpreted Python raises
+        # TypeError (None + 1). Guard with `is not None` for parity.
+        def add_one_unguarded(x):
+            return x + 1
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(add_one_unguarded, LongType())
+            self.assertTrue(pudf.transpiled)
+            df = self.spark.createDataFrame([(None,), (5,)], "a long")
+            self.assertEqual([r[0] for r in df.select(pudf("a")).collect()], [None, 6])
+
+    def test_udf_transpile_overflow_and_modulo_by_zero_raise(self):
+        # Under ANSI the transpiled arithmetic raises on overflow and on
+        # modulo-by-zero. Interpreted Python would promote `x * x` to a big int
+        # (a divergence; see SPARK-55210), and raises ZeroDivisionError for
+        # `x % 0` (compatible -- both raise).
+        def square(x):
+            if x is not None:
+                return x * x
+
+        def mod_zero(x):
+            if x is not None:
+                return x % 0
+
+        with self.sql_conf(_TRANSPILE_ON):
+            sq = UserDefinedFunction(square, LongType())
+            mz = UserDefinedFunction(mod_zero, LongType())
+            self.assertTrue(sq.transpiled and mz.transpiled)
+            big = self.spark.createDataFrame([(4000000000,)], "a long")  # 4e9^2 overflows long
+            with self.assertRaises(Exception) as ctx:
+                big.select(sq("a")).collect()
+            self.assertIn("OVERFLOW", str(ctx.exception).upper())
+            zero = self.spark.createDataFrame([(5,)], "a long")
+            with self.assertRaises(Exception) as ctx2:
+                zero.select(mz("a")).collect()
+            self.assertIn("ZERO", str(ctx2.exception).upper())
+
+    def test_udf_transpile_nan_comparison_known_divergence(self):
+        # KNOWN DIVERGENCE: Spark orders NaN as greater than every value, so a
+        # transpiled `x > 0` returns True for NaN, whereas interpreted Python
+        # (`nan > 0`) returns False. The null-guard checks isNull, not isNaN.
+        def gt_zero(x):
+            if x is not None:
+                return x > 0
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(gt_zero, BooleanType())
+            self.assertTrue(pudf.transpiled)
+            df = self.spark.createDataFrame([(float("nan"),), (1.0,)], "a double")
+            self.assertEqual([r[0] for r in df.select(pudf("a")).collect()], [True, True])
+
+    def test_udf_transpile_cross_type_equality_coerces(self):
+        # KNOWN DIVERGENCE: comparing a column to a literal of a different type
+        # coerces in Spark, so a transpiled `x == "5"` on an int column is True
+        # for 5, whereas Python's `5 == "5"` is False (no cross-type coercion).
+        # Equality with a string literal is intentionally NOT forced to fall
+        # back, since `stringcol == "5"` is a legitimate, correct comparison.
+        def eq_str_five(x):
+            if x is not None:
+                return x == "5"
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(eq_str_five, BooleanType())
+            self.assertTrue(pudf.transpiled)
+            df = self.spark.createDataFrame([(5,), (3,)], "a long")
+            self.assertEqual([r[0] for r in df.select(pudf("a")).collect()], [True, False])
+
 
 if __name__ == "__main__":
     from pyspark.testing import main

@@ -223,6 +223,12 @@ class CatalystTranspiler(AbstractTranspiler):
         operands (three-valued logic), which would round-trip through
         the UDF as ``None`` rather than the bool Python would have
         produced. Hand-roll the four cases via ``when`` branches.
+
+        Caveat: when the operands are different types Spark coerces before
+        comparing (e.g. an int column ``== "5"`` is True after casting the
+        string), whereas Python's ``==`` is False across unequal types. The
+        transpiler can't see column types, so this divergence is documented
+        rather than guarded.
         """
         right_col = self._convert_chunk(params, right_node)
         left_null = left_col.isNull()
@@ -259,6 +265,13 @@ class CatalystTranspiler(AbstractTranspiler):
         Callers that have already proven the operand non-null (``if x is
         not None: x > 0``) take the otherwise branch, so they never trip
         the raise.
+
+        Two value-level differences from Python remain (they need runtime
+        type/value info, so they are documented, not guarded): Spark orders
+        ``NaN`` as greater than every value, whereas Python's ``NaN``
+        comparisons are all ``False``; and operands of different types are
+        coerced by Spark (e.g. an int column ``> "5"``) where Python raises
+        ``TypeError``.
         """
         right_col = self._convert_chunk(params, right_node)
         null_guard = left_col.isNull() | right_col.isNull()
@@ -409,6 +422,24 @@ class CatalystTranspiler(AbstractTranspiler):
                             "is not supported by the transpiler"
                         )
             case ast.BinOp(left=left, op=op, right=right):
+                # The arithmetic operators below assume *numeric* operands.
+                # Python overloads `+` / `*` / `%` for str/bytes (text
+                # concatenation, repetition, %-formatting), which have no
+                # arithmetic meaning -- e.g. `a + "!"`, `"%d" % x`, `"ab" * n`.
+                # A string/bytes literal operand is therefore never arithmetic,
+                # so refuse it and fall back to interpreted Python. A string
+                # *column* operand can't be detected here (no schema info), so
+                # e.g. `a + 5` or `a * 3` on a string column still transpiles
+                # and diverges: a non-numeric value raises a Catalyst cast
+                # error, while a numeric-looking value is silently coerced
+                # (e.g. "2" * 3 -> 6, not "222"). Fixing that needs schema-aware
+                # transpilation; until then it is a documented limitation.
+                if _is_str_or_bytes_constant(left) or _is_str_or_bytes_constant(right):
+                    raise UnsupportedOperationException(
+                        "binary operator with a string/bytes literal operand "
+                        "(Python text concatenation / repetition / formatting) "
+                        "is not arithmetic and is not supported by the transpiler"
+                    )
                 left_col = self._convert_chunk(params, left)
                 if left_col is None:
                     raise UnsupportedOperationException(
@@ -420,8 +451,21 @@ class CatalystTranspiler(AbstractTranspiler):
                         "BinOp right operand could not be lowered to a Column"
                     )
                 match op:
-                    # TODO (SPARK-55210): Use try-variant functions to map Python exceptional
-                    # cases (e.g. overflow, divide-by-zero) to Catalyst errors more precisely.
+                    # These operators assume numeric operands and ANSI mode.
+                    # Known divergences from Python (they need runtime
+                    # type/value info the transpiler doesn't have, so they are
+                    # documented rather than guarded):
+                    #  * overflow -- under ANSI Spark raises ARITHMETIC_OVERFLOW
+                    #    where Python promotes to an arbitrary-precision int;
+                    #  * NULL -- arithmetic is NOT null-guarded (unlike the
+                    #    ordering comparisons above), so `x + 1` on a NULL input
+                    #    yields NULL whereas Python raises TypeError; guard with
+                    #    `is not None` for parity;
+                    #  * `**` lowers to Spark `pow`, which returns DOUBLE, so a
+                    #    large integer base/exponent can lose precision.
+                    # TODO (SPARK-55210): use try-variant functions to map Python
+                    # exceptional cases (overflow, divide-by-zero) to Catalyst
+                    # errors more precisely.
                     case ast.Add():
                         return left_col.__add__(right_col)
                     case ast.Sub():
@@ -513,6 +557,17 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
         for name in transpiler_names
         if name in AbstractTranspiler.varieties
     ]
+
+
+def _is_str_or_bytes_constant(node: ast.AST) -> bool:
+    """True for a literal ``str`` / ``bytes`` operand.
+
+    Python overloads ``+`` / ``*`` / ``%`` for text (concatenation,
+    repetition, %-formatting); a string/bytes literal operand therefore never
+    denotes arithmetic, so the transpiler refuses such a ``BinOp`` and falls
+    back to interpreted Python rather than emit a numeric op over text.
+    """
+    return isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
 
 
 def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.AST]]:
