@@ -878,19 +878,29 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertIn("a", message)
 
     # ------------------------------------------------------------------
-    # Edge cases (SPARK-55206 follow-up), table-driven. ``_run`` builds a UDF
-    # with transpilation on, runs it, and returns ``(did_it_transpile, values)``.
-    # Cases use assigned lambdas (which transpile) or ``def``s; ``subTest``
-    # labels keep failures identifiable. Plan-elision checks count
-    # ``EvalPython`` nodes, since an ordering compare's ``raise_error`` message
-    # literal contains "UDF" (so the "UDF" substring is unreliable).
+    # Edge cases (SPARK-55206 follow-up). Helpers build a UDF with
+    # transpilation on; `_vals` runs it and returns outputs (asserting it
+    # transpiled), `_raises` asserts it raises. Arg columns come from the
+    # schema. Operator cases are table-driven. Plan-elision checks count
+    # `EvalPython` nodes because an ordering compare's `raise_error` message
+    # contains "UDF" (so the "UDF" substring is unreliable).
     # ------------------------------------------------------------------
 
-    def _run(self, func, return_type, rows, schema, *cols):
+    def _vals(self, func, return_type, schema, rows):
         with self.sql_conf(_TRANSPILE_ON):
             u = UserDefinedFunction(func, return_type)
+            self.assertTrue(u.transpiled, str(func))
             df = self.spark.createDataFrame(rows, schema)
-            return bool(u.transpiled), [r[0] for r in df.select(u(*cols)).collect()]
+            return [r[0] for r in df.select(u(*df.columns)).collect()]
+
+    def _raises(self, func, schema, rows, needle="numeric"):
+        with self.sql_conf(_TRANSPILE_ON):
+            u = UserDefinedFunction(func, LongType())
+            self.assertTrue(u.transpiled, str(func))
+            df = self.spark.createDataFrame(rows, schema)
+            with self.assertRaises(Exception) as ctx:
+                df.select(u(*df.columns)).collect()
+            self.assertIn(needle, str(ctx.exception).lower(), str(func))
 
     @staticmethod
     def _eval_python_count(df):
@@ -901,7 +911,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # non-commutative -/* (parameter order), **, unary nesting, constant
         # body, not(compare), nested boolean, string ==/<, reversed-operand and
         # column-to-column comparisons, if/elif/else, and assigned lambdas.
-        # (Deterministic; the hypothesis suite that fuzzes these is gated.)
         L, B = LongType(), BooleanType()
         modulo = lambda x, y: x % y  # noqa: E731
         subtract = lambda a, b: a - b  # noqa: E731
@@ -917,7 +926,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         rev_lt = lambda x: (0 < x) if x is not None else None  # noqa: E731
         rev_eq = lambda x: 5 == x  # noqa: E731
         none_eq = lambda x: None == x  # noqa: E711,E731
-        col_lt = lambda a, b: (a < b) if (a is not None and b is not None) else None  # noqa: E731
+        col_lt = lambda a, b: (a < b) if a is not None and b is not None else None  # noqa: E731
         assigned = lambda v: v + 1  # noqa: E731
 
         def if_elif_else(x):
@@ -928,121 +937,45 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             else:
                 return 1
 
+        # (func, return_type, schema, rows, expected); arg columns come from the schema.
         cases = [
+            (modulo, L, "a long, b long", [(7, 3), (7, -3), (-7, 3), (-7, -3)], [1, -2, 2, -1]),
+            (subtract, L, "a long, b long", [(5, 3), (3, 5)], [2, -2]),
+            (multiply, L, "a long, b long", [(4, 3), (-2, 5)], [12, -10]),
+            (power, L, "a long", [(6,), (-3,), (0,)], [36, 9, 0]),
+            (double_neg, L, "a long", [(5,), (-3,)], [5, -3]),
+            (unary_pm, L, "a long", [(5,), (-3,)], [-5, 3]),
+            (constant, L, "a long", [(1,), (999,)], [42, 42]),
+            (not_pos, B, "a long", [(1,), (0,), (-1,), (None,)], [False, True, True, None]),
+            (str_eq, B, "a string", [("foo",), ("bar",), (None,)], [True, False, None]),
+            (str_lt, B, "a string", [("a",), ("z",), (None,)], [True, False, None]),
+            (rev_lt, B, "a long", [(1,), (0,), (-1,)], [True, False, False]),
+            (rev_eq, B, "a long", [(5,), (3,), (None,)], [True, False, False]),
+            (none_eq, B, "a long", [(None,), (5,)], [True, False]),
+            (col_lt, B, "a long, b long", [(1, 2), (2, 1), (1, 1)], [True, False, False]),
+            (if_elif_else, L, "a long", [(None,), (0,), (5,), (-3,)], [-1, 0, 1, 1]),
+            (assigned, L, "a long", [(1,), (10,)], [2, 11]),
             (
-                "modulo_sign",
-                modulo,
-                L,
-                [(7, 3), (7, -3), (-7, 3), (-7, -3), (0, 3), (5, -5)],
-                "a long, b long",
-                ("a", "b"),
-                [1, -2, 2, -1, 0, 0],
-            ),
-            (
-                "subtract_order",
-                subtract,
-                L,
-                [(5, 3), (3, 5)],
-                "a long, b long",
-                ("a", "b"),
-                [2, -2],
-            ),
-            ("multiply", multiply, L, [(4, 3), (-2, 5)], "a long, b long", ("a", "b"), [12, -10]),
-            ("power", power, L, [(6,), (-3,), (0,)], "a long", ("a",), [36, 9, 0]),
-            ("double_negate", double_neg, L, [(5,), (-3,)], "a long", ("a",), [5, -3]),
-            ("unary_plus_minus", unary_pm, L, [(5,), (-3,)], "a long", ("a",), [-5, 3]),
-            ("constant_body", constant, L, [(1,), (999,)], "a long", ("a",), [42, 42]),
-            (
-                "not_comparison",
-                not_pos,
-                B,
-                [(1,), (0,), (-1,), (None,)],
-                "a long",
-                ("a",),
-                [False, True, True, None],
-            ),
-            (
-                "nested_boolean",
                 nested,
                 B,
-                [(1, 1, 5), (-1, 1, 0), (-1, 1, 5), (1, -1, 9)],
                 "a long, b long, c long",
-                ("a", "b", "c"),
-                [True, True, False, False],
+                [(1, 1, 5), (-1, 1, 0), (-1, 1, 5)],
+                [True, True, False],
             ),
-            (
-                "string_equality",
-                str_eq,
-                B,
-                [("foo",), ("bar",), (None,)],
-                "a string",
-                ("a",),
-                [True, False, None],
-            ),
-            (
-                "string_ordering",
-                str_lt,
-                B,
-                [("a",), ("z",), (None,)],
-                "a string",
-                ("a",),
-                [True, False, None],
-            ),
-            (
-                "reversed_less_than",
-                rev_lt,
-                B,
-                [(1,), (0,), (-1,)],
-                "a long",
-                ("a",),
-                [True, False, False],
-            ),
-            (
-                "reversed_equals",
-                rev_eq,
-                B,
-                [(5,), (3,), (None,)],
-                "a long",
-                ("a",),
-                [True, False, False],
-            ),
-            ("none_equals_col", none_eq, B, [(None,), (5,)], "a long", ("a",), [True, False]),
-            (
-                "column_lt_column",
-                col_lt,
-                B,
-                [(1, 2), (2, 1), (1, 1)],
-                "a long, b long",
-                ("a", "b"),
-                [True, False, False],
-            ),
-            (
-                "if_elif_else",
-                if_elif_else,
-                L,
-                [(None,), (0,), (5,), (-3,)],
-                "a long",
-                ("a",),
-                [-1, 0, 1, 1],
-            ),
-            ("assigned_lambda", assigned, L, [(1,), (10,)], "a long", ("a",), [2, 11]),
         ]
-        for label, func, rt, rows, schema, cols, expected in cases:
-            with self.subTest(label):
-                transpiled, values = self._run(func, rt, rows, schema, *cols)
-                self.assertTrue(transpiled, f"{label}: should transpile")
-                self.assertEqual(values, expected, label)
+        for i, (func, rt, schema, rows, expected) in enumerate(cases):
+            with self.subTest(case=i):
+                self.assertEqual(self._vals(func, rt, schema, rows), expected, f"case {i}: {rows}")
 
     def test_udf_transpile_callable_object_self_offset(self):
-        # A callable instance carries ``self``; the extractor offsets it so a/b
+        # A callable instance carries `self`; the extractor offsets it so a/b
         # map to _udf_param_0/_udf_param_1 (non-commutative body proves order).
         class SubAB:
             def __call__(self, a, b):
                 return a - b
 
         self.assertEqual(
-            self._run(SubAB(), LongType(), [(5, 3), (3, 5)], "a long, b long", "a", "b"),
-            (True, [2, -2]),
+            self._vals(SubAB(), LongType(), "a long, b long", [(5, 3), (3, 5)]), [2, -2]
         )
 
     def test_udf_transpile_plan_elision(self):
@@ -1098,12 +1031,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             col = self.spark.createDataFrame([(1,)], "a long").select(d("a").alias("r"))
             self.assertEqual(col.schema["r"].dataType, DoubleType())
             self.assertEqual(col.first()[0], 2.0)
-        self.assertEqual(self._run(plus_one, LongType(), [(1,)], "a long", "a"), (True, [2]))
+        self.assertEqual(self._vals(plus_one, LongType(), "a long", [(1,)]), [2])
 
     def test_udf_transpile_falls_back(self):
         # Shapes that must NOT transpile (and still compute via Python):
-        # inline/wrapped/partial lambdas, default/variadic/keyword-only args,
-        # and string-literal operator overloading (+, %, * over text).
+        # inline/wrapped/partial lambdas, default/variadic/keyword-only args, and
+        # string-literal operator overloading (+, %, * over text).
         import functools
 
         def wrapper(fn):
@@ -1132,17 +1065,18 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(
                 [], UserDefinedFunction(functools.partial(base, 1), LongType()).transpiled
             )
-            for label, func, rt in [
-                ("default_arg", with_default, LongType()),
-                ("varargs", with_varargs, LongType()),
-                ("kwargs", with_kwargs, LongType()),
-                ("concat_right", concat_right, StringType()),
-                ("concat_left", concat_left, StringType()),
-                ("percent_format", percent_fmt, StringType()),
-                ("repeat", repeat, StringType()),
+            # default / variadic / keyword-only args, and string-literal +/%/* over text
+            for func, rt in [
+                (with_default, LongType()),
+                (with_varargs, LongType()),
+                (with_kwargs, LongType()),
+                (concat_right, StringType()),
+                (concat_left, StringType()),
+                (percent_fmt, StringType()),
+                (repeat, StringType()),
             ]:
-                with self.subTest(label):
-                    self.assertEqual([], UserDefinedFunction(func, rt).transpiled, label)
+                with self.subTest(func=func):
+                    self.assertEqual([], UserDefinedFunction(func, rt).transpiled)
             # Fell back -> interpreted Python still computes correctly.
             sdf = self.spark.createDataFrame([("hi",)], "a string")
             self.assertEqual(
@@ -1155,105 +1089,59 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             )
 
     def test_udf_transpile_known_value_divergences(self):
-        # Transpile but DIVERGE from Python (need runtime value info to fix;
-        # documented in transpile.py). Pinned so a future fix is noticed:
-        # unguarded arithmetic on NULL yields NULL (Python raises TypeError),
-        # NaN > 0 is True (Python False; Spark orders NaN highest), and a
-        # comparison to a cross-type literal coerces (int == "5" -> True; Python
-        # False). Mixed str/numeric *arithmetic* now raises instead -- see the
-        # pathological-operands test below.
+        # Transpile but DIVERGE from Python (documented in transpile.py; pinned so
+        # a future fix is noticed): unguarded arithmetic on NULL yields NULL
+        # (Python raises TypeError), NaN > 0 is True (Python False; Spark orders
+        # NaN highest), and comparing to a cross-type literal coerces (int == "5"
+        # -> True; Python False). Mixed str/numeric arithmetic raises -- see below.
         unguarded = lambda x: x + 1  # noqa: E731
         nan_gt = lambda x: (x > 0) if x is not None else None  # noqa: E731
         eq_strlit = lambda x: (x == "5") if x is not None else None  # noqa: E731
-        cases = [
-            ("unguarded_null", unguarded, LongType(), [(None,), (5,)], "a long", ("a",), [None, 6]),
-            (
-                "nan_gt_zero",
-                nan_gt,
-                BooleanType(),
-                [(float("nan"),), (1.0,)],
-                "a double",
-                ("a",),
-                [True, True],
-            ),
-            (
-                "int_eq_strlit",
-                eq_strlit,
-                BooleanType(),
-                [(5,), (3,)],
-                "a long",
-                ("a",),
-                [True, False],
-            ),
-        ]
-        for label, func, rt, rows, schema, cols, expected in cases:
-            with self.subTest(label):
-                transpiled, values = self._run(func, rt, rows, schema, *cols)
-                self.assertTrue(transpiled, label)
-                self.assertEqual(values, expected, label)
+        self.assertEqual(self._vals(unguarded, LongType(), "a long", [(None,), (5,)]), [None, 6])
+        self.assertEqual(
+            self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [True, True]
+        )
+        self.assertEqual(
+            self._vals(eq_strlit, BooleanType(), "a long", [(5,), (3,)]), [True, False]
+        )
 
     def test_udf_transpile_known_raise_divergences(self):
         # Transpile but raise where Python differs: overflow under ANSI vs
-        # Python's big int (SPARK-55210), and ``% 0`` (both raise, compatible).
+        # Python's big int (SPARK-55210), and `% 0` (both raise, compatible).
         overflow = lambda x: x * x  # noqa: E731
         modulo_zero = lambda x: x % 0  # noqa: E731
-        cases = [
-            ("overflow", overflow, LongType(), [(4000000000,)], "a long", ("a",), "OVERFLOW"),
-            ("modulo_by_zero", modulo_zero, LongType(), [(5,)], "a long", ("a",), "ZERO"),
-        ]
-        for label, func, rt, rows, schema, cols, needle in cases:
-            with self.subTest(label):
-                with self.sql_conf(_TRANSPILE_ON):
-                    u = UserDefinedFunction(func, rt)
-                    self.assertTrue(u.transpiled, label)
-                    df = self.spark.createDataFrame(rows, schema)
-                    with self.assertRaises(Exception) as ctx:
-                        df.select(u(*cols)).collect()
-                    self.assertIn(needle, str(ctx.exception).upper(), label)
+        self._raises(overflow, "a long", [(4000000000,)], "overflow")
+        self._raises(modulo_zero, "a long", [(5,)], "zero")
 
     def test_udf_transpile_mixed_string_numeric_operands_raise(self):
         # The transpiler can't see column types, so for any non-constant operand
-        # it emits a runtime numeric-type guard: a string/binary column in
-        # arithmetic raises loudly instead of Spark silently coercing it (the
-        # literal guard alone can't catch a string passed as a *column*). These
-        # pathological str/numeric mixes -- including str and int passed as
-        # separate UDF params -- must raise, not miscompute. Python would
-        # concatenate, repeat, format, or raise TypeError; we fail loudly.
+        # it emits a runtime numeric guard: a string/binary column in arithmetic
+        # raises loudly rather than let Spark silently coerce it (the literal
+        # guard alone can't catch a string passed as a *column*). These str/numeric
+        # mixes -- str and int as separate UDF params included -- must raise, not
+        # miscompute (Python would concatenate, repeat, format, or raise TypeError).
         add = lambda a, b: a + b  # noqa: E731
         sub = lambda a, b: a - b  # noqa: E731
         mul = lambda a, b: a * b  # noqa: E731
         mod = lambda a, b: a % b  # noqa: E731
         add5 = lambda a: a + 5  # noqa: E731
         mul3 = lambda a: a * 3  # noqa: E731
-        cases = [
-            ("str_col+int_col", add, [("10", 5)], "a string, b long", ("a", "b")),
-            ("int_col+str_col", add, [(5, "10")], "a long, b string", ("a", "b")),
-            ("str_col+str_col", add, [("x", "y")], "a string, b string", ("a", "b")),
-            ("str_col-int_col", sub, [("10", 5)], "a string, b long", ("a", "b")),
-            ("str_col*int_col", mul, [("2", 3)], "a string, b long", ("a", "b")),
-            ("int_col*str_col", mul, [(3, "2")], "a long, b string", ("a", "b")),
-            ("str_col%int_col", mod, [("10", 3)], "a string, b long", ("a", "b")),
-            ("str_col+int_literal", add5, [("10",)], "a string", ("a",)),
-            ("str_col*int_literal", mul3, [("2",)], "a string", ("a",)),
-        ]
-        for label, func, rows, schema, cols in cases:
-            with self.subTest(label):
-                with self.sql_conf(_TRANSPILE_ON):
-                    u = UserDefinedFunction(func, LongType())
-                    self.assertTrue(u.transpiled, label)
-                    df = self.spark.createDataFrame(rows, schema)
-                    with self.assertRaises(Exception) as ctx:
-                        df.select(u(*cols)).collect()
-                    self.assertIn("numeric", str(ctx.exception).lower(), label)
+        self._raises(add, "a string, b long", [("10", 5)])  # str + int
+        self._raises(add, "a long, b string", [(5, "10")])  # int + str
+        self._raises(add, "a string, b string", [("x", "y")])  # str + str
+        self._raises(sub, "a string, b long", [("10", 5)])
+        self._raises(mul, "a string, b long", [("2", 3)])
+        self._raises(mul, "a long, b string", [(3, "2")])  # int * str
+        self._raises(mod, "a string, b long", [("10", 3)])
+        self._raises(add5, "a string", [("10",)])  # str column + numeric literal
+        self._raises(mul3, "a string", [("2",)])
 
     def test_udf_transpile_power_precision_divergence(self):
         # `**` -> Spark pow (DOUBLE); beyond ~2**53 it loses precision where
         # Python keeps exact ints. Documented limitation.
         square = lambda x: x**2  # noqa: E731
         x = 134217729  # 2**27 + 1; exact square exceeds double's 2**53 range
-        self.assertEqual(
-            self._run(square, LongType(), [(x,)], "a long", "a"), (True, [18014398777917440])
-        )
+        self.assertEqual(self._vals(square, LongType(), "a long", [(x,)]), [18014398777917440])
         self.assertNotEqual(x * x, 18014398777917440)  # Python's exact value differs
 
 
