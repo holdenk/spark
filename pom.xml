@@ -200,6 +200,9 @@
     <!-- org.apache.commons/commons-pool2/-->
     <commons-pool2.version>2.11.1</commons-pool2.version>
     <datanucleus-core.version>4.1.17</datanucleus-core.version>
+    <!-- SPARK-CVE: pin transitive deps above their CVE-fixed versions -->
+    <gson.version>2.10.1</gson.version>
+    <jettison.version>1.5.4</jettison.version>
     <guava.version>14.0.1</guava.version>
     <janino.version>3.1.9</janino.version>
     <!--
@@ -1884,6 +1887,21 @@
             <artifactId>log4j</artifactId>
           </exclusion>
         </exclusions>
+      </dependency>
+      <!-- SPARK-CVE: gson pinned to fix CVE-2022-25647 (deserialization DoS);
+           brought in transitively (e.g. via Hive/Hadoop). 2.10.1 is backward
+           compatible and Java 8 compatible. -->
+      <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>${gson.version}</version>
+      </dependency>
+      <!-- SPARK-CVE: jettison pinned to fix CVE-2022-40149/40150/45685/45693
+           (DoS). Brought in transitively (e.g. via Hadoop/Jersey). -->
+      <dependency>
+        <groupId>org.codehaus.jettison</groupId>
+        <artifactId>jettison</artifactId>
+        <version>${jettison.version}</version>
       </dependency>
       <dependency>
         <groupId>org.codehaus.jackson</groupId>
