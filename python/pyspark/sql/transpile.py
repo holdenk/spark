@@ -545,15 +545,16 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
 
     Handles the following source patterns (in order):
 
-    * ``f = lambda x: x + 1``  — direct assignment
-    * ``f = some_wrapper(lambda x: x + 1, ...)``  — lambda as first positional
-      arg of a call (e.g. ``functools.partial``)
-    * ``lambda x: x + 1``  — bare expression (getsource on a raw lambda)
+    * ``f = lambda x: x + 1`` -- lambda bound directly to a name
+    * ``lambda x: x + 1`` -- bare expression (getsource on a raw lambda)
     * ``def f(x): ... return x + 1``
-    * class with callable
+    * a class with a ``__call__`` method
 
-    Returns ``None`` when no single unambiguous function can be identified.
-    Not yet handled: local class variables.
+    Returns ``None`` when no single unambiguous function can be identified --
+    notably, a lambda wrapped in a call such as
+    ``f = some_wrapper(lambda x: x + 1)`` parses as ``Assign(value=Call(...))``,
+    which is not unwrapped here and so falls back to interpreted Python. Local
+    class variables are likewise unsupported.
     """
     if not hasattr(body, "body") or not body.body:
         return None
@@ -617,6 +618,30 @@ def _transpile_func(
         function_ast = _get_function_from_ast(ast)
         if function_ast is None:
             return ([], ["Error extracting function body from ast, cannot transpile"], [])
+        # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
+        # positional-only parameters can't be represented by the positional
+        # ``_udf_param_N`` placeholder scheme: a call site may omit a
+        # defaulted argument, leaving the placeholder referencing a position
+        # the call never bound, and ``_get_parameter_list`` only reads
+        # ``args``. Fall back to interpreted Python rather than emit an
+        # invalid plan.
+        fn_args = function_ast.args
+        if (
+            fn_args.defaults
+            or any(d is not None for d in fn_args.kw_defaults)
+            or fn_args.kwonlyargs
+            or fn_args.vararg is not None
+            or fn_args.kwarg is not None
+            or getattr(fn_args, "posonlyargs", [])
+        ):
+            return (
+                [],
+                [
+                    "functions with default, variadic, keyword-only, or "
+                    "positional-only arguments are not supported by the transpiler"
+                ],
+                [],
+            )
         params = _get_parameter_list(function_ast)
         # Strip ``self`` for the caller-facing param list -- callers will
         # match user-supplied kwargs against this, and the user doesn't
