@@ -82,6 +82,16 @@
       <artifactId>commons-io</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      SPARK-XXXXX: gRPC 1.62+ moved the in-process transport out of grpc-core into a
+      separate grpc-inprocess artifact. It is only used by the client test suites.
+    -->
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-inprocess</artifactId>
+      <version>${io.grpc.version}</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-lang3</artifactId>
