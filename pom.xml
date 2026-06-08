@@ -2802,20 +2802,14 @@
           </exclusion>
         </exclusions>
       </dependency>
+      <!-- SPARK-CVE: arrow-memory-unsafe replaces arrow-memory-netty (see sql/api/pom.xml).
+           The Unsafe allocator does not depend on Netty, avoiding the NoSuchFieldError
+           (PooledByteBufAllocator.chunkSize) that Netty 4.1.124 triggers in
+           arrow-memory-netty 12.0.1. -->
       <dependency>
         <groupId>org.apache.arrow</groupId>
-        <artifactId>arrow-memory-netty</artifactId>
+        <artifactId>arrow-memory-unsafe</artifactId>
         <version>${arrow.version}</version>
-        <exclusions>
-          <exclusion>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-buffer</artifactId>
-          </exclusion>
-          <exclusion>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-common</artifactId>
-          </exclusion>
-        </exclusions>
       </dependency>
       <dependency>
         <groupId>com.univocity</groupId>
