@@ -80,6 +80,16 @@
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
+    <!-- SPARK-CVE: hadoop-aws 3.4.x uses AWS SDK v2; the EOL AWS SDK v1
+         (aws-java-sdk-bundle) is no longer on the classpath. DepsTestsSuite
+         talks to MinIO via the v2 S3 client. Declared in the main dependencies
+         block (not a profile) so both Maven and SBT test-compile resolve it. -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>bundle</artifactId>
+      <version>${aws.java.sdk.v2.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -203,20 +213,6 @@
   </build>
 
   <profiles>
-    <profile>
-      <id>hadoop-3</id>
-      <activation>
-        <activeByDefault>true</activeByDefault>
-      </activation>
-      <dependencies>
-        <dependency>
-          <groupId>com.amazonaws</groupId>
-          <artifactId>aws-java-sdk-bundle</artifactId>
-          <version>1.11.375</version>
-          <scope>test</scope>
-        </dependency>
-      </dependencies>
-    </profile>
     <profile>
       <id>volcano</id>
       <properties>
