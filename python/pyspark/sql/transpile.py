@@ -328,7 +328,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     f"operands of `{type(op).__name__}` are not type-compatible "
                     "for this input-type variant"
                 )
-            case ast.Return(value=value):
+            case ast.Return(value=value) if value is not None:
                 return self._category(params, value)
             case _:
                 # Comparisons / boolean ops / unary / None / ternary don't drive
@@ -615,9 +615,7 @@ def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
     return None
 
 
-def _param_category_combos(
-    function_ast: ast.FunctionDef, public_params: List[str]
-) -> List[dict]:
+def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[str]) -> List[dict]:
     """Per-variant maps ``{public_param_index -> "numeric"|"string"}``.
 
     A typed param (``def f(a: str, b: int)``) is pinned to its category; an
@@ -641,9 +639,7 @@ def _param_category_combos(
             {i: "numeric" for i in range(n)},
             {i: "string" for i in range(n)},
         ]
-    return [
-        {i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)
-    ] or [{}]
+    return [{i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)] or [{}]
 
 
 def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.AST]]:
