@@ -1036,7 +1036,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def test_udf_transpile_falls_back(self):
         # Shapes that must NOT transpile (and still compute via Python):
         # inline/wrapped/partial lambdas, default/variadic/keyword-only args, and
-        # string-literal operator overloading (+, %, * over text).
+        # `%` string formatting. (String `+`/`*` now lower to concat/repeat -- see
+        # test_udf_transpile_string_operands -- but `%` as a format is not handled.)
         import functools
 
         def wrapper(fn):
@@ -1052,10 +1053,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             return a
 
         base = lambda v, w: v + w  # noqa: E731
-        concat_right = lambda a: a + "!"  # noqa: E731
-        concat_left = lambda a: "pre-" + a  # noqa: E731
         percent_fmt = lambda x: "n=%d" % x  # noqa: E731
-        repeat = lambda x: "ab" * x  # noqa: E731
         with self.sql_conf(_TRANSPILE_ON):
             # inline / wrapped / partial lambdas -> source can't be extracted
             self.assertEqual([], UserDefinedFunction(lambda v: v + 1, LongType()).transpiled)
@@ -1065,23 +1063,16 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(
                 [], UserDefinedFunction(functools.partial(base, 1), LongType()).transpiled
             )
-            # default / variadic / keyword-only args, and string-literal +/%/* over text
+            # default / variadic / keyword-only args, and `%` string formatting
             for func, rt in [
                 (with_default, LongType()),
                 (with_varargs, LongType()),
                 (with_kwargs, LongType()),
-                (concat_right, StringType()),
-                (concat_left, StringType()),
                 (percent_fmt, StringType()),
-                (repeat, StringType()),
             ]:
                 with self.subTest(func=func):
                     self.assertEqual([], UserDefinedFunction(func, rt).transpiled)
             # Fell back -> interpreted Python still computes correctly.
-            sdf = self.spark.createDataFrame([("hi",)], "a string")
-            self.assertEqual(
-                sdf.select(UserDefinedFunction(concat_right, StringType())("a")).first()[0], "hi!"
-            )
             wd = UserDefinedFunction(with_default, LongType())
             num = self.spark.createDataFrame([(5,)], "a long")
             self.assertEqual(
@@ -1093,7 +1084,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # a future fix is noticed): unguarded arithmetic on NULL yields NULL
         # (Python raises TypeError), NaN > 0 is True (Python False; Spark orders
         # NaN highest), and comparing to a cross-type literal coerces (int == "5"
-        # -> True; Python False). Mixed str/numeric arithmetic raises -- see below.
+        # -> True; Python False). Mixed str/numeric arithmetic is handled or falls
+        # back -- see test_udf_transpile_string_operands{,_fall_back}.
         unguarded = lambda x: x + 1  # noqa: E731
         nan_gt = lambda x: (x > 0) if x is not None else None  # noqa: E731
         eq_strlit = lambda x: (x == "5") if x is not None else None  # noqa: E731
@@ -1105,36 +1097,66 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self._vals(eq_strlit, BooleanType(), "a long", [(5,), (3,)]), [True, False]
         )
 
-    def test_udf_transpile_known_raise_divergences(self):
-        # Transpile but raise where Python differs: overflow under ANSI vs
-        # Python's big int (SPARK-55210), and `% 0` (both raise, compatible).
+    def test_udf_transpile_overflow_and_modulo_zero_raise(self):
+        # Transpiled arithmetic that raises at runtime: `*` overflow raises under
+        # ANSI where Python promotes to a big int (a real divergence, SPARK-55210),
+        # while `% 0` raises in both Spark and Python (compatible -- pinned here so
+        # it isn't mistaken for a divergence).
         overflow = lambda x: x * x  # noqa: E731
         modulo_zero = lambda x: x % 0  # noqa: E731
         self._raises(overflow, "a long", [(4000000000,)], "overflow")
         self._raises(modulo_zero, "a long", [(5,)], "zero")
 
-    def test_udf_transpile_mixed_string_numeric_operands_raise(self):
-        # The transpiler can't see column types, so for any non-constant operand
-        # it emits a runtime numeric guard: a string/binary column in arithmetic
-        # raises loudly rather than let Spark silently coerce it (the literal
-        # guard alone can't catch a string passed as a *column*). These str/numeric
-        # mixes -- str and int as separate UDF params included -- must raise, not
-        # miscompute (Python would concatenate, repeat, format, or raise TypeError).
+    def test_udf_transpile_string_operands(self):
+        # Textual `+`/`*` lower to Catalyst string ops and match Python: `str +
+        # str` -> concat, and `str * int` / `int * str` -> repeat (including a
+        # string column times a numeric literal). The transpiler emits a string-
+        # typed variant whose declared categories the JVM matches against the bound
+        # column types (see UserDefinedPythonFunction.builder).
+        S = StringType()
+        add = lambda a, b: a + b  # noqa: E731
+        mul = lambda a, b: a * b  # noqa: E731
+        mul3 = lambda a: a * 3  # noqa: E731
+        concat_right = lambda a: a + "!"  # noqa: E731
+        concat_left = lambda a: "pre-" + a  # noqa: E731
+        repeat_lit = lambda x: "ab" * x  # noqa: E731
+        # (func, return_type, schema, rows, expected); arg columns come from schema.
+        cases = [
+            (add, S, "a string, b string", [("x", "y"), ("a", "b")], ["xy", "ab"]),
+            (mul, S, "a string, b long", [("ab", 3)], ["ababab"]),
+            (mul, S, "a long, b string", [(3, "ab")], ["ababab"]),
+            (mul3, S, "a string", [("2",), ("ab",)], ["222", "ababab"]),
+            (concat_right, S, "a string", [("hi",)], ["hi!"]),
+            (concat_left, S, "a string", [("x",)], ["pre-x"]),
+            (repeat_lit, S, "a long", [(3,)], ["ababab"]),
+        ]
+        for i, (func, rt, schema, rows, expected) in enumerate(cases):
+            with self.subTest(case=i):
+                self.assertEqual(self._vals(func, rt, schema, rows), expected, f"case {i}")
+
+    def test_udf_transpile_string_operands_fall_back(self):
+        # Operand/type combos with no valid string lowering for the bound column
+        # types fall back to the Python UDF, which raises the same way CPython does:
+        # `str + int` (and reversed), `str - int`, `str * str`, `str % int`, and a
+        # string column plus a numeric literal. The transpiler still emits numeric
+        # (and/or concat/repeat) variants, but none match the column types, so the
+        # JVM drops them and runs Python -- matching its TypeError.
         add = lambda a, b: a + b  # noqa: E731
         sub = lambda a, b: a - b  # noqa: E731
         mul = lambda a, b: a * b  # noqa: E731
         mod = lambda a, b: a % b  # noqa: E731
         add5 = lambda a: a + 5  # noqa: E731
-        mul3 = lambda a: a * 3  # noqa: E731
-        self._raises(add, "a string, b long", [("10", 5)])  # str + int
-        self._raises(add, "a long, b string", [(5, "10")])  # int + str
-        self._raises(add, "a string, b string", [("x", "y")])  # str + str
-        self._raises(sub, "a string, b long", [("10", 5)])
-        self._raises(mul, "a string, b long", [("2", 3)])
-        self._raises(mul, "a long, b string", [(3, "2")])  # int * str
-        self._raises(mod, "a string, b long", [("10", 3)])
-        self._raises(add5, "a string", [("10",)])  # str column + numeric literal
-        self._raises(mul3, "a string", [("2",)])
+        # needle="" -> assert only that it raises (the message is CPython's).
+        for func, schema, rows in [
+            (add, "a string, b long", [("10", 5)]),  # str + int
+            (add, "a long, b string", [(5, "10")]),  # int + str
+            (sub, "a string, b long", [("10", 5)]),  # str - int
+            (mul, "a string, b string", [("a", "b")]),  # str * str
+            (mod, "a string, b long", [("10", 3)]),  # str % int
+            (add5, "a string", [("10",)]),  # str column + numeric literal
+        ]:
+            with self.subTest(func=func, schema=schema):
+                self._raises(func, schema, rows, needle="")
 
     def test_udf_transpile_power_precision_divergence(self):
         # `**` -> Spark pow (DOUBLE); beyond ~2**53 it loses precision where

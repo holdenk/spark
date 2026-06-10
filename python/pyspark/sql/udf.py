@@ -209,6 +209,10 @@ class UserDefinedFunction:
         # Extract Python UDF details if transpilation is enabled.
         self.transpiled: list = []
         self._transpiled_param_names: list[str] = []
+        # Per-option input-type categories ("numeric"/"string" per public param),
+        # parallel to ``self.transpiled``; the JVM picks the option matching the
+        # actual column types or falls back to interpreted Python.
+        self._transpiled_input_categories: list = []
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
@@ -250,9 +254,12 @@ class UserDefinedFunction:
             from pyspark.sql.transpile import _transpile_func
 
             try:
-                self.transpiled, errors, self._transpiled_param_names = _transpile_func(
-                    session, func, returnType
-                )
+                (
+                    self.transpiled,
+                    errors,
+                    self._transpiled_param_names,
+                    self._transpiled_input_categories,
+                ) = _transpile_func(session, func, returnType)
                 self._transpile_errors.extend(errors)
                 if not self.transpiled:
                     detail = f": {errors}" if errors else ""
@@ -489,6 +496,7 @@ class UserDefinedFunction:
             self.evalType,
             self.deterministic,
             map(_to_java_column_opt, self.transpiled),
+            self._transpiled_input_categories,
         )
         return judf
 

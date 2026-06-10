@@ -25,11 +25,21 @@ etc.); running them under non-ANSI mode would silently diverge from the
 Python interpretation in ways we don't currently track. If you flip
 transpilation on with ANSI off the UDF will fall back to interpreted
 Python execution and a warning is logged at UDF construction time.
+
+Python's ``+`` and ``*`` are overloaded for text (concat / repeat), so an
+untyped parameter is transpiled into one option per input-type category
+(numeric and string) and the JVM picks the one matching the bound column
+types -- falling back to interpreted Python when none fit. Annotating the
+UDF's parameters (e.g. ``def f(a: int, b: str)``) pins each category and
+keeps the option matrix small; prefer doing so. To bound plan growth,
+functions with more than three untyped parameters only emit the
+all-numeric and all-string variants.
 """
 
 import ast
 from typing import Any, Callable, List, Optional, Tuple, TYPE_CHECKING
 import inspect
+import itertools
 import textwrap
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
@@ -37,11 +47,12 @@ from pyspark.sql.functions import (
     abs as _abs,
     coalesce,
     col,
+    concat,
     lit,
     pmod,
     raise_error,
+    repeat,
     sign,
-    typeof,
     when,
 )
 
@@ -70,6 +81,7 @@ class AbstractTranspiler(object):
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
+        param_categories: Optional[dict] = None,
     ) -> Optional[Column]:
         pass
 
@@ -283,45 +295,45 @@ class CatalystTranspiler(AbstractTranspiler):
         )
         return when(null_guard, raise_error(err)).otherwise(op(left_col, right_col))
 
-    def _guard_numeric_binop(
-        self,
-        left: ast.AST,
-        left_col: Column,
-        right: ast.AST,
-        right_col: Column,
-        result: Column,
-        op_repr: str,
-    ) -> Column:
-        """Guard an arithmetic result against textual column operands at runtime.
+    def _category(self, params: List[str], node: ast.AST) -> str:
+        """Infer ``"numeric"`` or ``"string"`` for ``node`` under the current
+        ``self._param_categories`` assumption (set per input-type variant).
 
-        The transpiler has no column types, and Python overloads ``+`` / ``*`` /
-        ``%`` for text (concatenation / repetition / %-formatting) while ``-`` /
-        ``**`` reject it; Spark would instead silently coerce a numeric-looking
-        string (``"2" * 3 -> 6``, not ``"222"``) or raise a cast error. A single
-        Catalyst expression can't return both the textual and numeric outcomes,
-        so for any operand that is not a numeric literal we check its runtime
-        type and raise loudly when it is string/binary. String/bytes *literals*
-        never reach here -- they force a fall back to interpreted Python earlier.
+        Drives operator selection (``+`` -> add vs concat, ``*`` -> multiply vs
+        repeat) and raises ``UnsupportedOperationException`` when an operator's
+        operands are type-incompatible, so the caller drops that variant and the
+        JVM picks another option / falls back to the Python UDF.
         """
-        checks = [
-            typeof(col).isin("string", "binary")
-            for node, col in ((left, left_col), (right, right_col))
-            if not isinstance(node, ast.Constant)
-        ]
-        if not checks:
-            return result
-        textual = checks[0]
-        for extra in checks[1:]:
-            textual = textual | extra
-        err = raise_error(
-            lit(
-                f"Python UDF transpiler: `{op_repr}` requires numeric operands; "
-                "a string/bytes operand has no arithmetic meaning here (Python "
-                "would concatenate, repeat, format, or raise). Guard or rewrite "
-                "the UDF."
-            )
-        )
-        return when(textual, err).otherwise(result)
+        match node:
+            case ast.Constant(value=v):
+                return "string" if isinstance(v, (str, bytes)) else "numeric"
+            case ast.Name(id=name) if name in params:
+                index = params.index(name)
+                if params and params[0] == "self":
+                    index -= 1
+                return self._param_categories.get(index, "numeric")
+            case ast.BinOp(left=left, op=op, right=right):
+                lc = self._category(params, left)
+                rc = self._category(params, right)
+                if isinstance(op, ast.Add) and lc == rc:
+                    return lc  # str + str -> str, num + num -> num
+                if isinstance(op, ast.Mult):
+                    if lc == "numeric" and rc == "numeric":
+                        return "numeric"
+                    if {lc, rc} == {"numeric", "string"}:
+                        return "string"  # str * int / int * str -> repeat
+                if isinstance(op, (ast.Sub, ast.Mod, ast.Pow)) and lc == rc == "numeric":
+                    return "numeric"
+                raise UnsupportedOperationException(
+                    f"operands of `{type(op).__name__}` are not type-compatible "
+                    "for this input-type variant"
+                )
+            case ast.Return(value=value):
+                return self._category(params, value)
+            case _:
+                # Comparisons / boolean ops / unary / None / ternary don't drive
+                # concat/repeat selection; treat as numeric for category purposes.
+                return "numeric"
 
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
         match body:
@@ -463,79 +475,60 @@ class CatalystTranspiler(AbstractTranspiler):
                             "is not supported by the transpiler"
                         )
             case ast.BinOp(left=left, op=op, right=right):
-                # Arithmetic operators assume *numeric* operands, but Python
-                # overloads `+` / `*` / `%` for text (concatenation, repetition,
-                # %-formatting) and rejects `-` / `**` on text. Two layers guard
-                # this: (1) a string/bytes *literal* operand is statically
-                # detectable and forces a fall back to interpreted Python, so
-                # `a + "!"` or `"%d" % x` still runs correctly; (2) a non-literal
-                # operand's type is unknown at transpile time, so
-                # `_guard_numeric_binop` adds a runtime check that raises rather
-                # than let Spark silently coerce `"2" * 3 -> 6` or `"10" + 5 ->
-                # 15`. Fully correct text handling would need schema-aware
-                # transpilation; until then we fail loudly instead of wrong.
-                if _is_str_or_bytes_constant(left) or _is_str_or_bytes_constant(right):
-                    raise UnsupportedOperationException(
-                        "binary operator with a string/bytes literal operand "
-                        "(Python text concatenation / repetition / formatting) "
-                        "is not arithmetic and is not supported by the transpiler"
-                    )
+                # Operator selection is driven by the operand *categories* under
+                # the current input-type variant (see ``_category``): Python's
+                # `+` / `*` are overloaded for text. `+` -> add (num,num) or
+                # concat (str,str); `*` -> multiply (num,num) or repeat (str,int
+                # / int,str); `-` / `%` / `**` are numeric-only. Combos that
+                # don't fit (str+int, str-str, ...) raise so this variant is
+                # dropped and the JVM picks another option or falls back to the
+                # Python UDF.
+                #
+                # Value-level divergences remain documented (need runtime value
+                # info, not type): overflow raises ARITHMETIC_OVERFLOW under ANSI
+                # where Python promotes to a big int; arithmetic is not
+                # NULL-guarded (`x + 1` on NULL -> NULL vs Python TypeError); and
+                # `**` -> Spark `pow` (DOUBLE) loses precision for large ints.
+                # TODO (SPARK-55210): map overflow / divide-by-zero precisely.
+                lc = self._category(params, left)
+                rc = self._category(params, right)
                 left_col = self._convert_chunk(params, left)
-                if left_col is None:
-                    raise UnsupportedOperationException(
-                        "BinOp left operand could not be lowered to a Column"
-                    )
                 right_col = self._convert_chunk(params, right)
-                if right_col is None:
-                    raise UnsupportedOperationException(
-                        "BinOp right operand could not be lowered to a Column"
-                    )
                 match op:
-                    # Value-level divergences remain documented (they need
-                    # runtime value info, not just type): overflow raises
-                    # ARITHMETIC_OVERFLOW under ANSI where Python promotes to a
-                    # big int; arithmetic is not NULL-guarded, so `x + 1` on a
-                    # NULL input yields NULL where Python raises TypeError; and
-                    # `**` lowers to Spark `pow` (DOUBLE), losing precision for
-                    # large integers (e.g. (2**27 + 1) ** 2 is off by one).
-                    # TODO (SPARK-55210): map overflow / divide-by-zero to
-                    # Catalyst errors via try-variant functions.
                     case ast.Add():
-                        return self._guard_numeric_binop(
-                            left, left_col, right, right_col, left_col.__add__(right_col), "+"
-                        )
+                        if lc == rc == "string":
+                            return concat(left_col, right_col)
+                        if lc == rc == "numeric":
+                            return left_col.__add__(right_col)
                     case ast.Sub():
-                        return self._guard_numeric_binop(
-                            left, left_col, right, right_col, left_col.__sub__(right_col), "-"
-                        )
+                        if lc == rc == "numeric":
+                            return left_col.__sub__(right_col)
                     case ast.Mult():
-                        return self._guard_numeric_binop(
-                            left, left_col, right, right_col, left_col.__mul__(right_col), "*"
-                        )
+                        if lc == "numeric" and rc == "numeric":
+                            return left_col.__mul__(right_col)
+                        if lc == "string" and rc == "numeric":
+                            return repeat(left_col, right_col.cast("int"))
+                        if lc == "numeric" and rc == "string":
+                            return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
-                        # Python's `%` takes the sign of the divisor; Spark's
-                        # takes the dividend's. `sign(b) * pmod(sign(b) * a,
-                        # abs(b))` reproduces Python for any non-zero divisor.
-                        sb = sign(right_col)
-                        return self._guard_numeric_binop(
-                            left,
-                            left_col,
-                            right,
-                            right_col,
-                            sb * pmod(sb * left_col, _abs(right_col)),
-                            "%",
-                        )
+                        if lc == rc == "numeric":
+                            # Python's `%` takes the sign of the divisor; Spark's
+                            # takes the dividend's. `sign(b) * pmod(sign(b) * a,
+                            # abs(b))` reproduces Python for any non-zero divisor.
+                            sb = sign(right_col)
+                            return sb * pmod(sb * left_col, _abs(right_col))
                     case ast.Pow():
-                        # `**` lowers to Spark `pow` (DOUBLE); see the precision
-                        # note above.
-                        return self._guard_numeric_binop(
-                            left, left_col, right, right_col, left_col.__pow__(right_col), "**"
-                        )
+                        if lc == rc == "numeric":
+                            return left_col.__pow__(right_col)
                     case _:
                         raise UnsupportedOperationException(
                             f"binary operator {type(op).__name__} is not "
                             "supported by the transpiler"
                         )
+                raise UnsupportedOperationException(
+                    f"`{type(op).__name__}` operands are not type-compatible for "
+                    "this input-type variant"
+                )
             case ast.Return(value=value):
                 return self._convert_chunk(params, value)
             case ast.Constant(value=value):
@@ -569,10 +562,14 @@ class CatalystTranspiler(AbstractTranspiler):
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
+        param_categories: Optional[dict] = None,
     ) -> Optional[Column]:
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
             return None
+        # Per-variant input-type assumption ({public_param_index -> category}),
+        # read by ``_category`` to choose str vs numeric operators.
+        self._param_categories = param_categories or {}
         function_body = function_ast.body
         if len(function_body) != 1:
             raise UnsupportedOperationException(
@@ -603,15 +600,50 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     ]
 
 
-def _is_str_or_bytes_constant(node: ast.AST) -> bool:
-    """True for a literal ``str`` / ``bytes`` operand.
+def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
+    """Map a parameter's type annotation to ``"numeric"`` / ``"string"``, or
+    ``None`` when it's absent or unrecognised (the caller then tries both)."""
+    name: Optional[str] = None
+    if isinstance(annotation, ast.Name):
+        name = annotation.id
+    elif isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        name = annotation.value  # stringized annotation, e.g. def f(a: "int")
+    if name in ("str", "bytes"):
+        return "string"
+    if name in ("int", "float", "complex", "bool"):
+        return "numeric"
+    return None
 
-    Python overloads ``+`` / ``*`` / ``%`` for text (concatenation,
-    repetition, %-formatting); a string/bytes literal operand therefore never
-    denotes arithmetic, so the transpiler refuses such a ``BinOp`` and falls
-    back to interpreted Python rather than emit a numeric op over text.
+
+def _param_category_combos(
+    function_ast: ast.FunctionDef, public_params: List[str]
+) -> List[dict]:
+    """Per-variant maps ``{public_param_index -> "numeric"|"string"}``.
+
+    A typed param (``def f(a: str, b: int)``) is pinned to its category; an
+    untyped param is tried as both. To cap plan growth, when more than three
+    params are untyped we emit only the all-numeric and all-string variants
+    (encourage typing inputs to keep the matrix small).
     """
-    return isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))
+    n = len(public_params)
+    public_args = function_ast.args.args[len(function_ast.args.args) - n :]
+    candidates: List[List[str]] = []
+    untyped = 0
+    for arg in public_args:
+        cat = _annotation_category(arg.annotation)
+        if cat is None:
+            candidates.append(["numeric", "string"])
+            untyped += 1
+        else:
+            candidates.append([cat])
+    if untyped > 3:
+        return [
+            {i: "numeric" for i in range(n)},
+            {i: "string" for i in range(n)},
+        ]
+    return [
+        {i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)
+    ] or [{}]
 
 
 def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.AST]]:
@@ -696,27 +728,30 @@ def _transpile_func(
     session: "SparkSession",
     func: Callable[..., Any],
     returnType: "DataTypeOrString",
-) -> Tuple[List[Column], List[str], List[str]]:
+) -> Tuple[List[Column], List[str], List[str], List[List[str]]]:
     """
     An experimental internal function that attempts to transpile a callable function.
 
     Returns
     -------
-    list of transpiled functions
+    list of transpiled options (one per backend x input-type variant)
     list of errors as strings
     list of positional parameter names (excluding ``self`` for callable
     instances) -- needed so the caller can resolve named-argument
     invocations to positional order at call time, since the ``_udf_param_N``
     substitution in :class:`UserDefinedPythonFunction` is positional.
+    list of per-option input-type categories (``"numeric"`` / ``"string"`` per
+    public param) -- the JVM picks the option whose categories match the bound
+    column types, or falls back to the Python UDF when none match.
     """
     try:
         src, ast = _get_src_ast_from_func(func)
         if ast is None:
-            return ([], ["Error getting ast for function, cannot transpile"], [])
+            return ([], ["Error getting ast for function, cannot transpile"], [], [])
         # Get the lambda body and parameters
         function_ast = _get_function_from_ast(ast)
         if function_ast is None:
-            return ([], ["Error extracting function body from ast, cannot transpile"], [])
+            return ([], ["Error extracting function body from ast, cannot transpile"], [], [])
         # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
         # positional-only parameters can't be represented by the positional
         # ``_udf_param_N`` placeholder scheme: a call site may omit a
@@ -740,6 +775,7 @@ def _transpile_func(
                     "positional-only arguments are not supported by the transpiler"
                 ],
                 [],
+                [],
             )
         params = _get_parameter_list(function_ast)
         # Strip ``self`` for the caller-facing param list -- callers will
@@ -747,23 +783,30 @@ def _transpile_func(
         # name ``self`` at the call site.
         public_params = params[1:] if params and params[0] == "self" else list(params)
         transpiled: list[Column] = []
+        input_categories: list[list[str]] = []
         errors = []
+        # One transpiled option per (backend x input-type variant). Untyped
+        # params are tried as both numeric and string so the JVM can pick the
+        # option matching the actual column types (or fall back if none match).
+        combos = _param_category_combos(function_ast, public_params)
         # Maybe multiple transpilers (think CUDA, etc.).
         transpilers = _get_transpilers(session)
         for transpiler in transpilers:
-            try:
-                transpiled_column = transpiler._transpile_from_ast(
-                    src, ast, function_ast, params, returnType
-                )
-                if transpiled_column is not None:
-                    transpiled.append(transpiled_column)
-                else:
-                    errors.append(f"Transpiler {transpiler} returned no column")
-            except Exception as e:
-                errors.append(str(e))
-        return (transpiled, errors, public_params)
+            for combo in combos:
+                try:
+                    transpiled_column = transpiler._transpile_from_ast(
+                        src, ast, function_ast, params, returnType, combo
+                    )
+                    if transpiled_column is not None:
+                        transpiled.append(transpiled_column)
+                        input_categories.append(
+                            [combo.get(i, "numeric") for i in range(len(public_params))]
+                        )
+                except Exception as e:
+                    errors.append(str(e))
+        return (transpiled, errors, public_params, input_categories)
     except Exception as e:
         # Don't re-raise: an inability to transpile must never break a
         # working UDF. The caller treats an empty ``transpiled`` list as a
         # silent fall-back to interpreted Python.
-        return ([], [str(e)], [])
+        return ([], [str(e)], [], [])
