@@ -190,6 +190,23 @@
       <artifactId>grpc-protobuf</artifactId>
       <version>${io.grpc.version}</version>
     </dependency>
+    <!-- SPARK-CVE: grpc-java 1.76 demotes grpc-protobuf-lite to runtime scope
+         (it was compile-scoped via grpc-protobuf through 1.56). SparkConnectService
+         uses io.grpc.protobuf.lite.ProtoLiteUtils directly at compile time, so
+         declare it explicitly at compile scope. Exclude protobuf-javalite to keep
+         it off the classpath alongside the full protobuf-java (matches grpc's own
+         exclusion). -->
+    <dependency>
+      <groupId>io.grpc</groupId>
+      <artifactId>grpc-protobuf-lite</artifactId>
+      <version>${io.grpc.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>com.google.protobuf</groupId>
+          <artifactId>protobuf-javalite</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
     <dependency>
       <groupId>io.grpc</groupId>
       <artifactId>grpc-services</artifactId>
