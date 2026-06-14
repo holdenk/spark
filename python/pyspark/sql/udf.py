@@ -220,15 +220,14 @@ class UserDefinedFunction:
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession
+        # A nondeterministic UDF must not be transpiled: replacing it with a plain
+        # Catalyst expression would let the optimizer fold/reorder/duplicate it,
+        # discarding the nondeterminism barrier. (asNondeterministic() also clears
+        # any options set here, for the udf(f).asNondeterministic() ordering.)
         transpile_enabled = (
             False
             if session is None
             else (
-                # A nondeterministic UDF must not be transpiled: replacing it
-                # with a plain Catalyst expression would let the optimizer
-                # fold/reorder/duplicate it, discarding the nondeterminism
-                # barrier. (asNondeterministic() also clears any options set
-                # here, for the udf(f).asNondeterministic() ordering.)
                 deterministic
                 and evalType == PythonEvalType.SQL_BATCHED_UDF
                 and session.conf.get("spark.sql.experimental.optimizer.transpilePyUDFs") == "true"
