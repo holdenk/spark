@@ -319,21 +319,24 @@ class CatalystTranspiler(AbstractTranspiler):
         """
         match node:
             case ast.Constant(value=v):
-                # bool subclasses int, so reject it first. Only real int/float
-                # are "numeric" and only str is "string". bool/None/complex/
-                # Ellipsis/bytes have no faithful numeric-or-string operator
-                # lowering (Spark can't multiply a boolean, has no complex type,
-                # and `repeat` rejects binary), so we raise to drop this variant
-                # and fall back to the Python UDF rather than emit an option that
-                # fails CheckAnalysis (e.g. `x * True`) or silently diverges
-                # (e.g. `x + None` -> NULL where Python raises TypeError).
-                if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-                    raise UnsupportedOperationException(
-                        f"constant {v!r} ({type(v).__name__}) has no numeric or "
-                        "string operator lowering; falling back to interpreted "
-                        "Python"
-                    )
-                return "string" if isinstance(v, str) else "numeric"
+                # bool subclasses int, so classify it first: int/float -> numeric,
+                # str -> string, bool -> bool, bytes -> binary. None/complex/
+                # Ellipsis have no usable Spark column type, so raise to drop this
+                # variant and fall back rather than emit an option that fails
+                # CheckAnalysis or silently diverges (e.g. `x + None` -> NULL where
+                # Python raises TypeError).
+                if isinstance(v, bool):
+                    return "bool"
+                if isinstance(v, bytes):
+                    return "binary"
+                if isinstance(v, (int, float)):
+                    return "numeric"
+                if isinstance(v, str):
+                    return "string"
+                raise UnsupportedOperationException(
+                    f"constant {v!r} ({type(v).__name__}) has no usable column "
+                    "category; falling back to interpreted Python"
+                )
             case ast.Name(id=name) if name in params:
                 index = params.index(name)
                 if params and params[0] == "self":
@@ -624,33 +627,37 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
 
 
 def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
-    """Map a parameter's type annotation to ``"numeric"`` / ``"string"``, or
-    ``None`` when it's absent or unrecognised (the caller then tries both)."""
+    """Map a parameter's type annotation to a category
+    (``"numeric"``/``"string"``/``"bool"``/``"binary"``), or ``None`` when it's
+    absent or unrecognised (the caller then tries both numeric and string)."""
     name: Optional[str] = None
     if isinstance(annotation, ast.Name):
         name = annotation.id
     elif isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
         name = annotation.value  # stringized annotation, e.g. def f(a: "int")
-    # Only str -> "string" and int/float -> "numeric". bool/complex/bytes are
-    # deliberately left unrecognised (-> None, "try both") so they fall back
-    # like any other unsupported type: bool/complex have no usable lowering
-    # (Spark can't do arithmetic on booleans and has no complex type) and bytes
-    # is BinaryType, which the string lowerings (concat/repeat) reject. This
-    # mirrors the constant handling in ``_category``.
+    # str -> "string", int/float -> "numeric", bool -> "bool", bytes -> "binary"
+    # (matching the constant handling in ``_category``). complex and anything
+    # unrecognised return None so the caller tries both numeric and string.
     if name == "str":
         return "string"
     if name in ("int", "float"):
         return "numeric"
+    if name == "bool":
+        return "bool"
+    if name == "bytes":
+        return "binary"
     return None
 
 
 def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[str]) -> List[dict]:
-    """Per-variant maps ``{public_param_index -> "numeric"|"string"}``.
+    """Per-variant maps ``{public_param_index -> category}`` where category is
+    one of ``"numeric"``/``"string"``/``"bool"``/``"binary"``.
 
     A typed param (``def f(a: str, b: int)``) is pinned to its category; an
-    untyped param is tried as both. To cap plan growth, when more than three
-    params are untyped we emit only the all-numeric and all-string variants
-    (encourage typing inputs to keep the matrix small).
+    untyped param is tried as both numeric and string. To cap plan growth, when
+    more than three params are untyped we collapse the untyped ones to the
+    all-numeric and all-string variants (encourage typing inputs to keep the
+    matrix small) while keeping every typed param pinned.
     """
     n = len(public_params)
     public_args = function_ast.args.args[len(function_ast.args.args) - n :]
@@ -664,9 +671,12 @@ def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[st
         else:
             candidates.append([cat])
     if untyped > 3:
+        # Cap the 2**untyped blow-up, but keep each typed param pinned to its
+        # category (a single-element ``candidates`` entry); only the untyped
+        # params collapse to the all-numeric / all-string pair.
         return [
-            {i: "numeric" for i in range(n)},
-            {i: "string" for i in range(n)},
+            {i: c[0] if len(c) == 1 else fill for i, c in enumerate(candidates)}
+            for fill in ("numeric", "string")
         ]
     return [{i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)] or [{}]
 

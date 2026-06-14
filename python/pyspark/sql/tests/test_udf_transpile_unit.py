@@ -28,6 +28,7 @@ import unittest
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
+    BinaryType,
     BooleanType,
     DoubleType,
     LongType,
@@ -1203,6 +1204,52 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertFalse(
                 UserDefinedFunction(plus_one, LongType(), deterministic=False).transpiled
             )
+
+    def test_udf_transpile_bool_and_binary_params(self):
+        # bool/bytes annotations map to the "bool"/"binary" categories and match
+        # Boolean/Binary columns. Identity and same-category comparison transpile
+        # (and match Python); boolean arithmetic has no lowering and falls back.
+        def bool_ident(x: bool):
+            return x
+
+        def bool_lt(a: bool, b: bool):
+            return (a < b) if a is not None and b is not None else None
+
+        def bool_add(x: bool):
+            return x + 1  # no boolean arithmetic lowering -> fall back
+
+        def bytes_ident(x: bytes):
+            return x
+
+        self.assertEqual(
+            self._vals(bool_ident, BooleanType(), "a boolean", [(True,), (False,), (None,)]),
+            [True, False, None],
+        )
+        self.assertEqual(
+            self._vals(
+                bool_lt,
+                BooleanType(),
+                "a boolean, b boolean",
+                [(False, True), (True, False), (True, True)],
+            ),
+            [True, False, False],
+        )
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertFalse(UserDefinedFunction(bool_add, LongType()).transpiled)
+            self.assertTrue(UserDefinedFunction(bytes_ident, BinaryType()).transpiled)
+
+    def test_param_category_combos_caps_preserve_typed_pins(self):
+        # With more than three untyped params the cap collapses the untyped ones
+        # to numeric/string but keeps each typed param pinned (here a: str).
+        import ast as _ast
+
+        from pyspark.sql.transpile import _param_category_combos
+
+        fn = _ast.parse("def f(a: str, b, c, d, e): return a").body[0]
+        combos = _param_category_combos(fn, ["a", "b", "c", "d", "e"])
+        self.assertEqual(len(combos), 2)
+        for combo in combos:
+            self.assertEqual(combo[0], "string")
 
 
 if __name__ == "__main__":
