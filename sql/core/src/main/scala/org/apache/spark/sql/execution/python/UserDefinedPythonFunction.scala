@@ -51,9 +51,11 @@ case class UserDefinedPythonFunction(
     // TODO: Add support for transpilation with Spark Connect and remove the default value.
     transpiled: JList[Column] = Nil.asJava,
     // Per-option input-type categories ("numeric"/"string" per public param),
-    // parallel to `transpiled`. `builder` keeps only the options whose categories
-    // match the bound argument types, so a later option can be picked or, when
-    // none match, the call falls back to the plain Python UDF.
+    // parallel to `transpiled` (same length). The analyzer rule
+    // ResolveTranspiledPythonUDFOptions later keeps only the options whose
+    // categories match the bound argument types; when none match, the call
+    // falls back to the plain Python UDF. `builder` requires the two lists to
+    // be parallel and skips transpilation otherwise.
     transpiledInputTypes: JList[JList[String]] = Nil.asJava) {
 
   def builder(e: Seq[Expression]): Expression = {
@@ -108,7 +110,14 @@ case class UserDefinedPythonFunction(
     // bound, so their types aren't known yet. ResolveTranspiledPythonUDFOptions
     // prunes the options to those matching the resolved input types (once known,
     // and before CheckAnalysis), and ConvertToCatalyst picks the survivor.
-    if (transpiledExprsForUse.nonEmpty) {
+    // Only build the node when every option carries its parallel input-type
+    // categories. ResolveTranspiledPythonUDFOptions prunes type-incompatible
+    // options using those categories, but only when they are present (its guard
+    // is `optionInputCategories.nonEmpty`); an empty or mismatched categories
+    // list would leave a type-invalid option to fail CheckAnalysis instead of
+    // falling back. If the two lists don't line up, skip transpilation.
+    if (transpiledExprsForUse.nonEmpty &&
+        optionInputTypesForUse.length == transpiledExprsForUse.length) {
       val tpu =
         TranspiledPythonUDF(name, udfExpr, transpiledExprsForUse, optionInputTypesForUse)
       // Resolve the UDF parameters to match the original UDF children

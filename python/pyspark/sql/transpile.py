@@ -263,12 +263,12 @@ class CatalystTranspiler(AbstractTranspiler):
     def _lower_value_compare(
         self,
         params: List[str],
-        left_col: Column,
+        left_node: ast.AST,
         right_node: ast.AST,
         op: Callable[[Column, Column], Column],
         op_repr: str,
     ) -> Column:
-        """Lower a value comparison (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``).
+        """Lower a value comparison (``<``, ``<=``, ``>``, ``>=``).
 
         Python raises ``TypeError`` when an operand of these operators is
         ``None`` (e.g. ``None > 0``), whereas Spark's three-valued logic
@@ -279,13 +279,26 @@ class CatalystTranspiler(AbstractTranspiler):
         not None: x > 0``) take the otherwise branch, so they never trip
         the raise.
 
-        Two value-level differences from Python remain (they need runtime
-        type/value info, so they are documented, not guarded): Spark orders
-        ``NaN`` as greater than every value, whereas Python's ``NaN``
-        comparisons are all ``False``; and operands of different types are
-        coerced by Spark (e.g. an int column ``> "5"``) where Python raises
-        ``TypeError``.
+        Python also forbids ordering across types (``1 < "a"`` -> TypeError),
+        whereas Spark would coerce the operands and return a (wrong) boolean.
+        We therefore only lower when both operands share a category; a
+        mismatch raises so this variant is dropped and the UDF falls back to
+        interpreted Python rather than silently diverging.
+
+        One value-level difference from Python remains (it needs runtime
+        value info, so it is documented, not guarded): Spark orders ``NaN``
+        as greater than every value, whereas Python's ``NaN`` comparisons
+        are all ``False``.
         """
+        lc = self._category(params, left_node)
+        rc = self._category(params, right_node)
+        if lc != rc:
+            raise UnsupportedOperationException(
+                f"`{op_repr}` compares operands of different categories "
+                f"({lc} vs {rc}); Python would raise TypeError, so the "
+                "transpiler falls back to interpreted Python"
+            )
+        left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
         null_guard = left_col.isNull() | right_col.isNull()
         err = lit(
@@ -306,7 +319,21 @@ class CatalystTranspiler(AbstractTranspiler):
         """
         match node:
             case ast.Constant(value=v):
-                return "string" if isinstance(v, (str, bytes)) else "numeric"
+                # bool subclasses int, so reject it first. Only real int/float
+                # are "numeric" and only str is "string". bool/None/complex/
+                # Ellipsis/bytes have no faithful numeric-or-string operator
+                # lowering (Spark can't multiply a boolean, has no complex type,
+                # and `repeat` rejects binary), so we raise to drop this variant
+                # and fall back to the Python UDF rather than emit an option that
+                # fails CheckAnalysis (e.g. `x * True`) or silently diverges
+                # (e.g. `x + None` -> NULL where Python raises TypeError).
+                if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                    raise UnsupportedOperationException(
+                        f"constant {v!r} ({type(v).__name__}) has no numeric or "
+                        "string operator lowering; falling back to interpreted "
+                        "Python"
+                    )
+                return "string" if isinstance(v, str) else "numeric"
             case ast.Name(id=name) if name in params:
                 index = params.index(name)
                 if params and params[0] == "self":
@@ -322,7 +349,7 @@ class CatalystTranspiler(AbstractTranspiler):
                         return "numeric"
                     if {lc, rc} == {"numeric", "string"}:
                         return "string"  # str * int / int * str -> repeat
-                if isinstance(op, (ast.Sub, ast.Mod, ast.Pow)) and lc == rc == "numeric":
+                if isinstance(op, (ast.Sub, ast.Mod)) and lc == rc == "numeric":
                     return "numeric"
                 raise UnsupportedOperationException(
                     f"operands of `{type(op).__name__}` are not type-compatible "
@@ -450,24 +477,20 @@ class CatalystTranspiler(AbstractTranspiler):
                         left_col = self._convert_chunk(params, left)
                         return self._lower_eq(params, left_col, comp, equal=False)
                     case ast.Lt():
-                        left_col = self._convert_chunk(params, left)
                         return self._lower_value_compare(
-                            params, left_col, comp, lambda l, r: l < r, "<"
+                            params, left, comp, lambda l, r: l < r, "<"
                         )
                     case ast.LtE():
-                        left_col = self._convert_chunk(params, left)
                         return self._lower_value_compare(
-                            params, left_col, comp, lambda l, r: l <= r, "<="
+                            params, left, comp, lambda l, r: l <= r, "<="
                         )
                     case ast.Gt():
-                        left_col = self._convert_chunk(params, left)
                         return self._lower_value_compare(
-                            params, left_col, comp, lambda l, r: l > r, ">"
+                            params, left, comp, lambda l, r: l > r, ">"
                         )
                     case ast.GtE():
-                        left_col = self._convert_chunk(params, left)
                         return self._lower_value_compare(
-                            params, left_col, comp, lambda l, r: l >= r, ">="
+                            params, left, comp, lambda l, r: l >= r, ">="
                         )
                     case _:
                         raise UnsupportedOperationException(
@@ -479,16 +502,19 @@ class CatalystTranspiler(AbstractTranspiler):
                 # the current input-type variant (see ``_category``): Python's
                 # `+` / `*` are overloaded for text. `+` -> add (num,num) or
                 # concat (str,str); `*` -> multiply (num,num) or repeat (str,int
-                # / int,str); `-` / `%` / `**` are numeric-only. Combos that
-                # don't fit (str+int, str-str, ...) raise so this variant is
-                # dropped and the JVM picks another option or falls back to the
-                # Python UDF.
+                # / int,str); `-` / `%` are numeric-only. Combos that don't fit
+                # (str+int, str-str, ...) raise so this variant is dropped and
+                # the JVM picks another option or falls back to the Python UDF.
+                #
+                # `**` is intentionally NOT lowered: Spark's `pow` is DOUBLE and
+                # loses precision for large integers, so it would silently return
+                # wrong results. TODO (SPARK-55210): add an exact integer-power
+                # lowering and re-enable it.
                 #
                 # Value-level divergences remain documented (need runtime value
                 # info, not type): overflow raises ARITHMETIC_OVERFLOW under ANSI
                 # where Python promotes to a big int; arithmetic is not
-                # NULL-guarded (`x + 1` on NULL -> NULL vs Python TypeError); and
-                # `**` -> Spark `pow` (DOUBLE) loses precision for large ints.
+                # NULL-guarded (`x + 1` on NULL -> NULL vs Python TypeError).
                 # TODO (SPARK-55210): map overflow / divide-by-zero precisely.
                 lc = self._category(params, left)
                 rc = self._category(params, right)
@@ -517,9 +543,6 @@ class CatalystTranspiler(AbstractTranspiler):
                             # abs(b))` reproduces Python for any non-zero divisor.
                             sb = sign(right_col)
                             return sb * pmod(sb * left_col, _abs(right_col))
-                    case ast.Pow():
-                        if lc == rc == "numeric":
-                            return left_col.__pow__(right_col)
                     case _:
                         raise UnsupportedOperationException(
                             f"binary operator {type(op).__name__} is not "
@@ -608,9 +631,15 @@ def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
         name = annotation.id
     elif isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
         name = annotation.value  # stringized annotation, e.g. def f(a: "int")
-    if name in ("str", "bytes"):
+    # Only str -> "string" and int/float -> "numeric". bool/complex/bytes are
+    # deliberately left unrecognised (-> None, "try both") so they fall back
+    # like any other unsupported type: bool/complex have no usable lowering
+    # (Spark can't do arithmetic on booleans and has no complex type) and bytes
+    # is BinaryType, which the string lowerings (concat/repeat) reject. This
+    # mirrors the constant handling in ``_category``.
+    if name == "str":
         return "string"
-    if name in ("int", "float", "complex", "bool"):
+    if name in ("int", "float"):
         return "numeric"
     return None
 

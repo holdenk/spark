@@ -908,14 +908,13 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
     def test_udf_transpile_lowers_operators(self):
         # Operators lower to Catalyst and match Python: modulo sign-parity,
-        # non-commutative -/* (parameter order), **, unary nesting, constant
+        # non-commutative -/* (parameter order), unary nesting, constant
         # body, not(compare), nested boolean, string ==/<, reversed-operand and
         # column-to-column comparisons, if/elif/else, and assigned lambdas.
         L, B = LongType(), BooleanType()
         modulo = lambda x, y: x % y  # noqa: E731
         subtract = lambda a, b: a - b  # noqa: E731
         multiply = lambda a, b: a * b  # noqa: E731
-        power = lambda x: x**2  # noqa: E731
         double_neg = lambda x: --x  # noqa: E731
         unary_pm = lambda x: +(-x)  # noqa: E731
         constant = lambda x: 42  # noqa: E731
@@ -942,7 +941,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             (modulo, L, "a long, b long", [(7, 3), (7, -3), (-7, 3), (-7, -3)], [1, -2, 2, -1]),
             (subtract, L, "a long, b long", [(5, 3), (3, 5)], [2, -2]),
             (multiply, L, "a long, b long", [(4, 3), (-2, 5)], [12, -10]),
-            (power, L, "a long", [(6,), (-3,), (0,)], [36, 9, 0]),
             (double_neg, L, "a long", [(5,), (-3,)], [5, -3]),
             (unary_pm, L, "a long", [(5,), (-3,)], [-5, 3]),
             (constant, L, "a long", [(1,), (999,)], [42, 42]),
@@ -1158,13 +1156,53 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             with self.subTest(func=func, schema=schema):
                 self._raises(func, schema, rows, needle="")
 
-    def test_udf_transpile_power_precision_divergence(self):
-        # `**` -> Spark pow (DOUBLE); beyond ~2**53 it loses precision where
-        # Python keeps exact ints. Documented limitation.
+    def test_udf_transpile_power_falls_back(self):
+        # `**` is intentionally not lowered (Spark's pow is DOUBLE and loses
+        # precision for large ints), so a UDF using it falls back to interpreted
+        # Python. TODO(SPARK-55210): revisit once an exact integer-power lowering
+        # exists.
         square = lambda x: x**2  # noqa: E731
-        x = 134217729  # 2**27 + 1; exact square exceeds double's 2**53 range
-        self.assertEqual(self._vals(square, LongType(), "a long", [(x,)]), [18014398777917440])
-        self.assertNotEqual(x * x, 18014398777917440)  # Python's exact value differs
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertFalse(UserDefinedFunction(square, LongType()).transpiled)
+
+    def test_udf_transpile_non_numeric_constant_falls_back(self):
+        # bool/None constants have no faithful numeric/string lowering, so
+        # arithmetic against them must fall back rather than emit an option that
+        # crashes analysis (`x * True`) or silently returns NULL (`x + None`).
+        mul_bool = lambda x: x * True  # noqa: E731
+        add_none = lambda x: x + None  # noqa: E731
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertFalse(UserDefinedFunction(mul_bool, LongType()).transpiled)
+            self.assertFalse(UserDefinedFunction(add_none, LongType()).transpiled)
+
+    def test_udf_transpile_mixed_type_comparison_falls_back(self):
+        # Python forbids ordering across types (`a < b` for int/str -> TypeError);
+        # Spark would coerce and return a wrong boolean. A comparison whose
+        # operand categories differ is dropped (so int-vs-str `<` falls back),
+        # while a same-category comparison still transpiles.
+        def lt_mixed(a: int, b: str):
+            return (a < b) if a is not None and b is not None else None
+
+        def lt_same(a: int, b: int):
+            return (a < b) if a is not None and b is not None else None
+
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertFalse(UserDefinedFunction(lt_mixed, BooleanType()).transpiled)
+            self.assertTrue(UserDefinedFunction(lt_same, BooleanType()).transpiled)
+
+    def test_udf_transpile_skips_nondeterministic(self):
+        # A nondeterministic UDF must not be transpiled: the optimizer could
+        # fold/reorder/duplicate the plain expression, dropping the barrier.
+        # Holds whether marked at construction or via asNondeterministic().
+        plus_one = lambda x: x + 1  # noqa: E731
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertTrue(UserDefinedFunction(plus_one, LongType()).transpiled)
+            self.assertFalse(
+                UserDefinedFunction(plus_one, LongType()).asNondeterministic().transpiled
+            )
+            self.assertFalse(
+                UserDefinedFunction(plus_one, LongType(), deterministic=False).transpiled
+            )
 
 
 if __name__ == "__main__":
