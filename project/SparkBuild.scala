@@ -1105,7 +1105,26 @@ object DependencyOverrides {
     dependencyOverrides += "xerces" % "xercesImpl" % "2.12.2",
     dependencyOverrides += "jline" % "jline" % "2.14.6",
     dependencyOverrides += "org.apache.avro" % "avro" % "1.11.5",
-    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.23.0")
+    // SPARK-CVE: keep in sync with <commons-compress.version> in pom.xml. sbt does not
+    // honor Maven dependencyManagement for transitives, so this override is what closes
+    // CVE-2024-25710 / CVE-2024-26308 in the sbt build.
+    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.26.2",
+    // SPARK-CVE: breeze (via mllib-local) declares slf4j-api 1.7.5 transitively. Maven
+    // forces 2.0.7 via dependencyManagement, but sbt does not, so mllib-local/update can
+    // resolve and try to fetch the ancient 1.7.5 jar. Force the managed version here.
+    dependencyOverrides += "org.slf4j" % "slf4j-api" % "2.0.7") ++
+    // SPARK-CVE: keep in sync with <netty.version> in pom.xml. Maven manages the top-level
+    // netty modules and lets netty's internal version alignment cascade to the rest; sbt
+    // does not, so it picks up the netty declared by transitive consumers (grpc/arrow),
+    // older 4.1.91/4.1.60.Final. Without these overrides the sbt build both fails to resolve
+    // (old jars are evicted, never published locally) and regresses past the Netty CVE bump.
+    Seq(
+      "netty-all", "netty-buffer", "netty-codec", "netty-codec-http", "netty-codec-http2",
+      "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy",
+      "netty-resolver", "netty-transport", "netty-transport-classes-epoll",
+      "netty-transport-classes-kqueue", "netty-transport-native-epoll",
+      "netty-transport-native-kqueue", "netty-transport-native-unix-common"
+    ).map(name => dependencyOverrides += "io.netty" % name % "4.1.124.Final")
 }
 
 /**
