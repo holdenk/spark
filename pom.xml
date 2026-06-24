@@ -119,8 +119,8 @@
     <exec-maven-plugin.version>3.1.0</exec-maven-plugin.version>
     <sbt.project.name>spark</sbt.project.name>
     <asm.version>9.5</asm.version>
-    <!-- SPARK-CVE: sbt does not honor Maven <dependencyManagement> for transitive deps, so any
-         CVE bump here must also be mirrored in `object DependencyOverrides` in `SparkBuild.scala`
+    <!-- sbt does not honor Maven <dependencyManagement> for transitive deps, so any
+         transitive dep bump here must also be mirrored in `object DependencyOverrides`
          (slf4j-api leaks in via breeze->mllib-local). Applies to commons-compress and netty below too. -->
     <slf4j.version>2.0.7</slf4j.version>
     <log4j.version>2.20.0</log4j.version>
@@ -166,7 +166,7 @@
     <aws.kinesis.client.version>1.12.0</aws.kinesis.client.version>
     <!-- Should be consistent with Kinesis client dependency -->
     <aws.java.sdk.version>1.11.655</aws.java.sdk.version>
-    <!-- SPARK-CVE: AWS SDK v2, used by hadoop-aws 3.4.x and the K8s integration
+    <!-- AWS SDK v2, used by hadoop-aws 3.4.x and the K8s integration
          tests' DepsTestsSuite. Matches the version Hadoop 3.4.3 pulls in, and
          replaces the EOL AWS SDK v1 in those tests. AWS SDK v2 requires Java 8+. -->
     <aws.java.sdk.v2.version>2.35.4</aws.java.sdk.v2.version>
@@ -198,7 +198,6 @@
     <snappy.version>1.1.10.5</snappy.version>
     <netlib.ludovic.dev.version>3.0.3</netlib.ludovic.dev.version>
     <commons-codec.version>1.16.1</commons-codec.version>
-    <!-- SPARK-CVE: keep in sync with the commons-compress override in `SparkBuild.scala` (see slf4j note above) -->
     <commons-compress.version>1.26.2</commons-compress.version>
     <commons-io.version>2.16.1</commons-io.version>
     <!-- org.apache.commons/commons-lang/-->
@@ -208,7 +207,6 @@
     <!-- org.apache.commons/commons-pool2/-->
     <commons-pool2.version>2.11.1</commons-pool2.version>
     <datanucleus-core.version>4.1.17</datanucleus-core.version>
-    <!-- SPARK-CVE: pin transitive deps above their CVE-fixed versions -->
     <gson.version>2.10.1</gson.version>
     <jettison.version>1.5.4</jettison.version>
     <guava.version>14.0.1</guava.version>
@@ -233,7 +231,7 @@
     <commons-cli.version>1.5.0</commons-cli.version>
     <bouncycastle.version>1.84</bouncycastle.version>
     <tink.version>1.9.0</tink.version>
-    <!-- SPARK-CVE: keep in sync with the netty module overrides in `SparkBuild.scala` (see slf4j note above) -->
+    <!-- Keep in sync with the netty module overrides in `SparkBuild.scala` (see slf4j note above) -->
     <netty.version>4.1.124.Final</netty.version>
     <!--
     If you are changing Arrow version specification, please check
@@ -1897,7 +1895,7 @@
           </exclusion>
         </exclusions>
       </dependency>
-      <!-- SPARK-CVE: gson pinned to fix CVE-2022-25647 (deserialization DoS);
+      <!-- gson pinned to fix CVE-2022-25647 (deserialization DoS);
            brought in transitively (e.g. via Hive/Hadoop). 2.10.1 is backward
            compatible and Java 8 compatible. -->
       <dependency>
@@ -1905,7 +1903,7 @@
         <artifactId>gson</artifactId>
         <version>${gson.version}</version>
       </dependency>
-      <!-- SPARK-CVE: jettison pinned to fix CVE-2022-40149/40150/45685/45693
+      <!-- jettison pinned to fix CVE-2022-40149/40150/45685/45693
            (DoS). Brought in transitively (e.g. via Hadoop/Jersey). -->
       <dependency>
         <groupId>org.codehaus.jettison</groupId>
@@ -2811,7 +2809,7 @@
           </exclusion>
         </exclusions>
       </dependency>
-      <!-- SPARK-CVE: arrow-memory-unsafe replaces arrow-memory-netty (see sql/api/pom.xml).
+      <!-- arrow-memory-unsafe replaces arrow-memory-netty (see sql/api/pom.xml).
            The Unsafe allocator does not depend on Netty, avoiding the NoSuchFieldError
            (PooledByteBufAllocator.chunkSize) that Netty 4.1.124 triggers in
            arrow-memory-netty 12.0.1. -->
