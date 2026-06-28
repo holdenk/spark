@@ -124,7 +124,7 @@
     <!-- make sure to update IsolatedClientLoader whenever this version is changed -->
     <hadoop.version>3.3.4</hadoop.version>
     <!-- SPARK-41247: When updating `protobuf.version`, also need to update `protoVersion` in `SparkBuild.scala` -->
-    <protobuf.version>3.23.4</protobuf.version>
+    <protobuf.version>3.25.5</protobuf.version>
     <protoc-jar-maven-plugin.version>3.11.4</protoc-jar-maven-plugin.version>
     <yarn.version>${hadoop.version}</yarn.version>
     <zookeeper.version>3.6.3</zookeeper.version>
@@ -147,10 +147,12 @@
     <jakartaservlet.version>4.0.3</jakartaservlet.version>
     <chill.version>0.10.0</chill.version>
     <!--
-      SPARK-44968: don't upgrade Ivy to version 2.5.2 until the test aborted of
-      `HiveExternalCatalogVersionsSuite` in Java 11/17 daily tests is resolved.
+      Ivy 2.5.3 resolves the `HiveExternalCatalogVersionsSuite` retrieve regression
+      that previously forced a downgrade to 2.5.1 (SPARK-44968), as adopted on master
+      in SPARK-50794, and fixes CVE-2022-46751 (XXE). The Java 11/17 daily tests should
+      be confirmed on this branch before release.
     -->
-    <ivy.version>2.5.1</ivy.version>
+    <ivy.version>2.5.3</ivy.version>
     <oro.version>2.0.8</oro.version>
     <!--
     If you changes codahale.metrics.version, you also need to change
@@ -185,12 +187,12 @@
     <scalafmt.validateOnly>true</scalafmt.validateOnly>
     <scalafmt.changedOnly>true</scalafmt.changedOnly>
     <codehaus.jackson.version>1.9.13</codehaus.jackson.version>
-    <fasterxml.jackson.version>2.15.2</fasterxml.jackson.version>
-    <fasterxml.jackson.databind.version>2.15.2</fasterxml.jackson.databind.version>
-    <snappy.version>1.1.10.5</snappy.version>
+    <fasterxml.jackson.version>2.15.4</fasterxml.jackson.version>
+    <fasterxml.jackson.databind.version>2.15.4</fasterxml.jackson.databind.version>
+    <snappy.version>1.1.10.8</snappy.version>
     <netlib.ludovic.dev.version>3.0.3</netlib.ludovic.dev.version>
     <commons-codec.version>1.16.1</commons-codec.version>
-    <commons-compress.version>1.23.0</commons-compress.version>
+    <commons-compress.version>1.27.1</commons-compress.version>
     <commons-io.version>2.16.1</commons-io.version>
     <!-- org.apache.commons/commons-lang/-->
     <commons-lang2.version>2.6</commons-lang2.version>
@@ -219,9 +221,9 @@
     <maven-antrun.version>3.1.0</maven-antrun.version>
     <commons-crypto.version>1.1.0</commons-crypto.version>
     <commons-cli.version>1.5.0</commons-cli.version>
-    <bouncycastle.version>1.77</bouncycastle.version>
+    <bouncycastle.version>1.78.1</bouncycastle.version>
     <tink.version>1.9.0</tink.version>
-    <netty.version>4.1.96.Final</netty.version>
+    <netty.version>4.1.118.Final</netty.version>
     <!--
     If you are changing Arrow version specification, please check
     ./python/pyspark/sql/pandas/utils.py, and ./python/setup.py too.
@@ -290,7 +292,7 @@
     <!-- Version used in Connect -->
     <connect.guava.version>32.0.1-jre</connect.guava.version>
     <guava.failureaccess.version>1.0.1</guava.failureaccess.version>
-    <io.grpc.version>1.56.0</io.grpc.version>
+    <io.grpc.version>1.62.2</io.grpc.version>
     <mima.version>1.1.2</mima.version>
     <tomcat.annotations.api.version>6.0.53</tomcat.annotations.api.version>
 
