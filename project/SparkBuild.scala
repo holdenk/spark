@@ -1109,6 +1109,10 @@ object DependencyOverrides {
     // honor Maven dependencyManagement for transitives, so this override is what closes
     // CVE-2024-25710 / CVE-2024-26308 in the sbt build.
     dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.26.2",
+    // SPARK-CVE: keep in sync with <commons-lang3.version> in pom.xml. commons-compress
+    // 1.26.2 needs lang3 >= 3.14 (ArrayFill); sbt does not honor Maven dependencyManagement
+    // for transitives, so force a single consistent lang3. Also clears CVE-2025-48924.
+    dependencyOverrides += "org.apache.commons" % "commons-lang3" % "3.18.0",
     // SPARK-CVE: breeze (via mllib-local) declares slf4j-api 1.7.5 transitively. Maven
     // forces 2.0.7 via dependencyManagement, but sbt does not, so mllib-local/update can
     // resolve and try to fetch the ancient 1.7.5 jar. Force the managed version here.
