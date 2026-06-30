@@ -3698,7 +3698,12 @@
     <profile>
       <id>scala-2.13</id>
       <properties>
-        <scala.version>2.13.8</scala.version>
+        <!-- SPARK-CVE: 2.13.8 -> 2.13.11. Scala 2.13.8's classfile parser crashes with
+             "bad constant pool index" reading the JDK 21-built commons-lang3 3.18.0 classes
+             (the JavaVersion enum) pulled in for CVE-2025-48924. 2.13.11 is the minimal patch
+             that reads JDK 21 class files; genjavadoc-plugin_2.13.11 (0.18) is published, so no
+             genjavadoc bump is needed. The 2.12 build is unaffected (2.12.18 reads lang3 3.18.0). -->
+        <scala.version>2.13.11</scala.version>
         <scala.binary.version>2.13</scala.binary.version>
       </properties>
       <build>
@@ -3751,6 +3756,14 @@
                   <arg>-Wconf:cat=unchecked&amp;msg=outer reference:s</arg>
                   <arg>-Wconf:cat=unchecked&amp;msg=eliminated by erasure:s</arg>
                   <arg>-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s</arg>
+                  <!--
+                    SPARK-CVE: the Scala 2.13.8 -> 2.13.11 bump (see scala-2.13 profile properties)
+                    newly emits "Implicit definition should have explicit type", which the
+                    fatal-warnings config above turns into errors. Spark 3.5 source predates
+                    explicit-typing these implicits (done upstream for Scala 2.13.16 / Spark 4.0),
+                    so mute the warning here. Keep in sync with project/SparkBuild.scala.
+                  -->
+                  <arg>-Wconf:msg=Implicit definition should have explicit type:s</arg>
                   <!--
                     TODO(SPARK-43850): Remove the following suppression rules and remove `import scala.language.higherKinds`
                     from the corresponding files when Scala 2.12 is no longer supported.
