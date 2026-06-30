@@ -48,7 +48,7 @@ To run locally::
         python/run-tests --testnames pyspark.sql.tests.test_udf_transpile_hypothesis
 
 Set ``RUN_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test example count
-(default 100, kept small for CI).
+(default 1000).
 """
 
 import os
@@ -115,7 +115,7 @@ if _have_hypothesis:
     # overflow.  Worse, the Python UDF runner silently wraps out-of-range
     # return values even with ANSI=True, so "both raised" never fires for
     # overflow values and the test sees a spurious mismatch instead.
-    # 2**61 is safe for all operations: (2**61)*3 ≈ 6.9e18 < 9.2e18 = Long.MAX.
+    # 2**61 is safe for all operations: (2**61)*3 ~= 6.9e18 < 9.2e18 = Long.MAX.
     _LONG_ARITH_BOUND = 2**61
     _long_arith_strategy = st.one_of(
         st.none(),

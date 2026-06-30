@@ -65,7 +65,7 @@ class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
 
     varieties: dict[str, type["AbstractTranspiler"]] = {}
-    # Specify the "friendly" name a user can add to spark.sql.experimental.optimizer.transpilers
+    # Specify the "friendly" name a user can add to spark.sql.experimental.optimizer.pyTranspilers
     # to enable this transpiler.
     variety: str = ""
 
@@ -110,7 +110,7 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
     Used to gate ``if``/ternary lowering: we only allow the test expression
     into Catalyst's ``when(coalesce(test, false), ...)`` form when it provably
     produces a boolean. Everything else (bare Name, arithmetic, function calls,
-    subscript, …) must force a fallback to interpreted Python instead of
+    subscript, ...) must force a fallback to interpreted Python instead of
     silently diverging.
     """
     match node:
@@ -127,62 +127,6 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
         case ast.IfExp(body=body, orelse=orelse):
             # Ternary is boolean only if both branches are.
             return _is_definitely_boolean(body) and _is_definitely_boolean(orelse)
-        case _:
-            return False
-
-
-def _is_definitely_non_boolean(node: ast.AST) -> bool:
-    """Return True when ``node`` is statically guaranteed to evaluate to a
-    value that is *not* a Python ``bool``.
-
-    Used to gate the bitwise lowering of ``and`` / ``or`` / ``not``: Python's
-    short-circuit operators return one of their operands rather than a strict
-    bool, so ``x or 0`` against an int column would silently get
-    bitwise-style behaviour from Spark's ``|`` instead of Python's truthiness
-    fallback. We can't always tell statically (a bare ``ast.Name`` could be
-    bound to any type), so we conservatively only refuse to lower when an
-    operand is *provably* non-boolean -- numeric / string literals, an
-    arithmetic ``BinOp``, a numeric ``UnaryOp(USub/UAdd)``. Everything else
-    (Names, Compare, Not, nested BoolOps, IfExp, conservative cases) is
-    treated as "possibly boolean" and we let the bitwise lowering proceed,
-    relying on the input being a boolean column at runtime.
-    """
-    match node:
-        case ast.Constant(value=v):
-            # ``True`` and ``False`` are themselves bool; ``None`` we
-            # accept (it round-trips through coalesce). Everything else
-            # is definitely not bool.
-            return not (v is None or isinstance(v, bool))
-        case ast.BinOp(
-            op=ast.Add()
-            | ast.Sub()
-            | ast.Mult()
-            | ast.Div()
-            | ast.FloorDiv()
-            | ast.Mod()
-            | ast.Pow()
-            | ast.LShift()
-            | ast.RShift()
-            | ast.MatMult()
-        ):
-            # Arithmetic / shift BinOps produce numeric (or matrix) results,
-            # never booleans, so they're provably non-boolean. Bitwise
-            # ``&`` / ``|`` / ``^`` are deliberately NOT matched: they
-            # produce a boolean when both operands are boolean (e.g.
-            # ``(x > 0) & (y > 0)``), so leaving them in the "possibly
-            # boolean" bucket lets the BoolOp / Not lowering proceed.
-            return True
-        case ast.UnaryOp(op=ast.USub()) | ast.UnaryOp(op=ast.UAdd()):
-            return True
-        case ast.IfExp(body=body, orelse=orelse):
-            # Conditional only known non-boolean if both branches are.
-            return _is_definitely_non_boolean(body) and _is_definitely_non_boolean(orelse)
-        case ast.Call():
-            # Function calls: we don't know the return type statically, so we
-            # can't claim they're non-boolean. Leave as "possibly boolean" and
-            # let the caller attempt lowering; if the call itself is not
-            # supported the catch-all arm will raise UnsupportedOperationException.
-            return False
         case _:
             return False
 
@@ -211,12 +155,37 @@ class CatalystTranspiler(AbstractTranspiler):
             return lit(None)
         return self._convert_chunk(params, statements[0])
 
+    def _safe_category(self, params: List[str], node: Optional[ast.AST]) -> Optional[str]:
+        """Best-effort input-type category for an if/else branch, or ``None`` when
+        it can't be pinned down statically.
+
+        Used only to compare the two branches of an if/ternary. A ``None`` result
+        means "treat as compatible" (don't force a fallback): the node is absent,
+        is a bare ``None`` literal (which unifies with any branch type via
+        ``coalesce``/``Cast``), or its category can't be determined.
+        """
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant) and node.value is None:
+            return None
+        # Comparisons / ``not`` / boolean ops produce a boolean column; classify
+        # them as "bool" (``_category``'s catch-all would mislabel them numeric).
+        if _is_definitely_boolean(node):
+            return "bool"
+        try:
+            return self._category(params, node)
+        except UnsupportedOperationException:
+            return None
+
     def _convert_if_like(
         self,
+        params: List[str],
         test_col: Column,
         body_col: Column,
         else_col: Column,
         test_node: ast.AST,
+        body_node: Optional[ast.AST],
+        else_node: Optional[ast.AST],
     ) -> Column:
         # We cannot soundly lower a generic Python truthiness test here.
         # Python truthiness depends on the runtime input type and value:
@@ -233,6 +202,22 @@ class CatalystTranspiler(AbstractTranspiler):
             raise UnsupportedOperationException(
                 f"bare truthiness tests ({ast.dump(test_node)}) in if-expressions are "
                 " not currently supported by the transpiler"
+            )
+        # When the two branches resolve to concrete but different categories
+        # (e.g. numeric vs string), the lowered ``when(...).otherwise(...)`` is a
+        # CASE WHEN whose branch values share no common type under ANSI. That node
+        # is carried as a child of the TranspiledPythonUDF and is type-checked by
+        # CheckAnalysis *before* ConvertToCatalyst can drop it, so it would fail
+        # the whole query rather than fall back. Refuse here so the UDF runs as
+        # interpreted Python instead. Branches whose category we can't pin down
+        # (e.g. a bare ``None``) are treated as compatible and don't force this.
+        body_cat = self._safe_category(params, body_node)
+        else_cat = self._safe_category(params, else_node)
+        if body_cat is not None and else_cat is not None and body_cat != else_cat:
+            raise UnsupportedOperationException(
+                f"if/else branches have incompatible categories ({body_cat} vs "
+                f"{else_cat}); the lowered CASE WHEN has no common type under ANSI, "
+                "so the transpiler falls back to interpreted Python"
             )
         safe_test = coalesce(test_col, lit(False))
         return when(safe_test, body_col).otherwise(else_col)
@@ -447,17 +432,23 @@ class CatalystTranspiler(AbstractTranspiler):
                 # Ternary `body if test else orelse` -- shares the
                 # NULL-as-falsy lowering with the if-statement case.
                 return self._convert_if_like(
+                    params,
                     self._convert_chunk(params, test),
                     self._convert_chunk(params, body_expr),
                     self._convert_chunk(params, orelse_expr),
                     test,
+                    body_expr,
+                    orelse_expr,
                 )
             case ast.If(test, success, orelse):
                 return self._convert_if_like(
+                    params,
                     self._convert_chunk(params, test),
                     self._convert_branch(params, success, "body"),
                     self._convert_branch(params, orelse, "else body"),
                     test,
+                    success[0] if success else None,
+                    orelse[0] if orelse else None,
                 )
             case ast.Compare(left, ops, comps):
                 if len(ops) != 1 or len(comps) != 1:
@@ -559,7 +550,13 @@ class CatalystTranspiler(AbstractTranspiler):
                         if lc == rc == "numeric":
                             # Python's `%` takes the sign of the divisor; Spark's
                             # takes the dividend's. `sign(b) * pmod(sign(b) * a,
-                            # abs(b))` reproduces Python for any non-zero divisor.
+                            # abs(b))` reproduces Python for every non-zero divisor
+                            # except at the LongType overflow boundaries -- `a =
+                            # Long.MinValue` with `b < 0` (the `sign(b) * a` negate
+                            # overflows) and `b = Long.MinValue` (the `abs(b)`
+                            # overflows) -- where this raises ARITHMETIC_OVERFLOW
+                            # under ANSI while Python returns a value. That matches
+                            # the documented overflow caveat for `+`/`-`/`*` above.
                             # Use a CASE-based integer sign rather than sign() to
                             # avoid promoting operands to DoubleType, which loses
                             # precision near LongType boundaries.

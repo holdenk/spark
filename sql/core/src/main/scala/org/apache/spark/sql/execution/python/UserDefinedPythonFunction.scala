@@ -118,9 +118,12 @@ case class UserDefinedPythonFunction(
     // falling back. If the two lists don't line up, skip transpilation.
     if (transpiledExprsForUse.nonEmpty &&
         optionInputTypesForUse.length == transpiledExprsForUse.length) {
-      val tpu =
-        TranspiledPythonUDF(name, udfExpr, transpiledExprsForUse, optionInputTypesForUse)
-      // Resolve the UDF parameters to match the original UDF children
+      val udfChildren = udfExpr.children.toArray
+      // Resolve the `_udf_param_N` placeholders the transpiler emits into the bound
+      // UDF arguments. Apply this ONLY to the transpiled options -- never to
+      // `udfExpr` itself, whose children are the user's argument expressions. A user
+      // column literally named `_udf_param_N` passed as an argument must not be
+      // rewritten, so we leave `udfExpr` untouched.
       def resolveUDFParams(expression: Expression, children: Array[Expression]): Expression = {
         expression match {
           case UnresolvedAttribute(nameParts)
@@ -139,7 +142,8 @@ case class UserDefinedPythonFunction(
             expression.mapChildren(resolveUDFParams(_, children))
         }
       }
-      resolveUDFParams(tpu, udfExpr.children.toArray)
+      val resolvedOptions = transpiledExprsForUse.map(resolveUDFParams(_, udfChildren))
+      TranspiledPythonUDF(name, udfExpr, resolvedOptions, optionInputTypesForUse)
     } else {
       udfExpr
     }

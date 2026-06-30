@@ -658,6 +658,74 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     [result] = df.select(pudf("a")).collect()
                     self.assertEqual(result[0], expected, f"{label}: interpreted mismatch")
 
+    def test_udf_transpile_falls_back_for_mismatched_branch_types(self):
+        # An if/ternary whose two branches produce different Spark categories
+        # (e.g. numeric vs string) would lower to a CASE WHEN whose branch
+        # values share no common type under ANSI. That node is carried as a
+        # child of the TranspiledPythonUDF and is type-checked by CheckAnalysis
+        # before ConvertToCatalyst can drop it, so without a guard the whole
+        # query would fail analysis instead of falling back. The transpiler must
+        # refuse and run the UDF as interpreted Python.
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def mixed_ternary(x):
+            return 1 if x > 0 else "neg"
+
+        def mixed_if(x):
+            if x > 0:
+                return "pos"
+            return x
+
+        # Positive control: matching-category branches must still transpile, so
+        # the guard does not over-refuse.
+        def homogeneous(x):
+            return x if x > 0 else 0
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+
+        with self.sql_conf(
+            {
+                "spark.sql.experimental.optimizer.transpilePyUDFs": True,
+                "spark.sql.ansi.enabled": True,
+            }
+        ):
+            # Inputs are chosen to take the string-returning branch so the
+            # interpreted result is unambiguous.
+            mismatch_cases = [
+                ("mixed_ternary", mixed_ternary, Row(a=-3), "neg"),
+                ("mixed_if", mixed_if, Row(a=10), "pos"),
+            ]
+            for label, func, row, expected in mismatch_cases:
+                with self.subTest(case=label):
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        pudf = UserDefinedFunction(func, StringType())
+                    self.assertEqual(
+                        [],
+                        pudf.transpiled,
+                        f"{label}: mismatched branch types must NOT be lowered to Catalyst",
+                    )
+                    fallback = [w for w in caught if "Unable to transpile" in str(w.message)]
+                    self.assertTrue(fallback, f"{label}: expected a fallback warning")
+                    df = self.spark.createDataFrame([row], schema=long_schema)
+                    # Must run without an analysis failure and match interpreted Python.
+                    [result] = df.select(pudf("a")).collect()
+                    self.assertEqual(result[0], expected, f"{label}: interpreted mismatch")
+
+            with self.subTest(case="homogeneous"):
+                pudf = UserDefinedFunction(homogeneous, LongType())
+                self.assertNotEqual(
+                    [],
+                    pudf.transpiled,
+                    "matching-category branches must still transpile",
+                )
+                df = self.spark.createDataFrame(
+                    [Row(a=5), Row(a=-3)], schema=long_schema
+                )
+                results = [r[0] for r in df.select(pudf("a")).collect()]
+                self.assertEqual(results, [5, 0], "homogeneous branch result mismatch")
+
     def test_udf_transpile_is_none_semantics(self):
         # `x is None` and `None is x` (and their `is not` variants) should
         # transpile to isNull/isNotNull. Any other identity check (`x is 0`,

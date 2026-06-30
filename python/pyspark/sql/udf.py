@@ -275,6 +275,7 @@ class UserDefinedFunction:
                 warnings.warn(f"Exception transpiling UDF {func}: {e}")
                 self.transpiled = []
                 self._transpiled_param_names = []
+                self._transpiled_input_categories = []
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
