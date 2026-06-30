@@ -3698,11 +3698,6 @@
     <profile>
       <id>scala-2.13</id>
       <properties>
-        <!-- SPARK-CVE: 2.13.8 -> 2.13.11. Scala 2.13.8's classfile parser crashes with
-             "bad constant pool index" reading the JDK 21-built commons-lang3 3.18.0 classes
-             (the JavaVersion enum) pulled in for CVE-2025-48924. 2.13.11 is the minimal patch
-             that reads JDK 21 class files; genjavadoc-plugin_2.13.11 (0.18) is published, so no
-             genjavadoc bump is needed. The 2.12 build is unaffected (2.12.18 reads lang3 3.18.0). -->
         <scala.version>2.13.11</scala.version>
         <scala.binary.version>2.13</scala.binary.version>
       </properties>
