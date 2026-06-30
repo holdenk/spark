@@ -288,6 +288,13 @@ object SparkBuild extends PomBuild {
           "-Wconf:cat=unchecked&msg=outer reference:s",
           "-Wconf:cat=unchecked&msg=eliminated by erasure:s",
           "-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s",
+          // SPARK-CVE: the Scala 2.13.8 -> 2.13.11 bump (so scalac can read the JDK 21-built
+          // commons-lang3 3.18.0 class files / JavaVersion enum for CVE-2025-48924; 2.13.8 crashes
+          // with "bad constant pool index") newly emits "Implicit definition should have explicit
+          // type", which the fatal-warnings config above turns into errors. Spark 3.5 source
+          // predates explicit-typing these implicits (done upstream for Scala 2.13.16 / Spark 4.0),
+          // so mute the warning here. Keep in sync with the scala-2.13 profile in pom.xml.
+          "-Wconf:msg=Implicit definition should have explicit type:s",
           // TODO(SPARK-43850): Remove the following suppression rules and remove `import scala.language.higherKinds`
           // from the corresponding files when Scala 2.12 is no longer supported.
           "-Wconf:cat=unused-imports&src=org\\/apache\\/spark\\/graphx\\/impl\\/VertexPartitionBase.scala:s",
