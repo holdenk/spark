@@ -1129,12 +1129,16 @@ object DependencyOverrides {
     // does not, so it picks up the netty declared by transitive consumers (grpc/arrow),
     // older 4.1.91/4.1.60.Final. Without these overrides the sbt build both fails to resolve
     // (old jars are evicted, never published locally) and regresses past the Netty CVE bump.
+    // netty-transport-native-epoll/kqueue must NOT be listed here: they are consumed with
+    // platform classifiers only, so their classifier-less jars never land in ~/.m2 and
+    // coursier (which prefers the local Maven repo once a POM is present there) fails the
+    // update with "not found". They are excluded from the sbt build instead, see
+    // ExcludedDependencies below.
     Seq(
       "netty-all", "netty-buffer", "netty-codec", "netty-codec-http", "netty-codec-http2",
       "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy",
       "netty-resolver", "netty-transport", "netty-transport-classes-epoll",
-      "netty-transport-classes-kqueue", "netty-transport-native-epoll",
-      "netty-transport-native-kqueue", "netty-transport-native-unix-common"
+      "netty-transport-classes-kqueue", "netty-transport-native-unix-common"
     ).map(name => dependencyOverrides += "io.netty" % name % "4.1.124.Final")
 }
 
@@ -1158,7 +1162,17 @@ object ExcludedDependencies {
     excludeDependencies ++= Seq(
       ExclusionRule(organization = "com.sun.jersey"),
       ExclusionRule("javax.servlet", "javax.servlet-api"),
-      ExclusionRule("javax.ws.rs", "jsr311-api"))
+      ExclusionRule("javax.ws.rs", "jsr311-api"),
+      // SPARK-CVE: selenium-remote-driver (a test dep of every module via the parent pom)
+      // depends on these two netty modules WITHOUT a platform classifier. Maven only ever
+      // fetches their classifier jars (linux-x86_64 etc., see pom.xml), so the local Maven
+      // repo ends up with the POM but no classifier-less jar, and coursier - which prefers
+      // the local Maven repo once a POM is present there - fails `update` with "not found"
+      // (this is what silently broke dev/mima in CI). The native transports are an optional
+      // perf feature (Spark defaults to NIO; the epoll/kqueue *classes* still come from
+      // netty-transport-classes-*), so drop the native jars from the sbt build entirely.
+      ExclusionRule("io.netty", "netty-transport-native-epoll"),
+      ExclusionRule("io.netty", "netty-transport-native-kqueue"))
   )
 }
 
