@@ -673,9 +673,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             return 1 if x > 0 else "neg"
 
         def mixed_if(x):
+            # Single top-level `if`/`else` so the If-statement lowering path
+            # (not the "more than one statement" fallback) exercises the guard.
             if x > 0:
                 return "pos"
-            return x
+            else:
+                return x
 
         # Positive control: matching-category branches must still transpile, so
         # the guard does not over-refuse.
