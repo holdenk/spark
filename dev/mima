@@ -25,8 +25,25 @@ FWDIR="$(cd "`dirname "$0"`"/..; pwd)"
 cd "$FWDIR"
 
 SPARK_PROFILES=${1:-"-Pmesos -Pkubernetes -Pyarn -Pspark-ganglia-lgpl -Pkinesis-asl -Phive-thriftserver -Phive"}
-TOOLS_CLASSPATH="$(build/sbt -DcopyDependencies=false "export tools/fullClasspath" | grep jar | tail -n1)"
-OLD_DEPS_CLASSPATH="$(build/sbt -DcopyDependencies=false $SPARK_PROFILES "export oldDeps/fullClasspath" | grep jar | tail -n1)"
+
+# Run an `sbt ... export <proj>/fullClasspath` and echo just the classpath line.
+# The classpath is captured via command substitution, so on success sbt's own
+# output is intentionally quiet. If sbt fails, that output is where the real
+# error lives, so surface it to stderr (and abort) instead of swallowing it --
+# otherwise a resolution/compile failure here shows up in CI as a bare
+# "exit code 1" with no diagnostics.
+export_classpath() {
+  local out
+  if ! out="$(build/sbt "$@" 2>&1)"; then
+    echo "$out" >&2
+    echo "ERROR: 'build/sbt $*' failed while exporting the MiMa classpath (see output above)" >&2
+    exit 1
+  fi
+  echo "$out" | grep jar | tail -n1
+}
+
+TOOLS_CLASSPATH="$(export_classpath -DcopyDependencies=false "export tools/fullClasspath")"
+OLD_DEPS_CLASSPATH="$(export_classpath -DcopyDependencies=false $SPARK_PROFILES "export oldDeps/fullClasspath")"
 
 rm -f .generated-mima*
 
