@@ -84,6 +84,7 @@ class AbstractTranspiler(object):
     ) -> Optional[Column]:
         pass
 
+
 def _is_definitely_basic_type(node: ast.AST) -> bool:
     """
     Return True when ``node`` is statically guaranteed to produce a Python
@@ -102,6 +103,7 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return True
         case _:
             return False
+
 
 def _is_definitely_boolean(node: ast.AST) -> bool:
     """Return True when ``node`` is statically guaranteed to produce a Python

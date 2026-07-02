@@ -723,9 +723,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     pudf.transpiled,
                     "matching-category branches must still transpile",
                 )
-                df = self.spark.createDataFrame(
-                    [Row(a=5), Row(a=-3)], schema=long_schema
-                )
+                df = self.spark.createDataFrame([Row(a=5), Row(a=-3)], schema=long_schema)
                 results = [r[0] for r in df.select(pudf("a")).collect()]
                 self.assertEqual(results, [5, 0], "homogeneous branch result mismatch")
 
