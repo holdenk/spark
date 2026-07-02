@@ -54,7 +54,7 @@ class LdapAuthenticationProviderImplSuite extends SparkFunSuite {
       dns("uid=alice,ou=users,dc=example,dc=com"))
   }
 
-  test("SPARK: LDAP special characters in the username are escaped for the baseDN pattern") {
+  test("LDAP special characters in the username are escaped for the baseDN pattern") {
     val provider = newProvider(baseDN = "ou=users,dc=example,dc=com")
     // Without escaping this would be "uid=admin,ou=Admins,ou=users,dc=example,dc=com", letting
     // the attacker bind as a different DN (authentication bypass / impersonation).
@@ -62,19 +62,19 @@ class LdapAuthenticationProviderImplSuite extends SparkFunSuite {
       dns("uid=admin\\,ou\\=Admins,ou=users,dc=example,dc=com"))
   }
 
-  test("SPARK: full DN structure manipulation is neutralized for the baseDN pattern") {
+  test("full DN structure manipulation is neutralized for the baseDN pattern") {
     val provider = newProvider(baseDN = "ou=users,dc=example,dc=com")
     assert(principals(provider, "attacker,ou=Admins,dc=example,dc=com") ===
       dns("uid=attacker\\,ou\\=Admins\\,dc\\=example\\,dc\\=com,ou=users,dc=example,dc=com"))
   }
 
-  test("SPARK: LDAP special characters in the username are escaped for userDNPattern") {
+  test("LDAP special characters in the username are escaped for userDNPattern") {
     val provider = newProvider(userDNPattern = "uid=%s,ou=service,dc=example,dc=com")
     assert(principals(provider, "admin,ou=Admins") ===
       dns("uid=admin\\,ou\\=Admins,ou=service,dc=example,dc=com"))
   }
 
-  test("SPARK: multiple userDNPatterns are all escaped") {
+  test("multiple userDNPatterns are all escaped") {
     val provider = newProvider(
       userDNPattern = "uid=%s,ou=service,dc=example,dc=com:cn=%s,ou=people,dc=example,dc=com")
     assert(principals(provider, "a+b,c") === dns(
@@ -82,7 +82,7 @@ class LdapAuthenticationProviderImplSuite extends SparkFunSuite {
       "cn=a\\+b\\,c,ou=people,dc=example,dc=com"))
   }
 
-  test("SPARK: escaped backslashes are inserted literally (no regex replacement)") {
+  test("escaped backslashes are inserted literally (no regex replacement)") {
     // The escaped value contains a backslash; String.replaceAll would treat it as a regex escape
     // and either throw or corrupt the output. Verify literal insertion.
     val provider = newProvider(userDNPattern = "uid=%s,ou=service,dc=example,dc=com")
