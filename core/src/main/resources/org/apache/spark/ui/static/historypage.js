@@ -163,7 +163,9 @@ $(document).ready(function() {
         attempt["durationMillisec"] = attempt["duration"];
         attempt["duration"] = formatDuration(attempt["duration"]);
         attempt["id"] = id;
-        attempt["name"] = escapeHtml(name);
+        // The app name is HTML-escaped at render time by stringAbbreviate, so
+        // store the raw value here to avoid double-escaping.
+        attempt["name"] = name;
         attempt["version"] = version;
         attempt["attemptUrl"] = uiRoot + "/history/" + id + "/" +
           (attempt.hasOwnProperty("attemptId") ? attempt["attemptId"] + "/" : "") + "jobs/";

@@ -235,10 +235,22 @@ function getBaseURI() {
   return document.baseURI || document.URL;
 }
 
+/* Escape a string for safe inclusion in HTML text content. Keep this in sync
+ * with the escapeHtml helper in historypage.js. */
+function escapeHtml(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function detailsUINode(isMultiline, message) {
   if (isMultiline) {
     const span = '<span data-toggle-details=".stacktrace-details" class="expand-details">+details</span>';
-    const pre = '<pre>' + message + '</pre>';
+    const pre = '<pre>' + escapeHtml(message) + '</pre>';
     const div = '<div class="stacktrace-details collapsed">' + pre + '</div>';
     return span + div;
   } else {
@@ -270,18 +282,18 @@ function errorSummary(errorMessage) {
 function errorMessageCell(errorMessage) {
   const [summary, isMultiline] = errorSummary(errorMessage);
   const details = detailsUINode(isMultiline, errorMessage);
-  return summary + details;
+  return escapeHtml(summary) + details;
 }
 
 function stringAbbreviate(content, limit) {
   if (content && content.length > limit) {
-    const summary = content.substring(0, limit) + '...';
+    const summary = escapeHtml(content.substring(0, limit)) + '...';
     // TODO: Reused stacktrace-details* style for convenience, but it's not really a stacktrace
     // Consider creating a new style for this case if stacktrace-details is not appropriate in
     // the future.
     const details = detailsUINode(true, content);
     return summary + details;
   } else {
-    return content;
+    return escapeHtml(content);
   }
 }

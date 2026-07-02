@@ -244,4 +244,28 @@ class UIUtilsSuite extends SparkFunSuite {
     assert(html.contains("data-toggle-details"), "detailsUINode should use data-toggle-details")
     assert(html.contains("stacktrace-details"), "detailsUINode should contain stacktrace-details")
   }
+
+  test("errorMessageCell escapes HTML in error messages") {
+    val payload = "<img src=x onerror=alert(document.domain)>"
+
+    // Single-line message: the whole message becomes the summary.
+    val singleLine = UIUtils.errorMessageCell(payload).toString
+    assert(!singleLine.contains(payload),
+      "raw HTML payload must not appear unescaped in the summary")
+    assert(singleLine.contains("&lt;img src=x onerror=alert(document.domain)&gt;"),
+      "the summary must be HTML-escaped")
+
+    // Multi-line message: summary is the first line, payload lands in the details <pre>.
+    val multiLine = UIUtils.errorMessageCell("boom\n" + payload).toString
+    assert(!multiLine.contains(payload),
+      "raw HTML payload must not appear unescaped in the details block")
+    assert(multiLine.contains("&lt;img src=x onerror=alert(document.domain)&gt;"),
+      "the details block must be HTML-escaped")
+
+    // detailsUINode is the shared sink and must escape on its own.
+    val details = UIUtils.detailsUINode(isMultiline = true, payload).toString
+    assert(!details.contains(payload), "detailsUINode must not emit raw HTML")
+    assert(details.contains("&lt;img src=x onerror=alert(document.domain)&gt;"),
+      "detailsUINode must HTML-escape its message")
+  }
 }
