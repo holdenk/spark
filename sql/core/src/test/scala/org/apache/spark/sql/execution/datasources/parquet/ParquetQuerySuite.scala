@@ -885,7 +885,9 @@ abstract class ParquetQuerySuite extends ParquetTest
       // class named in the file. Schema inference falls back to the underlying physical schema
       // rather than instantiating the attacker-named class.
       withSQLConf(SQLConf.ALLOW_CREATING_UDT_FROM_STRING.key -> "false") {
+        assert(!inferredColumnType.isInstanceOf[TestNestedStructUDT])
         assert(!inferredColumnType.isInstanceOf[UserDefinedType[_]])
+        assert(inferredColumnType.isInstanceOf[StructType])
       }
 
       // Explicitly allow-listing the class restores UDT resolution end to end.
