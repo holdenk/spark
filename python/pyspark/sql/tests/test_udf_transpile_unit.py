@@ -748,6 +748,56 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             results = [r[0] for r in df.select(pudf("a")).collect()]
             self.assertEqual(results, [5 == True, 1 == True])
 
+    def test_udf_transpile_falls_back_for_nested_ternary_eq(self):
+        # A ternary operand used inside `==` must contribute its branches'
+        # category, not the old "numeric" catch-all: `("5" if c else "6") == 5`
+        # previously passed the equality guard as numeric-vs-numeric and
+        # Spark's string-number coercion silently returned True where Python's
+        # cross-type == is False. (Reported by Codex review on PR #34.)
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def nested_ternary_eq(x):
+            return ("5" if x > 0 else "6") == 5
+
+        def none_branch_ternary_eq(x):
+            return ("5" if x > 0 else None) == 5
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        df = self.spark.createDataFrame([Row(a=5), Row(a=-5)], schema=long_schema)
+        with self.sql_conf(_TRANSPILE_ON):
+            for func in [nested_ternary_eq, none_branch_ternary_eq]:
+                with self.subTest(func=func.__name__):
+                    with _warnings.catch_warnings(record=True):
+                        _warnings.simplefilter("always")
+                        pudf = UserDefinedFunction(func, BooleanType())
+                    self.assertEqual(
+                        [], pudf.transpiled, "string-ternary == int must not transpile"
+                    )
+                    results = [r[0] for r in df.select(pudf("a")).collect()]
+                    self.assertEqual(results, [False, False], "must match Python's ==")
+
+    def test_udf_transpile_falls_back_for_bool_arithmetic(self):
+        # `(x > 0) + 1` is valid Python (True + 1 == 2), but the lowered
+        # Add(boolean, int) fails ANSI analysis. The category of a
+        # boolean-producing operand is now "bool" (not the numeric catch-all),
+        # so this refuses and runs as interpreted Python.
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def bool_plus_one(x):
+            return (x > 0) + 1
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(bool_plus_one, LongType())
+            self.assertEqual([], pudf.transpiled, "bool arithmetic must not transpile")
+            df = self.spark.createDataFrame([Row(a=5), Row(a=-5)], schema=long_schema)
+            results = [r[0] for r in df.select(pudf("a")).collect()]
+            self.assertEqual(results, [2, 1])
+
     def test_udf_transpile_falls_back_for_return_wrapped_bool_branch(self):
         # If-statement branches arrive as ast.Return nodes; the branch-category
         # guard must see through the wrapper. A boolean-returning branch vs a

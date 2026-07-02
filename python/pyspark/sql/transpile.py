@@ -385,9 +385,43 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
             case ast.Return(value=value) if value is not None:
                 return self._category(params, value)
+            case ast.IfExp(body=if_body, orelse=if_orelse):
+                # A ternary's category is its branches' common category. Without
+                # this arm the catch-all labeled every IfExp "numeric", so e.g.
+                # `("5" if c else "6") == 5` passed the equality guard as
+                # numeric-vs-numeric and Spark's string-number coercion silently
+                # diverged from Python's cross-type `==` (always False). A
+                # None-literal branch adopts the other branch's category (NULL
+                # unifies with any type in the lowered CASE WHEN); mismatched or
+                # all-None branches raise so the variant is dropped.
+                def branch_category(b: ast.AST) -> Optional[str]:
+                    if isinstance(b, ast.Constant) and b.value is None:
+                        return None
+                    return self._category(params, b)
+
+                body_cat = branch_category(if_body)
+                else_cat = branch_category(if_orelse)
+                if body_cat is not None and else_cat is not None and body_cat != else_cat:
+                    raise UnsupportedOperationException(
+                        f"ternary branches have mismatched categories ({body_cat} "
+                        f"vs {else_cat}) and cannot drive operator selection"
+                    )
+                result_cat = body_cat if body_cat is not None else else_cat
+                if result_cat is None:
+                    raise UnsupportedOperationException(
+                        "ternary with all-None branches has no usable column category"
+                    )
+                return result_cat
+            case _ if _is_definitely_boolean(node):
+                # Comparisons, `not`, and boolean ops produce a boolean column.
+                # Labeling them "numeric" (the old catch-all) let booleans into
+                # arithmetic/equality lowerings where ANSI analysis fails (e.g.
+                # `(x > 0) + 1`, valid Python) instead of falling back.
+                return "bool"
             case _:
-                # Comparisons / boolean ops / unary / None / ternary don't drive
-                # concat/repeat selection; treat as numeric for category purposes.
+                # Remaining nodes (unsupported calls, subscripts, ...) don't
+                # drive concat/repeat selection and are rejected later by
+                # `_convert_chunk`; treat as numeric for category purposes.
                 return "numeric"
 
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
