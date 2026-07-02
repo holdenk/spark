@@ -727,6 +727,189 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 results = [r[0] for r in df.select(pudf("a")).collect()]
                 self.assertEqual(results, [5, 0], "homogeneous branch result mismatch")
 
+    def test_udf_transpile_falls_back_for_cross_category_eq(self):
+        # `x == True` on a numeric column would lower to `x = true`, which
+        # fails ANSI analysis (BIGINT vs BOOLEAN) while the option is still a
+        # child of the TranspiledPythonUDF -- breaking a working UDF. The
+        # category gate must refuse so it runs as interpreted Python.
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def eq_true(x):
+            return x == True  # noqa: E712
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(eq_true, BooleanType())
+            self.assertEqual([], pudf.transpiled, "cross-category == must not transpile")
+            df = self.spark.createDataFrame([Row(a=5), Row(a=1)], schema=long_schema)
+            results = [r[0] for r in df.select(pudf("a")).collect()]
+            self.assertEqual(results, [5 == True, 1 == True])
+
+    def test_udf_transpile_falls_back_for_return_wrapped_bool_branch(self):
+        # If-statement branches arrive as ast.Return nodes; the branch-category
+        # guard must see through the wrapper. A boolean-returning branch vs a
+        # numeric one previously slipped past the guard and failed analysis
+        # (CASE WHEN [BOOLEAN, INT]) instead of falling back.
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def mixed(x):
+            if x > 0:
+                return x > 5
+            else:
+                return 1
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(mixed, LongType())
+            self.assertEqual([], pudf.transpiled, "bool-vs-int branches must not transpile")
+            df = self.spark.createDataFrame([Row(a=-3)], schema=long_schema)
+            [result] = df.select(pudf("a")).collect()
+            self.assertEqual(result[0], 1)
+
+    def test_udf_transpile_falls_back_for_plain_self_param(self):
+        # A plain function whose first parameter is literally named `self`
+        # must not be confused with a bound __call__ method: stripping it
+        # previously emitted `_udf_param_-1` and threw an AnalysisException
+        # at call construction.
+        import warnings as _warnings
+
+        def weird(self, other):
+            return self + other
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(weird, LongType())
+            self.assertEqual([], pudf.transpiled, "plain 'self' param must not transpile")
+            df = self.spark.createDataFrame([Row(a=2, b=3)])
+            [result] = df.select(pudf("a", "b")).collect()
+            self.assertEqual(result[0], 5)
+
+    def test_udf_transpile_falls_back_for_wraps_decorated_function(self):
+        # inspect.getsource follows __wrapped__, so a functools.wraps-decorated
+        # UDF previously transpiled the WRAPPED function's source while the
+        # interpreted path ran the wrapper -- a silent wrong result.
+        import functools
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def base(x):
+            return x + 1
+
+        @functools.wraps(base)
+        def wrapper(x):
+            return base(x) * 10
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(wrapper, LongType())
+            self.assertEqual([], pudf.transpiled, "wraps-decorated UDF must not transpile")
+            df = self.spark.createDataFrame([Row(a=5)], schema=long_schema)
+            [result] = df.select(pudf("a")).collect()
+            self.assertEqual(result[0], 60, "must run the wrapper, not the wrapped source")
+
+    def test_udf_transpile_falls_back_for_none_in_boolop(self):
+        # Python's `None and x` short-circuits to None; Spark's three-valued
+        # `null AND false` is false. A literal None operand must force a
+        # fallback rather than silently diverge.
+        import warnings as _warnings
+        from pyspark.sql.types import StructField, StructType
+
+        def none_and(x):
+            return None and (x > 0)
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(none_and, BooleanType())
+            self.assertEqual([], pudf.transpiled, "literal None in and/or must not transpile")
+            df = self.spark.createDataFrame([Row(a=-5)], schema=long_schema)
+            [result] = df.select(pudf("a")).collect()
+            self.assertIsNone(result[0])
+
+    def test_udf_transpile_preserves_auto_column_name(self):
+        # The auto-generated column name must stay `f(a)` whether or not the
+        # rewrite engages; the TranspiledPythonUDF wrapper (and its option
+        # children) must not leak into user-visible schema names.
+        from pyspark.sql.types import StructField, StructType
+
+        def plus_four(x):
+            return x + 4
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        df = self.spark.createDataFrame([Row(a=1)], schema=long_schema)
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(plus_four, LongType())
+            self.assertTrue(pudf.transpiled)
+            self.assertEqual(df.select(pudf("a")).columns, ["plus_four(a)"])
+
+    def test_udf_transpile_arity_mismatch_falls_back(self):
+        # Calling with the wrong number of arguments is a user error that must
+        # surface as the standard Python-side TypeError, not be silently
+        # absorbed by a transpiled constant (zero-param case) nor raise a
+        # misleading "internal error" AnalysisException (too-few-args case).
+        import warnings as _warnings
+        from pyspark.errors import PythonException
+        from pyspark.sql.types import StructField, StructType
+
+        def zero():
+            return 42
+
+        def two(x, y):
+            return x + y
+
+        long_schema = StructType([StructField("a", LongType(), nullable=True)])
+        df = self.spark.createDataFrame([Row(a=5)], schema=long_schema)
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True):
+                _warnings.simplefilter("always")
+                pudf_zero = UserDefinedFunction(zero, LongType())
+                pudf_two = UserDefinedFunction(two, LongType())
+            with self.assertRaises(PythonException):
+                df.select(pudf_zero("a")).collect()
+            with self.assertRaises(PythonException):
+                df.select(pudf_two("a")).collect()
+
+    def test_udf_transpile_decimal_input_falls_back(self):
+        # Python receives decimal.Decimal objects, which raise TypeError when
+        # mixed with float literals; the transpiled numeric lowering would
+        # silently succeed. Decimal columns must fall back to interpreted
+        # Python (pruned by input category at analysis time).
+        from pyspark.errors import PythonException
+
+        def add_half(x):
+            return x + 1.5
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(add_half, StringType())
+            self.assertTrue(pudf.transpiled, "numeric option should still be produced")
+            df = self.spark.sql("SELECT CAST(1.0 AS DECIMAL(10,2)) AS d")
+            with self.assertRaises(PythonException):
+                df.select(pudf("d")).collect()
+
+    def test_udf_transpile_collated_string_falls_back(self):
+        # Under a non-binary collation Spark's `=` follows collation rules
+        # ('abc' = 'ABC' is true under UTF8_LCASE) while Python compares
+        # codepoints. Collated columns must fall back to interpreted Python.
+        def eq_abc(s):
+            return s == "ABC"
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(eq_abc, BooleanType())
+            self.assertTrue(pudf.transpiled, "string option should still be produced")
+            df = self.spark.sql("SELECT 'abc' COLLATE UTF8_LCASE AS s")
+            [result] = df.select(pudf("s")).collect()
+            self.assertIs(result[0], False, "must match Python, not collation semantics")
+
     def test_udf_transpile_is_none_semantics(self):
         # `x is None` and `None is x` (and their `is not` variants) should
         # transpile to isNull/isNotNull. Any other identity check (`x is 0`,
@@ -1150,9 +1333,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def test_udf_transpile_known_value_divergences(self):
         # Transpile but DIVERGE from Python (documented in transpile.py; pinned so
         # a future fix is noticed): unguarded arithmetic on NULL yields NULL
-        # (Python raises TypeError), NaN > 0 is True (Python False; Spark orders
-        # NaN highest), and comparing to a cross-type literal coerces (int == "5"
-        # -> True; Python False). Mixed str/numeric arithmetic is handled or falls
+        # (Python raises TypeError), and NaN > 0 is True (Python False; Spark
+        # orders NaN highest). Mixed str/numeric arithmetic is handled or falls
         # back -- see test_udf_transpile_string_operands{,_fall_back}.
         unguarded = lambda x: x + 1  # noqa: E731
         nan_gt = lambda x: (x > 0) if x is not None else None  # noqa: E731
@@ -1161,8 +1343,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertEqual(
             self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [True, True]
         )
+        # `x == "5"` used to be pinned as a coercion divergence (int == "5" ->
+        # True). The eq category gate now drops the numeric variant, so on a
+        # long column the string option is pruned and the UDF falls back to
+        # interpreted Python -- matching Python's cross-type == (always False).
         self.assertEqual(
-            self._vals(eq_strlit, BooleanType(), "a long", [(5,), (3,)]), [True, False]
+            self._vals(eq_strlit, BooleanType(), "a long", [(5,), (3,)]), [False, False]
         )
 
     def test_udf_transpile_overflow_and_modulo_zero_raise(self):

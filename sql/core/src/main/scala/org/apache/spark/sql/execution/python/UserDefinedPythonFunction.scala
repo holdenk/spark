@@ -116,8 +116,16 @@ case class UserDefinedPythonFunction(
     // is `optionInputCategories.nonEmpty`); an empty or mismatched categories
     // list would leave a type-invalid option to fail CheckAnalysis instead of
     // falling back. If the two lists don't line up, skip transpilation.
+    // A call-site arity mismatch (user passed more or fewer args than the UDF's
+    // parameters) must fall back to the plain Python UDF so the standard runtime
+    // TypeError surfaces. Each option's category list has exactly one entry per
+    // public parameter, so a length mismatch against the bound children detects
+    // both directions: too few args would otherwise trip the placeholder bounds
+    // check below as a misleading "internal error", and too many args on a
+    // zero/fewer-param UDF would otherwise silently succeed where Python raises.
     if (transpiledExprsForUse.nonEmpty &&
-        optionInputTypesForUse.length == transpiledExprsForUse.length) {
+        optionInputTypesForUse.length == transpiledExprsForUse.length &&
+        optionInputTypesForUse.forall(_.length == e.length)) {
       val udfChildren = udfExpr.children.toArray
       // Resolve the `_udf_param_N` placeholders the transpiler emits into the bound
       // UDF arguments. Apply this ONLY to the transpiled options -- never to

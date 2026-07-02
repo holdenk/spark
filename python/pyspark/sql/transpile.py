@@ -168,6 +168,12 @@ class CatalystTranspiler(AbstractTranspiler):
         """
         if node is None:
             return None
+        # If-statement branches arrive as ``Return`` statements; classify the
+        # returned value, not the statement wrapper (``_is_definitely_boolean``
+        # has no ``Return`` case, so without this a boolean-returning branch
+        # would fall through to ``_category``'s numeric catch-all).
+        if isinstance(node, ast.Return):
+            return self._safe_category(params, node.value)
         if isinstance(node, ast.Constant) and node.value is None:
             return None
         # Comparisons / ``not`` / boolean ops produce a boolean column; classify
@@ -227,7 +233,7 @@ class CatalystTranspiler(AbstractTranspiler):
     def _lower_eq(
         self,
         params: List[str],
-        left_col: Column,
+        left_node: ast.AST,
         right_node: ast.AST,
         equal: bool,
     ) -> Column:
@@ -240,12 +246,28 @@ class CatalystTranspiler(AbstractTranspiler):
         the UDF as ``None`` rather than the bool Python would have
         produced. Hand-roll the four cases via ``when`` branches.
 
-        Caveat: when the operands are different types Spark coerces before
-        comparing (e.g. an int column ``== "5"`` is True after casting the
-        string), whereas Python's ``==`` is False across unequal types. The
-        transpiler can't see column types, so this divergence is documented
-        rather than guarded.
+        When the two operands resolve to concrete but DIFFERENT categories
+        (e.g. ``x == True`` on a numeric column, or ``x == "5"`` under the
+        numeric variant), the lowered ``=`` either fails analysis under ANSI
+        (bool vs bigint) -- which would break a working UDF since the option
+        is type-checked before ConvertToCatalyst can drop it -- or coerces
+        where Python's ``==`` is simply False. Refuse those so the UDF falls
+        back to interpreted Python. A ``None`` literal operand stays allowed
+        (the four-branch NULL handling above reproduces Python exactly).
+
+        One value-level difference remains (needs runtime values, so it is
+        documented, not guarded): Spark treats ``NaN = NaN`` as true, while
+        Python's ``nan == nan`` is False.
         """
+        lc = self._safe_category(params, left_node)
+        rc = self._safe_category(params, right_node)
+        if lc is not None and rc is not None and lc != rc:
+            raise UnsupportedOperationException(
+                f"`==`/`!=` operands have incompatible categories ({lc} vs {rc}); "
+                "Python compares across types as unequal while Spark would coerce "
+                "or fail analysis, so the transpiler falls back to interpreted Python"
+            )
+        left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
         left_null = left_col.isNull()
         right_null = right_col.isNull()
@@ -418,6 +440,19 @@ class CatalystTranspiler(AbstractTranspiler):
                         "lower this and the UDF falls back to interpreted "
                         "Python"
                     )
+                # A literal None operand short-circuits differently: Python's
+                # `None and (x > 0)` returns None regardless of x, but Spark's
+                # three-valued `null AND false` is false (and `null OR true` is
+                # true), so the lowered form diverges. `_is_definitely_boolean`
+                # accepts None for `not`/if-test contexts where coalesce handles
+                # it; here it must force a fallback instead.
+                if any(isinstance(v, ast.Constant) and v.value is None for v in values):
+                    raise UnsupportedOperationException(
+                        "literal None operand in `and` / `or` cannot be lowered: "
+                        "Spark's three-valued logic diverges from Python's "
+                        "short-circuit-return-operand semantics, so the UDF "
+                        "falls back to interpreted Python"
+                    )
                 cols = [self._convert_chunk(params, v) for v in values]
                 if isinstance(op, ast.And):
                     result = cols[0]
@@ -483,11 +518,9 @@ class CatalystTranspiler(AbstractTranspiler):
                         else:
                             return subject_col.isNotNull()
                     case ast.Eq():
-                        left_col = self._convert_chunk(params, left)
-                        return self._lower_eq(params, left_col, comp, equal=True)
+                        return self._lower_eq(params, left, comp, equal=True)
                     case ast.NotEq():
-                        left_col = self._convert_chunk(params, left)
-                        return self._lower_eq(params, left_col, comp, equal=False)
+                        return self._lower_eq(params, left, comp, equal=False)
                     case ast.Lt():
                         return self._lower_value_compare(
                             params, left, comp, lambda l, r: l < r, "<"
@@ -714,10 +747,17 @@ def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.
         src = textwrap.dedent(src).strip()
         ast_info = ast.parse(src)
     except Exception:
-        if hasattr(func, "__call__"):
-            src = inspect.getsource(func.__call__)
+        try:
+            # getattr keeps mypy happy: `__call__` on a bare Callable is
+            # not attribute-accessible in the type system.
+            src = inspect.getsource(getattr(func, "__call__"))
             src = textwrap.dedent(src).strip()
             ast_info = ast.parse(src)
+        except Exception:
+            # No usable source (REPL/stdin definition, builtin, ...) --
+            # return cleanly so the caller reports "cannot transpile"
+            # instead of surfacing an UnboundLocalError as the reason.
+            return None, None
     return src, ast_info
 
 
@@ -802,6 +842,24 @@ def _transpile_func(
     column types, or falls back to the Python UDF when none match.
     """
     try:
+        # A functools.wraps-style decorator makes ``inspect.getsource`` return
+        # the WRAPPED function's source (getsource follows ``__wrapped__``),
+        # while the UDF actually executes the wrapper. Transpiling would
+        # silently reproduce the wrong behavior, so refuse and fall back.
+        if (
+            getattr(func, "__wrapped__", None) is not None
+            or getattr(getattr(func, "__call__", None), "__wrapped__", None) is not None
+        ):
+            return (
+                [],
+                [
+                    "decorated callables (functools.wraps) are not supported: "
+                    "the visible source is the wrapped function's, not the "
+                    "wrapper's, so transpilation would change behavior"
+                ],
+                [],
+                [],
+            )
         src, ast = _get_src_ast_from_func(func)
         if ast is None:
             return ([], ["Error getting ast for function, cannot transpile"], [], [])
@@ -835,6 +893,24 @@ def _transpile_func(
                 [],
             )
         params = _get_parameter_list(function_ast)
+        # The transpiler strips a leading ``self`` on the assumption that the
+        # source came from a bound ``__call__`` / method whose receiver is not
+        # supplied at the call site. A PLAIN function whose first parameter
+        # happens to be named ``self`` breaks that assumption: every arg IS
+        # supplied at the call site, and stripping would misnumber the
+        # ``_udf_param_N`` placeholders (emitting ``_udf_param_-1``). Refuse
+        # and fall back rather than guess.
+        if params and params[0] == "self" and inspect.isfunction(func):
+            return (
+                [],
+                [
+                    "plain function with first parameter named 'self' is "
+                    "ambiguous to the transpiler's self-stripping; falling "
+                    "back to interpreted Python"
+                ],
+                [],
+                [],
+            )
         # Strip ``self`` for the caller-facing param list -- callers will
         # match user-supplied kwargs against this, and the user doesn't
         # name ``self`` at the call site.
