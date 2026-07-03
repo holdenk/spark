@@ -343,10 +343,7 @@ object DataType {
           udtClass, SqlApiConf.get.allowedDynamicUDTClasses)
       }
       // Defense in depth: resolve the class without initializing it and verify that it really is a
-      // UserDefinedType subclass before constructing it. Because `udtClass` comes from the schema
-      // string embedded in the data being read (e.g. Parquet file metadata), this prevents a
-      // crafted file from triggering the static initializer or constructor of an arbitrary class
-      // that merely happens to be on the classpath (CWE-470).
+      // UserDefinedType subclass before constructing it.
       val clazz = SparkClassUtils.classForName[UserDefinedType[_]](udtClass, initialize = false)
       if (!classOf[UserDefinedType[_]].isAssignableFrom(clazz)) {
         throw DataTypeErrors.udtClassNotUserDefinedTypeError(udtClass)

@@ -232,7 +232,7 @@ class DataTypeSuite extends SparkFunSuite with SQLHelper {
     }
   }
 
-  test("a schema string cannot load an arbitrary non-UserDefinedType class (CWE-470)") {
+  test("a schema string cannot load an arbitrary non-UserDefinedType class") {
     // Simulate a crafted schema string (e.g. from Parquet file metadata) whose UDT "class" field
     // points at an arbitrary class that is not a UserDefinedType. Spark must refuse to load and
     // instantiate it, both when UDT loading is enabled and when the class is explicitly allowed.
