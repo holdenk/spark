@@ -96,7 +96,7 @@ public class LdapAuthenticationProviderImpl implements PasswdAuthenticationProvi
   // Builds the list of LDAP principals (Distinguished Names) to attempt binding with for the
   // given user. The user-supplied value is escaped with {@link Rdn#escapeValue} before it is
   // placed into a DN so that LDAP special characters including ',', '=', '+', '<', '>', etc.
-  // cannot alter the DN structure. See RFC-2253
+  // cannot alter the DN structure. See RFC-2253.
   // Visible for testing.
   List<String> createCandidatePrincipals(String user) {
     String escapedUser = Rdn.escapeValue(user);
