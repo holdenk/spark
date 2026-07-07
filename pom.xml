@@ -3752,7 +3752,7 @@
                   <arg>-Wconf:cat=unchecked&amp;msg=eliminated by erasure:s</arg>
                   <arg>-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s</arg>
                   <!--
-                    SPARK-CVE: the Scala 2.13.8 -> 2.13.11 bump (see scala-2.13 profile properties)
+                    The Scala 2.13.8 -> 2.13.11 bump (see scala-2.13 profile properties)
                     newly emits "Implicit definition should have explicit type", which the
                     fatal-warnings config above turns into errors. Spark 3.5 source predates
                     explicit-typing these implicits (done upstream for Scala 2.13.16 / Spark 4.0),

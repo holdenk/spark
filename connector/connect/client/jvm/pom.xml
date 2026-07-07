@@ -77,9 +77,6 @@
       <version>${ammonite.version}</version>
       <scope>provided</scope>
     </dependency>
-    <!-- SPARK-CVE: grpc-java 1.69+ split io.grpc.inprocess out of grpc-core into a
-         separate grpc-inprocess artifact. The client test suites use
-         InProcessChannelBuilder/InProcessServerBuilder, so declare it at test scope. -->
     <dependency>
       <groupId>io.grpc</groupId>
       <artifactId>grpc-inprocess</artifactId>

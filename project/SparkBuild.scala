@@ -288,7 +288,7 @@ object SparkBuild extends PomBuild {
           "-Wconf:cat=unchecked&msg=outer reference:s",
           "-Wconf:cat=unchecked&msg=eliminated by erasure:s",
           "-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s",
-          // SPARK-CVE: the Scala 2.13.8 -> 2.13.11 bump (so scalac can read the JDK 21-built
+          // The Scala 2.13.8 -> 2.13.11 bump (so scalac can read the JDK 21-built
           // commons-lang3 3.18.0 class files / JavaVersion enum for CVE-2025-48924; 2.13.8 crashes
           // with "bad constant pool index") newly emits "Implicit definition should have explicit
           // type", which the fatal-warnings config above turns into errors. Spark 3.5 source
@@ -1112,30 +1112,10 @@ object DependencyOverrides {
     dependencyOverrides += "xerces" % "xercesImpl" % "2.12.2",
     dependencyOverrides += "jline" % "jline" % "2.14.6",
     dependencyOverrides += "org.apache.avro" % "avro" % "1.11.5",
-    // SPARK-CVE: keep in sync with <commons-compress.version> in pom.xml. sbt does not
-    // honor Maven dependencyManagement for transitives, so this override is what closes
-    // CVE-2024-25710 / CVE-2024-26308 in the sbt build.
     dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.26.2",
-    // SPARK-CVE: keep in sync with <commons-lang3.version> in pom.xml. commons-compress
-    // 1.26.2 needs lang3 >= 3.14 (ArrayFill); sbt does not honor Maven dependencyManagement
-    // for transitives, so force a single consistent lang3. Also clears CVE-2025-48924.
     dependencyOverrides += "org.apache.commons" % "commons-lang3" % "3.18.0",
-    // SPARK-CVE: breeze (via mllib-local) declares slf4j-api 1.7.5 transitively. Maven
-    // forces 2.0.7 via dependencyManagement, but sbt does not, so mllib-local/update can
-    // resolve and try to fetch the ancient 1.7.5 jar. Force the managed version here.
     dependencyOverrides += "org.slf4j" % "slf4j-api" % "2.0.7",
-    // The three overrides below pin modules to the version Maven's mediation picks, so
-    // that sbt resolves jars that actually exist in a Maven-populated ~/.m2 (coursier
-    // prefers the local Maven repo once a POM is present there and fails `update` with
-    // "not found" when only another version's jar was fetched - the same failure mode
-    // that broke dev/mima in CI, see the netty note below).
-    //
-    // The kafka module poms pin jopt-simple to 3.2 (test scope) and Maven's nearest-wins
-    // takes it over kafka_2.12's transitive 5.0.4; coursier max-picks 5.0.4 instead.
     dependencyOverrides += "net.sf.jopt-simple" % "jopt-simple" % "3.2",
-    // In ammonite 2.5.9's tree (provided dep of connect-client-jvm), Maven mediates
-    // geny to 0.7.0 (via os-lib 0.8.0) and sourcecode to 0.2.7 (via ammonite-terminal);
-    // coursier max-picks 0.7.1 / 0.3.0, which are POM-only in ~/.m2.
     dependencyOverrides += "com.lihaoyi" %% "geny" % "0.7.0",
     dependencyOverrides += "com.lihaoyi" %% "sourcecode" % "0.2.7") ++
     // SPARK-CVE: keep in sync with <netty.version> in pom.xml. Maven manages the top-level
@@ -1177,7 +1157,7 @@ object ExcludedDependencies {
       ExclusionRule(organization = "com.sun.jersey"),
       ExclusionRule("javax.servlet", "javax.servlet-api"),
       ExclusionRule("javax.ws.rs", "jsr311-api"),
-      // SPARK-CVE: selenium-remote-driver (a test dep of every module via the parent pom)
+      // selenium-remote-driver (a test dep of every module via the parent pom)
       // depends on these two netty modules WITHOUT a platform classifier. Maven only ever
       // fetches their classifier jars (linux-x86_64 etc., see pom.xml), so the local Maven
       // repo ends up with the POM but no classifier-less jar, and coursier - which prefers
