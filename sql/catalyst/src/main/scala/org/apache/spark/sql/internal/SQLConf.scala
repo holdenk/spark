@@ -259,7 +259,7 @@ object SQLConf {
         "file can make Spark load an arbitrary class from the classpath. Set this to false to " +
         "block loading UDT classes by name, optionally allowing specific classes via " +
         s"'${SqlApiConfHelper.ALLOWED_DYNAMIC_UDT_CLASSES}'.")
-      .version("5.0.0")
+      .version("4.2.0")
       .booleanConf
       .createWithDefault(true)
 
@@ -268,7 +268,7 @@ object SQLConf {
       .doc(s"When '${SqlApiConfHelper.ALLOW_CREATING_UDT_FROM_STRING}' is false, UserDefinedType " +
         "classes listed here (by fully qualified class name) may still be loaded and " +
         "instantiated from a schema string. Has no effect when UDT loading is enabled.")
-      .version("5.0.0")
+      .version("4.2.0")
       .stringConf
       .toSequence
       .createWithDefault(Nil)
