@@ -117,6 +117,7 @@ public class LdapAuthenticationProviderImpl implements PasswdAuthenticationProvi
       }
     }
 
+    // If there is no configured pattern or base we accept the raw user in full.
     if (candidatePrincipals.isEmpty()) {
       candidatePrincipals = Collections.singletonList(user);
     }
