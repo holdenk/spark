@@ -1123,18 +1123,36 @@ object DependencyOverrides {
     // SPARK-CVE: breeze (via mllib-local) declares slf4j-api 1.7.5 transitively. Maven
     // forces 2.0.7 via dependencyManagement, but sbt does not, so mllib-local/update can
     // resolve and try to fetch the ancient 1.7.5 jar. Force the managed version here.
-    dependencyOverrides += "org.slf4j" % "slf4j-api" % "2.0.7") ++
+    dependencyOverrides += "org.slf4j" % "slf4j-api" % "2.0.7",
+    // The three overrides below pin modules to the version Maven's mediation picks, so
+    // that sbt resolves jars that actually exist in a Maven-populated ~/.m2 (coursier
+    // prefers the local Maven repo once a POM is present there and fails `update` with
+    // "not found" when only another version's jar was fetched - the same failure mode
+    // that broke dev/mima in CI, see the netty note below).
+    //
+    // The kafka module poms pin jopt-simple to 3.2 (test scope) and Maven's nearest-wins
+    // takes it over kafka_2.12's transitive 5.0.4; coursier max-picks 5.0.4 instead.
+    dependencyOverrides += "net.sf.jopt-simple" % "jopt-simple" % "3.2",
+    // In ammonite 2.5.9's tree (provided dep of connect-client-jvm), Maven mediates
+    // geny to 0.7.0 (via os-lib 0.8.0) and sourcecode to 0.2.7 (via ammonite-terminal);
+    // coursier max-picks 0.7.1 / 0.3.0, which are POM-only in ~/.m2.
+    dependencyOverrides += "com.lihaoyi" %% "geny" % "0.7.0",
+    dependencyOverrides += "com.lihaoyi" %% "sourcecode" % "0.2.7") ++
     // SPARK-CVE: keep in sync with <netty.version> in pom.xml. Maven manages the top-level
     // netty modules and lets netty's internal version alignment cascade to the rest; sbt
     // does not, so it picks up the netty declared by transitive consumers (grpc/arrow),
     // older 4.1.91/4.1.60.Final. Without these overrides the sbt build both fails to resolve
     // (old jars are evicted, never published locally) and regresses past the Netty CVE bump.
+    // netty-transport-native-epoll/kqueue must NOT be listed here: they are consumed with
+    // platform classifiers only, so their classifier-less jars never land in ~/.m2 and
+    // coursier (which prefers the local Maven repo once a POM is present there) fails the
+    // update with "not found". They are excluded from the sbt build instead, see
+    // ExcludedDependencies below.
     Seq(
       "netty-all", "netty-buffer", "netty-codec", "netty-codec-http", "netty-codec-http2",
       "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy",
       "netty-resolver", "netty-transport", "netty-transport-classes-epoll",
-      "netty-transport-classes-kqueue", "netty-transport-native-epoll",
-      "netty-transport-native-kqueue", "netty-transport-native-unix-common"
+      "netty-transport-classes-kqueue", "netty-transport-native-unix-common"
     ).map(name => dependencyOverrides += "io.netty" % name % "4.1.124.Final")
 }
 
@@ -1158,7 +1176,17 @@ object ExcludedDependencies {
     excludeDependencies ++= Seq(
       ExclusionRule(organization = "com.sun.jersey"),
       ExclusionRule("javax.servlet", "javax.servlet-api"),
-      ExclusionRule("javax.ws.rs", "jsr311-api"))
+      ExclusionRule("javax.ws.rs", "jsr311-api"),
+      // SPARK-CVE: selenium-remote-driver (a test dep of every module via the parent pom)
+      // depends on these two netty modules WITHOUT a platform classifier. Maven only ever
+      // fetches their classifier jars (linux-x86_64 etc., see pom.xml), so the local Maven
+      // repo ends up with the POM but no classifier-less jar, and coursier - which prefers
+      // the local Maven repo once a POM is present there - fails `update` with "not found"
+      // (this is what silently broke dev/mima in CI). The native transports are an optional
+      // perf feature (Spark defaults to NIO; the epoll/kqueue *classes* still come from
+      // netty-transport-classes-*), so drop the native jars from the sbt build entirely.
+      ExclusionRule("io.netty", "netty-transport-native-epoll"),
+      ExclusionRule("io.netty", "netty-transport-native-kqueue"))
   )
 }
 
