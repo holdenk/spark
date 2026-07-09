@@ -87,9 +87,8 @@ private[sql] object DataTypeErrors extends DataTypeErrorsBase {
   def udtClassLoadingDisabledError(udtClass: String, allowed: Seq[String]): Throwable = {
     new SparkException(
       errorClass = "UDT_CLASS_LOADING_DISABLED",
-      messageParameters = Map(
-        "udtClass" -> udtClass,
-        "allowed" -> allowed.map(toSQLValue).mkString(", ")),
+      messageParameters =
+        Map("udtClass" -> udtClass, "allowed" -> allowed.map(toSQLValue).mkString(", ")),
       cause = null)
   }
 

@@ -338,9 +338,10 @@ object DataType {
           ("sqlType", _),
           ("type", JString("udt"))) =>
       if (!SqlApiConf.get.allowCreatingUDTFromString &&
-          !SqlApiConf.get.allowedDynamicUDTClasses.contains(udtClass)) {
+        !SqlApiConf.get.allowedDynamicUDTClasses.contains(udtClass)) {
         throw DataTypeErrors.udtClassLoadingDisabledError(
-          udtClass, SqlApiConf.get.allowedDynamicUDTClasses)
+          udtClass,
+          SqlApiConf.get.allowedDynamicUDTClasses)
       }
       // Defense in depth: resolve the class without initializing it and verify that it really is a
       // UserDefinedType subclass before constructing it.
