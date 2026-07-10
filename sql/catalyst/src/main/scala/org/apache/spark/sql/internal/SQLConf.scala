@@ -259,6 +259,7 @@ object SQLConf {
         "block loading UDT classes by name, optionally allowing specific classes via " +
         s"'${SqlApiConfHelper.ALLOWED_DYNAMIC_UDT_CLASSES}'.")
       .version("4.1.3")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
       .booleanConf
       .createWithDefault(true)
 
@@ -268,6 +269,7 @@ object SQLConf {
         "classes listed here (by fully qualified class name) may still be loaded and " +
         "instantiated from a schema string. Has no effect when UDT loading is enabled.")
       .version("4.1.3")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
       .stringConf
       .toSequence
       .createWithDefault(Nil)
