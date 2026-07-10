@@ -47,6 +47,7 @@ from pyspark.sql.types import (
     BinaryType,
     BooleanType,
     DataType,
+    DecimalType,
     NumericType,
     StringType,
 )
@@ -737,29 +738,51 @@ class CatalystTranspiler(AbstractTranspiler):
                 "functions with more than one top-level statement are not "
                 "supported by the transpiler"
             )
-        # Refuse variants whose final Cast to the declared return type can
-        # never resolve. The options are type-checked by CheckAnalysis as
-        # children of TranspiledPythonUDF before ConvertToCatalyst could drop
-        # them, so an invalid Cast (e.g. a binary-typed body cast to a numeric
-        # return type) fails the whole query instead of falling back. Under
-        # ANSI: string bodies cast to every allowed return type (string ->
-        # numeric/boolean are runtime-checked but analysis-valid), numeric and
-        # boolean bodies cast to everything except binary, and binary bodies
-        # cast only to string/binary. An unknown category (e.g. a bare None
-        # body) lowers to NULL, which casts to anything.
+        # Refuse variants whose body category does not MATCH the declared
+        # return type's category. Two distinct failure modes hide here:
+        #
+        # * A cast that can never resolve (binary -> numeric, bool -> binary):
+        #   the options are type-checked by CheckAnalysis as children of
+        #   TranspiledPythonUDF before ConvertToCatalyst could drop them, so
+        #   the whole query fails instead of falling back.
+        # * A cast that IS analysis-valid but that the interpreted
+        #   SQL_BATCHED_UDF path never performs: EvaluatePython.makeFromJava
+        #   accepts only the expected JVM types for the declared return type
+        #   and nulls everything else. E.g. `def f(s: str): return s` declared
+        #   LongType() returns NULL interpreted, but a lowered
+        #   cast(string as bigint) would return 123 for '123' (or raise
+        #   CAST_INVALID_INPUT for 'abc') -- a silent divergence.
+        #
+        # So require the strict match: numeric -> non-decimal NumericType
+        # (DecimalType is excluded like it is for inputs: the interpreted
+        # converter accepts only decimal.Decimal results there and nulls the
+        # ints/floats these lowerings produce), string -> StringType, bool ->
+        # BooleanType, binary -> BinaryType. An unknown category (e.g. a bare
+        # None body) lowers to NULL, which every return type accepts as NULL
+        # on both paths. Within-numeric conversions (e.g. a bigint body cast
+        # to a double return type) are intentionally still allowed and
+        # documented as the transpiled-cast behavior pinned by
+        # test_udf_transpile_casts_to_return_type.
         if isinstance(returnType, DataType):
             body_cat = self._safe_category(params, function_body[0])
             cast_ok = (
                 body_cat is None
-                or body_cat == "string"
-                or (body_cat in ("numeric", "bool") and not isinstance(returnType, BinaryType))
-                or (body_cat == "binary" and isinstance(returnType, (StringType, BinaryType)))
+                or (
+                    body_cat == "numeric"
+                    and isinstance(returnType, NumericType)
+                    and not isinstance(returnType, DecimalType)
+                )
+                or (body_cat == "string" and isinstance(returnType, StringType))
+                or (body_cat == "bool" and isinstance(returnType, BooleanType))
+                or (body_cat == "binary" and isinstance(returnType, BinaryType))
             )
             if not cast_ok:
                 raise UnsupportedOperationException(
-                    f"a {body_cat}-typed lowering cannot be cast to the declared "
-                    f"return type {returnType.simpleString()} under ANSI rules; "
-                    "falling back to interpreted Python"
+                    f"a {body_cat}-typed lowering does not match the declared "
+                    f"return type {returnType.simpleString()}; the interpreted "
+                    "path would return NULL where the lowered cast would "
+                    "convert (or fail), so the transpiler falls back to "
+                    "interpreted Python"
                 )
         converted = self._convert_chunk(params, function_body[0])
         # Cast to the declared return type so the rewritten plan reports a
@@ -948,13 +971,14 @@ def _transpile_func(
     try:
         # The transpiler lowers to atomic (numeric/string/boolean/binary)
         # expressions and casts the result to the declared return type. For a
-        # return type no lowering can be cast to (arrays, maps, structs,
-        # datetimes, ...), that Cast can never resolve -- and because the
-        # options ride along as children of TranspiledPythonUDF, an
-        # unresolvable Cast fails the WHOLE query at CheckAnalysis instead of
-        # falling back. Restrict transpilation to return types with a valid
-        # ANSI cast from the lowered categories (the per-variant combinations
-        # are checked in ``_transpile_from_ast``); everything else falls back
+        # return type no lowering can even category-match (arrays, maps,
+        # structs, datetimes, ...), that Cast either never resolves -- and
+        # because the options ride along as children of TranspiledPythonUDF,
+        # an unresolvable Cast fails the WHOLE query at CheckAnalysis instead
+        # of falling back -- or diverges from the interpreted converter, which
+        # nulls type-mismatched results. Restrict transpilation to return
+        # types some lowering can match (the strict per-variant body-category
+        # check lives in ``_transpile_from_ast``); everything else falls back
         # to interpreted Python.
         if isinstance(returnType, str):
             from pyspark.sql.types import _parse_datatype_string

@@ -914,11 +914,16 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertIsNone(result[0], "interpreted fallback nulls the mismatch")
 
     def test_udf_transpile_falls_back_for_cross_category_return_cast(self):
-        # Per-variant guard: a binary-typed body cannot be cast to a numeric
-        # return type (and a boolean body cannot be cast to binary) -- the
-        # unresolvable Cast would fail analysis instead of falling back. A
-        # binary body cast to string stays transpilable (valid ANSI cast).
+        # Per-variant guard: the body category must MATCH the declared return
+        # type's category. Un-castable combos (binary body -> numeric return,
+        # boolean body -> binary return) would fail analysis outright, and
+        # analysis-valid cross-category casts (string -> long, numeric ->
+        # boolean, anything -> decimal) diverge from the interpreted path,
+        # which nulls type-mismatched results instead of casting -- e.g.
+        # `def f(s: str): return s` declared LongType() would return 123 for
+        # '123' (or raise CAST_INVALID_INPUT) where interpreted returns NULL.
         import warnings as _warnings
+        from pyspark.sql.types import DecimalType
 
         def bytes_to_long(x: bytes):
             return x
@@ -926,19 +931,32 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def bool_to_binary(x):
             return (x > 0) if x is not None else None
 
+        def str_ident(s: str):
+            return s
+
+        def plus_one(x):
+            return x + 1
+
         with self.sql_conf(_TRANSPILE_ON):
             for func, rt, label in (
                 (bytes_to_long, LongType(), "binary body -> numeric return"),
                 (bool_to_binary, BinaryType(), "boolean body -> binary return"),
+                (bytes_to_long, StringType(), "binary body -> string return"),
+                (str_ident, LongType(), "string body -> numeric return"),
+                (plus_one, BooleanType(), "numeric body -> boolean return"),
+                (plus_one, DecimalType(10, 2), "numeric body -> decimal return"),
             ):
                 with _warnings.catch_warnings(record=True):
                     _warnings.simplefilter("always")
                     pudf = UserDefinedFunction(func, rt)
                 self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+            # Interpreted execution of the Codex-flagged example: NULL, not a
+            # cast. (The transpiled cast would have returned 123.)
             with _warnings.catch_warnings(record=True):
                 _warnings.simplefilter("always")
-                str_ok = UserDefinedFunction(bytes_to_long, StringType())
-            self.assertTrue(str_ok.transpiled, "binary body -> string return is castable")
+                str_long = UserDefinedFunction(str_ident, LongType())
+            df = self.spark.createDataFrame([("123",)], "s string")
+            self.assertIsNone(df.select(str_long("s")).first()[0])
 
     def test_udf_transpile_falls_back_for_non_numeric_unary(self):
         # Unary +/- only lower for numeric operands: Python raises TypeError
@@ -975,18 +993,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         class PickSelf:
             def __call__(self, x):
-                return self if x is None else x
+                return x if x is not None else self
 
         with self.sql_conf(_TRANSPILE_ON):
             with _warnings.catch_warnings(record=True):
                 _warnings.simplefilter("always")
                 pudf = UserDefinedFunction(PickSelf(), LongType())
             self.assertEqual([], pudf.transpiled, "`self` reference must not transpile")
-            df = self.spark.createDataFrame([(2,), (None,)], "a long")
+            # Interpreted execution still works (previously the call itself
+            # raised). Only non-null rows are exercised: a row that RETURNS
+            # `self` would fail JVM-side unpickling of the instance, which is
+            # interpreted-UDF behavior unrelated to this guard.
+            df = self.spark.createDataFrame([(2,), (7,)], "a long")
             results = [r[0] for r in df.select(pudf("a")).collect()]
-            # Interpreted execution: x for the non-null row; the returned
-            # instance for the null row is type-mismatched and converts to null.
-            self.assertEqual(results, [2, None])
+            self.assertEqual(results, [2, 7])
 
     def test_udf_transpile_preserves_auto_column_name(self):
         # The auto-generated column name must stay `f(a)` whether or not the
@@ -1042,7 +1062,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             return x + 1.5
 
         with self.sql_conf(_TRANSPILE_ON):
-            pudf = UserDefinedFunction(add_half, StringType())
+            # DoubleType: the return type must category-match the numeric body
+            # for the option to be emitted (a string return type would itself
+            # force a fallback before the decimal-input pruning under test).
+            pudf = UserDefinedFunction(add_half, DoubleType())
             self.assertTrue(pudf.transpiled, "numeric option should still be produced")
             df = self.spark.sql("SELECT CAST(1.0 AS DECIMAL(10,2)) AS d")
             with self.assertRaises(PythonException):
