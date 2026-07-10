@@ -43,6 +43,13 @@ import itertools
 import textwrap
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
+from pyspark.sql.types import (
+    BinaryType,
+    BooleanType,
+    DataType,
+    NumericType,
+    StringType,
+)
 from pyspark.sql.functions import (
     abs as _abs,
     coalesce,
@@ -174,6 +181,16 @@ class CatalystTranspiler(AbstractTranspiler):
         # would fall through to ``_category``'s numeric catch-all).
         if isinstance(node, ast.Return):
             return self._safe_category(params, node.value)
+        # An if-statement's category is its branches' common category (the
+        # ``_category`` catch-all would mislabel every ``ast.If`` "numeric").
+        # Mismatched branches return None ("can't be pinned down"); the
+        # branch-compatibility check in ``_convert_if_like`` raises for them.
+        if isinstance(node, ast.If):
+            body_c = self._safe_category(params, node.body[0]) if node.body else None
+            else_c = self._safe_category(params, node.orelse[0]) if node.orelse else None
+            if body_c is not None and else_c is not None and body_c != else_c:
+                return None
+            return body_c if body_c is not None else else_c
         if isinstance(node, ast.Constant) and node.value is None:
             return None
         # Comparisons / ``not`` / boolean ops produce a boolean column; classify
@@ -446,11 +463,27 @@ class CatalystTranspiler(AbstractTranspiler):
                         "and the UDF falls back to interpreted Python"
                     )
                 return coalesce(self._convert_chunk(params, operand).__invert__(), lit(True))
-            case ast.UnaryOp(op=ast.USub(), operand=operand):
-                # `-x` -- handle both literal negative ints (USub on a
-                # Constant) and runtime negation of a column.
-                return self._convert_chunk(params, operand).__neg__()
-            case ast.UnaryOp(op=ast.UAdd(), operand=operand):
+            case ast.UnaryOp(op=(ast.USub() | ast.UAdd()) as op, operand=operand):
+                # `-x` / `+x` -- like the binary arithmetic operators, only
+                # lower for numeric operands. Python raises TypeError for
+                # unary +/- on strings, but Spark's ANSI string promotion
+                # would silently coerce the string to double (`-'5'` ->
+                # -5.0), and a boolean operand emits UnaryMinus(bool), which
+                # fails CheckAnalysis outright -- breaking the query instead
+                # of falling back, since the option is type-checked as a
+                # child of TranspiledPythonUDF before ConvertToCatalyst can
+                # drop it. Fail closed for every non-numeric category.
+                if self._category(params, operand) != "numeric":
+                    raise UnsupportedOperationException(
+                        "unary `+`/`-` is only supported for numeric operands "
+                        "(Python raises TypeError on strings, and Spark would "
+                        "coerce or fail analysis); the transpiler falls back "
+                        "to interpreted Python"
+                    )
+                if isinstance(op, ast.USub):
+                    # Handles both literal negative ints (USub on a Constant)
+                    # and runtime negation of a column.
+                    return self._convert_chunk(params, operand).__neg__()
                 # `+x` -- identity, kept for symmetry with USub.
                 return self._convert_chunk(params, operand)
             case ast.BoolOp(op=op, values=values):
@@ -655,6 +688,19 @@ class CatalystTranspiler(AbstractTranspiler):
                     param_index = params.index(name)
                     # Special hack for self on callables
                     if params[0] == "self":
+                        # A body that references the receiver itself (e.g.
+                        # ``return self``) has no column equivalent: ``self``
+                        # is not an argument at the call site, and offsetting
+                        # would emit ``_udf_param_-1``, which the JVM builder
+                        # rejects with an AnalysisException at call
+                        # construction instead of falling back. Refuse so the
+                        # UDF stays interpreted.
+                        if name == "self":
+                            raise UnsupportedOperationException(
+                                "references to `self` in a callable's body "
+                                "are not supported by the transpiler; falling "
+                                "back to interpreted Python"
+                            )
                         param_index -= 1
                     return col(f"_udf_param_{param_index}")
                 else:
@@ -691,6 +737,30 @@ class CatalystTranspiler(AbstractTranspiler):
                 "functions with more than one top-level statement are not "
                 "supported by the transpiler"
             )
+        # Refuse variants whose final Cast to the declared return type can
+        # never resolve. The options are type-checked by CheckAnalysis as
+        # children of TranspiledPythonUDF before ConvertToCatalyst could drop
+        # them, so an invalid Cast (e.g. a binary-typed body cast to a numeric
+        # return type) fails the whole query instead of falling back. Under
+        # ANSI: string bodies cast to every allowed return type (string ->
+        # numeric/boolean are runtime-checked but analysis-valid), numeric and
+        # boolean bodies cast to everything except binary, and binary bodies
+        # cast only to string/binary. An unknown category (e.g. a bare None
+        # body) lowers to NULL, which casts to anything.
+        if isinstance(returnType, DataType):
+            body_cat = self._safe_category(params, function_body[0])
+            cast_ok = (
+                body_cat is None
+                or body_cat == "string"
+                or (body_cat in ("numeric", "bool") and not isinstance(returnType, BinaryType))
+                or (body_cat == "binary" and isinstance(returnType, (StringType, BinaryType)))
+            )
+            if not cast_ok:
+                raise UnsupportedOperationException(
+                    f"a {body_cat}-typed lowering cannot be cast to the declared "
+                    f"return type {returnType.simpleString()} under ANSI rules; "
+                    "falling back to interpreted Python"
+                )
         converted = self._convert_chunk(params, function_body[0])
         # Cast to the declared return type so the rewritten plan reports a
         # known data type to the optimizer's plan validator (otherwise it
@@ -876,6 +946,31 @@ def _transpile_func(
     column types, or falls back to the Python UDF when none match.
     """
     try:
+        # The transpiler lowers to atomic (numeric/string/boolean/binary)
+        # expressions and casts the result to the declared return type. For a
+        # return type no lowering can be cast to (arrays, maps, structs,
+        # datetimes, ...), that Cast can never resolve -- and because the
+        # options ride along as children of TranspiledPythonUDF, an
+        # unresolvable Cast fails the WHOLE query at CheckAnalysis instead of
+        # falling back. Restrict transpilation to return types with a valid
+        # ANSI cast from the lowered categories (the per-variant combinations
+        # are checked in ``_transpile_from_ast``); everything else falls back
+        # to interpreted Python.
+        if isinstance(returnType, str):
+            from pyspark.sql.types import _parse_datatype_string
+
+            returnType = _parse_datatype_string(returnType)
+        if not isinstance(returnType, (NumericType, StringType, BooleanType, BinaryType)):
+            return (
+                [],
+                [
+                    f"return type {returnType.simpleString()} is not supported by "
+                    "the transpiler (no lowered expression can be cast to it "
+                    "under ANSI rules); falling back to interpreted Python"
+                ],
+                [],
+                [],
+            )
         # A functools.wraps-style decorator makes ``inspect.getsource`` return
         # the WRAPPED function's source (getsource follows ``__wrapped__``),
         # while the UDF actually executes the wrapper. Transpiling would
