@@ -119,12 +119,15 @@
     <exec-maven-plugin.version>3.1.0</exec-maven-plugin.version>
     <sbt.project.name>spark</sbt.project.name>
     <asm.version>9.5</asm.version>
+    <!-- sbt does not honor Maven <dependencyManagement> for transitive deps, so any
+         transitive dep bump here must also be mirrored in `object DependencyOverrides`
+         (slf4j-api leaks in via breeze->mllib-local). Applies to commons-compress and netty below too. -->
     <slf4j.version>2.0.7</slf4j.version>
     <log4j.version>2.20.0</log4j.version>
     <!-- make sure to update IsolatedClientLoader whenever this version is changed -->
-    <hadoop.version>3.3.4</hadoop.version>
+    <hadoop.version>3.4.3</hadoop.version>
     <!-- SPARK-41247: When updating `protobuf.version`, also need to update `protoVersion` in `SparkBuild.scala` -->
-    <protobuf.version>3.23.4</protobuf.version>
+    <protobuf.version>3.25.8</protobuf.version>
     <protoc-jar-maven-plugin.version>3.11.4</protoc-jar-maven-plugin.version>
     <yarn.version>${hadoop.version}</yarn.version>
     <zookeeper.version>3.6.3</zookeeper.version>
@@ -147,10 +150,11 @@
     <jakartaservlet.version>4.0.3</jakartaservlet.version>
     <chill.version>0.10.0</chill.version>
     <!--
-      SPARK-44968: don't upgrade Ivy to version 2.5.2 until the test aborted of
-      `HiveExternalCatalogVersionsSuite` in Java 11/17 daily tests is resolved.
+      Upgraded to 2.5.2 to fix CVE-2022-46751 (XXE). The SPARK-44968 concern
+      was a HiveExternalCatalogVersionsSuite abort seen only under Java 11/17
+      daily tests; this branch targets Java 8 builds. Matches SPARK-44914.
     -->
-    <ivy.version>2.5.1</ivy.version>
+    <ivy.version>2.5.2</ivy.version>
     <oro.version>2.0.8</oro.version>
     <!--
     If you changes codahale.metrics.version, you also need to change
@@ -162,6 +166,10 @@
     <aws.kinesis.client.version>1.12.0</aws.kinesis.client.version>
     <!-- Should be consistent with Kinesis client dependency -->
     <aws.java.sdk.version>1.11.655</aws.java.sdk.version>
+    <!-- AWS SDK v2, used by hadoop-aws 3.4.x and the K8s integration
+         tests' DepsTestsSuite. Matches the version Hadoop 3.4.3 pulls in, and
+         replaces the EOL AWS SDK v1 in those tests. AWS SDK v2 requires Java 8+. -->
+    <aws.java.sdk.v2.version>2.35.4</aws.java.sdk.v2.version>
     <!-- the producer is used in tests -->
     <aws.kinesis.producer.version>0.12.8</aws.kinesis.producer.version>
     <gcs-connector.version>hadoop3-2.2.14</gcs-connector.version>
@@ -190,15 +198,17 @@
     <snappy.version>1.1.10.5</snappy.version>
     <netlib.ludovic.dev.version>3.0.3</netlib.ludovic.dev.version>
     <commons-codec.version>1.16.1</commons-codec.version>
-    <commons-compress.version>1.23.0</commons-compress.version>
+    <commons-compress.version>1.26.2</commons-compress.version>
     <commons-io.version>2.16.1</commons-io.version>
     <!-- org.apache.commons/commons-lang/-->
     <commons-lang2.version>2.6</commons-lang2.version>
     <!-- org.apache.commons/commons-lang3/-->
-    <commons-lang3.version>3.12.0</commons-lang3.version>
+    <commons-lang3.version>3.18.0</commons-lang3.version>
     <!-- org.apache.commons/commons-pool2/-->
     <commons-pool2.version>2.11.1</commons-pool2.version>
     <datanucleus-core.version>4.1.17</datanucleus-core.version>
+    <gson.version>2.10.1</gson.version>
+    <jettison.version>1.5.4</jettison.version>
     <guava.version>14.0.1</guava.version>
     <janino.version>3.1.9</janino.version>
     <!--
@@ -219,9 +229,10 @@
     <maven-antrun.version>3.1.0</maven-antrun.version>
     <commons-crypto.version>1.1.0</commons-crypto.version>
     <commons-cli.version>1.5.0</commons-cli.version>
-    <bouncycastle.version>1.77</bouncycastle.version>
+    <bouncycastle.version>1.84</bouncycastle.version>
     <tink.version>1.9.0</tink.version>
-    <netty.version>4.1.96.Final</netty.version>
+    <!-- Keep in sync with the netty module overrides in `SparkBuild.scala` (see slf4j note above) -->
+    <netty.version>4.1.124.Final</netty.version>
     <!--
     If you are changing Arrow version specification, please check
     ./python/pyspark/sql/pandas/utils.py, and ./python/setup.py too.
@@ -290,7 +301,7 @@
     <!-- Version used in Connect -->
     <connect.guava.version>32.0.1-jre</connect.guava.version>
     <guava.failureaccess.version>1.0.1</guava.failureaccess.version>
-    <io.grpc.version>1.56.0</io.grpc.version>
+    <io.grpc.version>1.76.0</io.grpc.version>
     <mima.version>1.1.2</mima.version>
     <tomcat.annotations.api.version>6.0.53</tomcat.annotations.api.version>
 
@@ -1884,6 +1895,21 @@
           </exclusion>
         </exclusions>
       </dependency>
+      <!-- gson pinned to fix CVE-2022-25647 (deserialization DoS);
+           brought in transitively (e.g. via Hive/Hadoop). 2.10.1 is backward
+           compatible and Java 8 compatible. -->
+      <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>${gson.version}</version>
+      </dependency>
+      <!-- jettison pinned to fix CVE-2022-40149/40150/45685/45693
+           (DoS). Brought in transitively (e.g. via Hadoop/Jersey). -->
+      <dependency>
+        <groupId>org.codehaus.jettison</groupId>
+        <artifactId>jettison</artifactId>
+        <version>${jettison.version}</version>
+      </dependency>
       <dependency>
         <groupId>org.codehaus.jackson</groupId>
         <artifactId>jackson-core-asl</artifactId>
@@ -2783,20 +2809,14 @@
           </exclusion>
         </exclusions>
       </dependency>
+      <!-- arrow-memory-unsafe replaces arrow-memory-netty (see sql/api/pom.xml).
+           The Unsafe allocator does not depend on Netty, avoiding the NoSuchFieldError
+           (PooledByteBufAllocator.chunkSize) that Netty 4.1.124 triggers in
+           arrow-memory-netty 12.0.1. -->
       <dependency>
         <groupId>org.apache.arrow</groupId>
-        <artifactId>arrow-memory-netty</artifactId>
+        <artifactId>arrow-memory-unsafe</artifactId>
         <version>${arrow.version}</version>
-        <exclusions>
-          <exclusion>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-buffer</artifactId>
-          </exclusion>
-          <exclusion>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-common</artifactId>
-          </exclusion>
-        </exclusions>
       </dependency>
       <dependency>
         <groupId>com.univocity</groupId>
@@ -3678,7 +3698,7 @@
     <profile>
       <id>scala-2.13</id>
       <properties>
-        <scala.version>2.13.8</scala.version>
+        <scala.version>2.13.11</scala.version>
         <scala.binary.version>2.13</scala.binary.version>
       </properties>
       <build>
@@ -3731,6 +3751,14 @@
                   <arg>-Wconf:cat=unchecked&amp;msg=outer reference:s</arg>
                   <arg>-Wconf:cat=unchecked&amp;msg=eliminated by erasure:s</arg>
                   <arg>-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s</arg>
+                  <!--
+                    The Scala 2.13.8 -> 2.13.11 bump (see scala-2.13 profile properties)
+                    newly emits "Implicit definition should have explicit type", which the
+                    fatal-warnings config above turns into errors. Spark 3.5 source predates
+                    explicit-typing these implicits (done upstream for Scala 2.13.16 / Spark 4.0),
+                    so mute the warning here. Keep in sync with project/SparkBuild.scala.
+                  -->
+                  <arg>-Wconf:msg=Implicit definition should have explicit type:s</arg>
                   <!--
                     TODO(SPARK-43850): Remove the following suppression rules and remove `import scala.language.higherKinds`
                     from the corresponding files when Scala 2.12 is no longer supported.

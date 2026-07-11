@@ -25,8 +25,33 @@ FWDIR="$(cd "`dirname "$0"`"/..; pwd)"
 cd "$FWDIR"
 
 SPARK_PROFILES=${1:-"-Pmesos -Pkubernetes -Pyarn -Pspark-ganglia-lgpl -Pkinesis-asl -Phive-thriftserver -Phive"}
-TOOLS_CLASSPATH="$(build/sbt -DcopyDependencies=false "export tools/fullClasspath" | grep jar | tail -n1)"
-OLD_DEPS_CLASSPATH="$(build/sbt -DcopyDependencies=false $SPARK_PROFILES "export oldDeps/fullClasspath" | grep jar | tail -n1)"
+
+# Run an sbt "export <project>/fullClasspath" command and print the exported classpath.
+# The sbt output is only consumed through a command substitution below, so without extra
+# care any sbt failure would abort the script (set -e) with the error message captured
+# and never shown. Buffer the output in a temp file and dump it on failure instead.
+export_classpath() {
+  local sbt_output classpath
+  sbt_output="$(mktemp)"
+  if ! build/sbt -DcopyDependencies=false "$@" > "$sbt_output" 2>&1; then
+    echo "ERROR: sbt failed while running: build/sbt -DcopyDependencies=false $*" >&2
+    cat "$sbt_output" >&2
+    rm -f "$sbt_output"
+    return 1
+  fi
+  classpath="$(grep jar "$sbt_output" | tail -n1)"
+  if [ -z "$classpath" ]; then
+    echo "ERROR: no classpath found in sbt output of: build/sbt -DcopyDependencies=false $*" >&2
+    cat "$sbt_output" >&2
+    rm -f "$sbt_output"
+    return 1
+  fi
+  rm -f "$sbt_output"
+  echo "$classpath"
+}
+
+TOOLS_CLASSPATH="$(export_classpath "export tools/fullClasspath")"
+OLD_DEPS_CLASSPATH="$(export_classpath $SPARK_PROFILES "export oldDeps/fullClasspath")"
 
 rm -f .generated-mima*
 

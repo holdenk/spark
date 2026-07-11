@@ -89,9 +89,9 @@ object BuildCommons {
 
   // Google Protobuf version used for generating the protobuf.
   // SPARK-41247: needs to be consistent with `protobuf.version` in `pom.xml`.
-  val protoVersion = "3.23.4"
+  val protoVersion = "3.25.8"
   // GRPC version used for Spark Connect.
-  val grpcVersion = "1.56.0"
+  val grpcVersion = "1.76.0"
 }
 
 object SparkBuild extends PomBuild {
@@ -288,6 +288,13 @@ object SparkBuild extends PomBuild {
           "-Wconf:cat=unchecked&msg=outer reference:s",
           "-Wconf:cat=unchecked&msg=eliminated by erasure:s",
           "-Wconf:msg=^(?=.*?a value of type)(?=.*?cannot also be).+$:s",
+          // The Scala 2.13.8 -> 2.13.11 bump (so scalac can read the JDK 21-built
+          // commons-lang3 3.18.0 class files / JavaVersion enum for CVE-2025-48924; 2.13.8 crashes
+          // with "bad constant pool index") newly emits "Implicit definition should have explicit
+          // type", which the fatal-warnings config above turns into errors. Spark 3.5 source
+          // predates explicit-typing these implicits (done upstream for Scala 2.13.16 / Spark 4.0),
+          // so mute the warning here. Keep in sync with the scala-2.13 profile in pom.xml.
+          "-Wconf:msg=Implicit definition should have explicit type:s",
           // TODO(SPARK-43850): Remove the following suppression rules and remove `import scala.language.higherKinds`
           // from the corresponding files when Scala 2.12 is no longer supported.
           "-Wconf:cat=unused-imports&src=org\\/apache\\/spark\\/graphx\\/impl\\/VertexPartitionBase.scala:s",
@@ -1105,7 +1112,28 @@ object DependencyOverrides {
     dependencyOverrides += "xerces" % "xercesImpl" % "2.12.2",
     dependencyOverrides += "jline" % "jline" % "2.14.6",
     dependencyOverrides += "org.apache.avro" % "avro" % "1.11.5",
-    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.23.0")
+    dependencyOverrides += "org.apache.commons" % "commons-compress" % "1.26.2",
+    dependencyOverrides += "org.apache.commons" % "commons-lang3" % "3.18.0",
+    dependencyOverrides += "org.slf4j" % "slf4j-api" % "2.0.7",
+    dependencyOverrides += "net.sf.jopt-simple" % "jopt-simple" % "3.2",
+    dependencyOverrides += "com.lihaoyi" %% "geny" % "0.7.0",
+    dependencyOverrides += "com.lihaoyi" %% "sourcecode" % "0.2.7") ++
+    // SPARK-CVE: keep in sync with <netty.version> in pom.xml. Maven manages the top-level
+    // netty modules and lets netty's internal version alignment cascade to the rest; sbt
+    // does not, so it picks up the netty declared by transitive consumers (grpc/arrow),
+    // older 4.1.91/4.1.60.Final. Without these overrides the sbt build both fails to resolve
+    // (old jars are evicted, never published locally) and regresses past the Netty CVE bump.
+    // netty-transport-native-epoll/kqueue must NOT be listed here: they are consumed with
+    // platform classifiers only, so their classifier-less jars never land in ~/.m2 and
+    // coursier (which prefers the local Maven repo once a POM is present there) fails the
+    // update with "not found". They are excluded from the sbt build instead, see
+    // ExcludedDependencies below.
+    Seq(
+      "netty-all", "netty-buffer", "netty-codec", "netty-codec-http", "netty-codec-http2",
+      "netty-codec-socks", "netty-common", "netty-handler", "netty-handler-proxy",
+      "netty-resolver", "netty-transport", "netty-transport-classes-epoll",
+      "netty-transport-classes-kqueue", "netty-transport-native-unix-common"
+    ).map(name => dependencyOverrides += "io.netty" % name % "4.1.124.Final")
 }
 
 /**
@@ -1128,7 +1156,17 @@ object ExcludedDependencies {
     excludeDependencies ++= Seq(
       ExclusionRule(organization = "com.sun.jersey"),
       ExclusionRule("javax.servlet", "javax.servlet-api"),
-      ExclusionRule("javax.ws.rs", "jsr311-api"))
+      ExclusionRule("javax.ws.rs", "jsr311-api"),
+      // selenium-remote-driver (a test dep of every module via the parent pom)
+      // depends on these two netty modules WITHOUT a platform classifier. Maven only ever
+      // fetches their classifier jars (linux-x86_64 etc., see pom.xml), so the local Maven
+      // repo ends up with the POM but no classifier-less jar, and coursier - which prefers
+      // the local Maven repo once a POM is present there - fails `update` with "not found"
+      // (this is what silently broke dev/mima in CI). The native transports are an optional
+      // perf feature (Spark defaults to NIO; the epoll/kqueue *classes* still come from
+      // netty-transport-classes-*), so drop the native jars from the sbt build entirely.
+      ExclusionRule("io.netty", "netty-transport-native-epoll"),
+      ExclusionRule("io.netty", "netty-transport-native-kqueue"))
   )
 }
 
