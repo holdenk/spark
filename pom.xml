@@ -464,6 +464,18 @@
         <artifactId>chill-java</artifactId>
         <version>${chill.version}</version>
       </dependency>
+      <!--
+        SPARK-51806: Kryo 4.0.x depends on objenesis 2.5.1, while Spark depends on
+        objenesis 3.3 (see the runtime dependency manifest under dev/deps). The version
+        is defined uniformly here and declared as an explicit dependency in `core` so it
+        is reliably resolved and copied onto the runtime classpath (e.g. by the SBT
+        `assembly` copyDeps used for SparkR documentation generation).
+        -->
+      <dependency>
+        <groupId>org.objenesis</groupId>
+        <artifactId>objenesis</artifactId>
+        <version>3.3</version>
+      </dependency>
       <dependency>
         <groupId>com.github.jnr</groupId>
         <artifactId>jnr-posix</artifactId>
