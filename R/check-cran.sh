@@ -54,6 +54,9 @@ fi
 # Run check as-cran.
 VERSION=`grep Version "$FWDIR/pkg/DESCRIPTION" | awk '{print $NF}'`
 
+
+export _R_CHECK_TOPLEVEL_FILES_=FALSE
+
 CRAN_CHECK_OPTIONS="--as-cran"
 
 if [ -n "$NO_TESTS" ]
