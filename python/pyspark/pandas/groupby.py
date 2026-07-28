@@ -363,6 +363,11 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
                     )
 
                 else:
+                    if not isinstance(aggfunc, str) or not aggfunc.isidentifier():
+                        raise ValueError(
+                            "aggregate function name must be a valid identifier "
+                            "(e.g. 'sum', 'mean'), got: %r" % (aggfunc,)
+                        )
                     reordered.append(
                         F.expr("{1}(`{0}`) as `{2}`".format(col_name, aggfunc, data_col))
                     )
