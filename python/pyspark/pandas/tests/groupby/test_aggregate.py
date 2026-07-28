@@ -269,6 +269,27 @@ class GroupbyAggregateMixin:
         )
         self.assert_eq(agg_pdf, agg_psdf)
 
+    def test_aggregate_func_name_validation(self):
+        # SQL expression injection guard: the aggregate function name is
+        # interpolated into a Spark SQL expression, so it must be a plain
+        # function identifier (e.g. "sum") rather than an arbitrary
+        # expression carrying a subquery, alias or comment.
+        pdf = pd.DataFrame({"A": [1, 1, 2], "B": [10, 20, 30]})
+        psdf = ps.from_pandas(pdf)
+        for bad in [
+            "first((SELECT 1)) as `B` -- ",
+            "count(*) as x",
+            "sum(`B`) + 1",
+            "b`) as `c",
+        ]:
+            with self.assertRaisesRegex(ValueError, "valid identifier"):
+                psdf.groupby("A").agg({"B": bad})
+        # Legitimate aggregate names continue to work.
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "sum"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+
 
 class GroupbyAggregateTests(
     GroupbyAggregateMixin,
