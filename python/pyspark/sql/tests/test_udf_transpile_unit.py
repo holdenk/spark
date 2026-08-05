@@ -119,6 +119,29 @@ class _AddClassAttr:
         return x + self.K
 
 
+class _AttrBase:
+    """Base holding a class attribute, to exercise the MRO walk."""
+
+    K = 3
+
+
+class _AddInheritedClassAttr(_AttrBase):
+    """`self.K` resolves through the MRO to an importable base -- also live."""
+
+    def __call__(self, x):
+        return x + self.K
+
+
+class _BoundMethodHolder:
+    """A bound method used as a UDF: the receiver comes from ``__self__``."""
+
+    def __init__(self, k):
+        self.k = k
+
+    def add_k(self, x):
+        return x + self.k
+
+
 class _AddPropertyAttr:
     def __init__(self):
         self.n = 1
@@ -1588,6 +1611,83 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(df.first()[0], 13)
             self.assertEqual(0, self._eval_python_count(df))
 
+    def test_udf_transpile_captured_int_outside_long_range_falls_back(self):
+        # Python integers are unbounded, so a capture can exceed LongType. That
+        # must be refused by an explicit guard with a readable message -- not by
+        # `lit` happening to throw a JVM NumberFormatException -- and the result
+        # must still match the interpreted path.
+        L = LongType()
+        boundary = 2**63 - 1 - 10
+        self.assertEqual(self._vals(_make_adder(boundary), L, "a long", [(10,)]), [boundary + 10])
+        for label, off in [
+            ("2**63", 2**63),
+            ("2**70", 2**70),
+            ("-(2**70)", -(2**70)),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(_make_adder(off), L)
+                self.assertEqual([], pudf.transpiled, f"{label} must not be baked")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertIn(
+                    "outside the range of a 64-bit integer",
+                    str(warned[0].message),
+                    f"{label}: expected the explicit range guard, not a JVM error",
+                )
+                # Both paths agree: the interpreted converter nulls a return
+                # value that does not fit the declared LongType.
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(10,)], "a long")
+                    self.assertIsNone(df.select(pudf("a")).collect()[0][0], label)
+        # A captured bool subclasses int but is only ever 0/1, so it stays
+        # eligible for the type check rather than tripping the range guard.
+        pudf, _ = self._fallback_warnings(_make_adder(True), L)
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(10,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 11)
+
+    def test_udf_transpile_repeated_lowering_is_idempotent(self):
+        # A UDF is lowered more than once: at construction to validate it, on
+        # every `.transpiled` access, and again when its judf is built. The
+        # normalization pass rewrites the AST in place, so it must work on a
+        # copy -- otherwise each build re-inlines the previous build's output and
+        # `a = a + 1; return a * 2` walks from `(a + 1) * 2` to
+        # `((a + 1) + 1) * 2` to `(((a + 1) + 1) + 1) * 2`. That produces a wrong
+        # answer rather than a fallback, so pin the invariant directly instead of
+        # relying on other tests to exercise it incidentally.
+        import ast as _ast
+
+        from pyspark.sql.transpile import _analyze_func, _normalize_function
+
+        def rebinds(a):
+            a = a + 1
+            return a * 2
+
+        analysis, errors = _analyze_func(rebinds, LongType())
+        self.assertIsNotNone(analysis, f"expected an analysis, got {errors}")
+        before = _ast.dump(analysis.function_ast)
+        lowered = [
+            _ast.unparse(
+                _normalize_function(rebinds, analysis.function_ast, analysis.params).body[0]
+            )
+            for _ in range(5)
+        ]
+        self.assertEqual(1, len(set(lowered)), f"repeated lowering drifted: {lowered}")
+        self.assertEqual(
+            before,
+            _ast.dump(analysis.function_ast),
+            "normalization mutated the stored AST instead of a copy",
+        )
+
+        # And end to end: many `.transpiled` accesses before executing must not
+        # change the answer.
+        with self.sql_conf(_TRANSPILE_ON):
+            u = UserDefinedFunction(rebinds, LongType())
+            for _ in range(4):
+                self.assertTrue(u.transpiled)
+            df = self.spark.createDataFrame([(10,)], "a long")
+            self.assertEqual(rebinds(10), 22, "bad test expectation")
+            self.assertEqual(df.select(u("a")).collect()[0][0], 22)
+
     def test_udf_transpile_works_with_arrow_udfs_enabled(self):
         # Regression guard for the interaction with SPARK-54555, which made
         # Arrow-optimized Python UDFs the default. Transpilation is gated on
@@ -2037,16 +2137,24 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
 
     def test_udf_transpile_self_attr_capture(self):
-        # An instance ``__dict__`` attribute is pickled by value -> bakeable.
+        # An instance ``__dict__`` attribute is pickled by value -> bakeable,
+        # whether the UDF is a callable instance or a bound method (the latter
+        # takes its receiver from ``__self__``).
         self.assertEqual(
             self._vals(_AddInstanceAttr(4), LongType(), "a long", [(1,), (10,)]), [5, 14]
         )
-        # A class attribute on an importable class follows the class's own
-        # pickling mode (by reference here), a descriptor's value is computed
-        # per process, and a ``__slots__`` instance has no ``__dict__``. All
-        # must fall back while still producing the interpreted result.
+        self.assertEqual(
+            self._vals(_BoundMethodHolder(4).add_k, LongType(), "a long", [(1,), (10,)]),
+            [5, 14],
+        )
+        # A class attribute follows the class's own pickling mode -- by reference
+        # here, whether declared on the class or inherited through the MRO, so
+        # the executor would re-read it. A descriptor's value is computed per
+        # process, and a ``__slots__`` instance has no ``__dict__``. All must
+        # fall back while still producing the interpreted result.
         for label, func, expected in [
             ("class attribute", _AddClassAttr(), 1 + _AddClassAttr.K),
+            ("inherited class attribute", _AddInheritedClassAttr(), 1 + _AttrBase.K),
             ("property", _AddPropertyAttr(), 6),
             ("__slots__", _AddSlotsAttr(2), 3),
         ]:

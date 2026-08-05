@@ -201,6 +201,10 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
 # map onto a Spark column category, and ``cloudpickle`` snapshots them by value.
 _BAKEABLE_TYPES = (int, float, str, bool, bytes)
 
+# A captured int must fit LongType; see the guard in ``_ScopeNormalizer._bake``.
+_LONG_MIN = -(2**63)
+_LONG_MAX = 2**63 - 1
+
 # Inlining a local binding duplicates its expression at every use site, so a
 # chain like ``b = a + a; c = b + b; ...`` doubles in size per link (a depth-10
 # chain reaches ~8k nodes). Cap the normalized body and fall back above it.
@@ -439,6 +443,27 @@ class _ScopeNormalizer(ast.NodeTransformer):
     @staticmethod
     def _bake(description: str, value: Any) -> ast.expr:
         if value is None or isinstance(value, _BAKEABLE_TYPES):
+            # Python ints are unbounded, so a capture can exceed what LongType
+            # holds. Refuse explicitly rather than relying on ``lit`` to throw:
+            # the outcome would be the same fallback today, but only because the
+            # JVM raises, and the resulting warning is a Java stack trace. Worse,
+            # were ``lit`` ever to accept such a value (as a decimal, say), the
+            # constant would still be classified "numeric" here, so the option
+            # would be matched against a bigint column and fail CheckAnalysis --
+            # which kills the whole query, because options are type-checked as
+            # children of TranspiledPythonUDF before ConvertToCatalyst can drop
+            # them. ``bool`` is excluded: it subclasses int but is only 0/1.
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and not _LONG_MIN <= value <= _LONG_MAX
+            ):
+                raise UnsupportedOperationException(
+                    f"{description} holds {value}, which is outside the range of "
+                    "a 64-bit integer; Python integers are unbounded but Spark's "
+                    "LongType is not, so the transpiler falls back to interpreted "
+                    "Python"
+                )
             return ast.Constant(value=value)
         raise UnsupportedOperationException(
             f"{description} holds a {type(value).__name__}, which has no column "
@@ -578,9 +603,11 @@ def _normalize_function(
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
     # construction and again when its judf is created). Normalizing the original
     # would compound: `a = a + 1; return a * 2` would become `(a + 1) * 2`, then
-    # `((a + 1) + 1) * 2` on the next build. Work on a copy.
-    body = copy.deepcopy(function_ast).body
-    statement = normalizer.normalize_body(body)
+    # `((a + 1) + 1) * 2` on the next build. Work on a copy -- including the
+    # ``args`` the rewritten node carries below. Nothing mutates ``args`` today,
+    # but the whole point of copying here is to not depend on that holding.
+    source = copy.deepcopy(function_ast)
+    statement = normalizer.normalize_body(source.body)
     size = sum(1 for _ in ast.walk(statement))
     if size > _MAX_NORMALIZED_NODES:
         raise UnsupportedOperationException(
@@ -588,10 +615,14 @@ def _normalize_function(
             f"the {_MAX_NORMALIZED_NODES} limit; falling back to interpreted "
             "Python rather than emitting a plan this large"
         )
+    # Constructed through an ``Any`` alias for the same typeshed reason as in
+    # ``_get_function_from_ast``: mypy's ``ast.FunctionDef`` overloads require a
+    # keyword-only ``type_params`` on 3.12+, which does not exist at runtime on
+    # every Python we support.
     normalized: Any = ast.FunctionDef
     rewritten = normalized(
-        name=function_ast.name,
-        args=function_ast.args,
+        name=source.name,
+        args=source.args,
         body=[ast.fix_missing_locations(statement)],
         decorator_list=[],
     )
