@@ -350,6 +350,116 @@ def neq_pair(x, y):
 lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 
 
+# Scope capture and local assignment (SPARK-55207).
+#
+# Captures are built by factory functions so the value lands in a closure cell,
+# which cloudpickle always snapshots by value. A top-level ``def`` in this module
+# would instead be pickled by reference, and the transpiler deliberately refuses
+# to bake globals in that case -- ``_run`` asserts transpilation actually
+# happened, so such a fixture would fail loudly rather than silently compare
+# interpreted against interpreted.
+#
+# Bodies are written as a prefix of assignments followed by exactly one terminal
+# statement, which is the shape the transpiler supports; an early-return guard
+# before the terminal statement is control flow (SPARK-55218) and still falls
+# back. The assignment bodies therefore evaluate their arithmetic
+# unconditionally, so a NULL input raises TypeError in Python while the lowered
+# form yields NULL -- the pre-existing, documented divergence that
+# ``plus_four_unsafe`` also exercises and that ``_run`` tolerates by design.
+#
+# Arithmetic stays within ``_LONG_ARITH_BOUND``, which is sized so that the
+# operations here cannot overflow LongType: the widest is a doubling, and
+# 2 * 2**61 is still below Long.MAX. Squaring a bound-sized value would
+# overflow, and because the Python UDF runner silently wraps out-of-range
+# results even under ANSI, that shows up as a spurious mismatch rather than
+# "both raised" -- so these fixtures double rather than square.
+
+
+def _make_plus_captured(offset):
+    def plus_captured(x):
+        # Bakes a captured int into an arithmetic lowering.
+        return x + offset
+
+    return plus_captured
+
+
+def _make_captured_compare(threshold):
+    def captured_compare(x):
+        # A captured value on the right of an ordering comparison. The explicit
+        # else keeps this a single terminal ``if`` statement, and the guard keeps
+        # NULL away from ``>`` (which the transpiler lowers with a raise).
+        if x is None:
+            return False
+        else:
+            return x > threshold
+
+    return captured_compare
+
+
+def _make_captured_in_branches(low, high):
+    def captured_in_branches(x):
+        # Captured values in both arms, so the branch-category check compares
+        # two baked constants.
+        if x is None:
+            return low
+        else:
+            return high
+
+    return captured_in_branches
+
+
+plus_captured_four = _make_plus_captured(4)
+captured_compare_zero = _make_captured_compare(0)
+captured_branches = _make_captured_in_branches(-1, 1)
+
+
+def assign_then_double(x):
+    # Local binding used twice, so inlining duplicates the expression.
+    b = x + 4
+    return b + b
+
+
+def assign_reuses_binding(x):
+    # Three uses of one binding; the lowered form must still equal ``b``.
+    b = x + 1
+    return b + b - b
+
+
+def assign_rebinds_parameter(x):
+    # Rebinding a parameter: every later read must see the new expression.
+    # Getting the resolution order wrong yields a wrong answer, not a fallback.
+    x = x + 1
+    x = x * 2
+    return x
+
+
+def assign_chain_of_three(x):
+    a = x + 1
+    b = a + 2
+    c = b + 3
+    return c
+
+
+def assign_augmented(x):
+    total = x
+    total += 5
+    total *= 2
+    return total
+
+
+def _make_assign_mixes_capture(offset):
+    def mixes(x):
+        # A local binding whose value depends on a captured constant, so the
+        # capture is baked and then duplicated by inlining.
+        scaled = x + offset
+        return scaled + scaled
+
+    return mixes
+
+
+assign_capture_and_binding = _make_assign_mixes_capture(3)
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -476,6 +586,92 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four, LongType(), df, "a")
             self.assertEqual(transpiled, interpreted, f"plus_four mismatch on {value!r}")
+
+        # -- scope capture and local assignment (SPARK-55207) ----------------
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_captured_offset_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(plus_captured_four, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"plus_captured_four mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
+        def test_captured_compare_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(captured_compare_zero, BooleanType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"captured_compare_zero mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
+        def test_captured_branches_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(captured_branches, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"captured_branches mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_then_double_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_then_double, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"assign_then_double mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_reuses_binding_matches_python(self, value):
+            # Inlining duplicates `b`, so both copies must overflow (or not)
+            # exactly as Python's single evaluation does.
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_reuses_binding, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"assign_reuses_binding mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_rebinds_parameter_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_rebinds_parameter, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"assign_rebinds_parameter mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_chain_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_chain_of_three, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"assign_chain_of_three mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_augmented_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_augmented, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"assign_augmented mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_capture_and_binding_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_capture_and_binding, LongType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"assign_capture_and_binding mismatch on {value!r}"
+            )
 
         @_hyp_settings
         @given(value=_long_arith_strategy)

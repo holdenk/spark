@@ -22,7 +22,7 @@ import functools
 import inspect
 import sys
 import warnings
-from typing import Callable, Any, TYPE_CHECKING, Optional, cast, Union
+from typing import Callable, Any, TYPE_CHECKING, Optional, Tuple, cast, Union
 
 
 from pyspark.util import PythonEvalType
@@ -95,8 +95,8 @@ def _create_py_udf(
     # in Arrow is needed, that is, when the user-specified return type(SQL Type) of the UDF and the
     # actual instance(Python Value(Type)) that the UDF returns are different.
     # Arrow and Pickle have different type coercion rules, so a UDF might have a different result
-    # with/without Arrow optimization. That's the main reason the Arrow optimization for Python
-    # UDFs is disabled by default.
+    # with/without Arrow optimization. Arrow optimization is nevertheless enabled by default as of
+    # SPARK-54555; set spark.sql.execution.pythonUDF.arrow.enabled to false to opt back out.
 
     is_arrow_enabled = False
     if useArrow is None:
@@ -206,17 +206,22 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
-        # Extract Python UDF details if transpilation is enabled.
-        self.transpiled: list = []
-        self._transpiled_param_names: list[str] = []
-        # Per-option input-type categories ("numeric"/"string" per public param),
-        # parallel to ``self.transpiled``; the JVM picks the option matching the
-        # actual column types or falls back to interpreted Python.
-        self._transpiled_input_categories: list = []
+        # Transpilation state. ``_transpile_analysis`` holds everything about the
+        # UDF that does not depend on the values it captures from its enclosing
+        # scope; the captured values themselves are only read when the ``judf``
+        # is built. That timing matters: ``_create_judf`` also cloudpickles the
+        # function for the interpreted path, so reading captures there makes the
+        # literals baked into the plan and the pickled snapshot agree exactly.
+        # See the capture-timing note in ``pyspark.sql.transpile``.
+        self._transpile_analysis: Optional[Any] = None
+        # Set when transpilation must never be attempted (e.g. after
+        # ``asNondeterministic()``), regardless of configuration.
+        self._transpile_disabled = False
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
         # the right order. Empty list when transpilation didn't happen.
+        self._transpiled_param_names: list[str] = []
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession
@@ -272,19 +277,27 @@ class UserDefinedFunction:
                 transpile_enabled = False
             if transpile_enabled and session:
                 # Import only if needed, also avoid circular import loops.
-                from pyspark.sql.transpile import _transpile_func
+                from pyspark.sql.transpile import _analyze_func, _build_transpiled
 
                 # ``self.returnType`` parses (and caches) the declared return
                 # type; the transpiler needs the parsed form to decide whether
                 # the final Cast to it can resolve at all. The parse is reused
                 # later by ``_create_judf``, so this adds no extra JVM work.
-                (
-                    self.transpiled,
-                    errors,
-                    self._transpiled_param_names,
-                    self._transpiled_input_categories,
-                ) = _transpile_func(session, func, self.returnType)
-                if not self.transpiled:
+                analysis, errors = _analyze_func(func, self.returnType)
+                if analysis is not None:
+                    self._transpiled_param_names = analysis.public_params
+                    # Lower once here purely to validate. An unsupported body
+                    # should be reported where the UDF is defined rather than
+                    # at first use, which is also what the existing tests
+                    # assert. The expressions are discarded: the ones that end
+                    # up in the plan come from a fresh lowering in
+                    # ``_create_judf``, whose captured values are read at the
+                    # same moment the function is pickled.
+                    options, build_errors, _ = _build_transpiled(session, func, analysis)
+                    errors = errors + build_errors
+                    if options:
+                        self._transpile_analysis = analysis
+                if self._transpile_analysis is None:
                     detail = f": {errors}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
         except Exception as e:
@@ -295,9 +308,49 @@ class UserDefinedFunction:
             # cannot answer them should degrade to "no transpilation", not
             # break UDF definition.
             warnings.warn(f"Exception transpiling UDF {func}: {e}")
-            self.transpiled = []
+            self._transpile_analysis = None
             self._transpiled_param_names = []
-            self._transpiled_input_categories = []
+
+    def _build_transpiled_options(self) -> Tuple[list, list]:
+        """Lower this UDF to Catalyst expressions, reading captured values now.
+
+        Returns ``(options, input_categories)``, parallel lists; the JVM picks
+        the option whose categories match the bound column types and otherwise
+        falls back to the interpreted Python UDF.
+
+        Deliberately not cached. Captured free variables are baked in as
+        literals, so the lowering is only valid for the values current at the
+        moment it runs; the caller that puts these into a plan
+        (``_create_judf``) is the same one that pickles the function, so both
+        see the same values.
+        """
+        if self._transpile_analysis is None or self._transpile_disabled:
+            return [], []
+        from pyspark.sql import SparkSession
+        from pyspark.sql.transpile import _build_transpiled
+
+        session = SparkSession._instantiatedSession
+        if session is None:
+            return [], []
+        try:
+            options, _errors, input_categories = _build_transpiled(
+                session, self.func, self._transpile_analysis
+            )
+            return options, input_categories
+        except Exception as e:
+            # Same contract as construction: never break a working UDF.
+            warnings.warn(f"Exception transpiling UDF {self.func}: {e}")
+            return [], []
+
+    @property
+    def transpiled(self) -> list:
+        """The Catalyst expressions this UDF would be rewritten into, if any.
+
+        Introspection helper: each access re-lowers the function, so captured
+        values are read as of the call. An empty list means the UDF runs as
+        interpreted Python.
+        """
+        return self._build_transpiled_options()[0]
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
@@ -515,8 +568,15 @@ class UserDefinedFunction:
         wrapped_func = _wrap_function(sc, func, self.returnType)
         jdt = spark._jsparkSession.parseDataType(self.returnType.json())
         assert sc._jvm is not None
-        transpiled = self.transpiled if include_transpiled else []
-        input_categories = self._transpiled_input_categories if include_transpiled else []
+        # Lower here rather than at construction so the free variables baked
+        # into these expressions are read at the same moment ``_wrap_function``
+        # above cloudpickles the function for the interpreted path. Both paths
+        # then snapshot the same values, and since this judf is cached by the
+        # ``_judf`` property, they stay in agreement for the UDF's lifetime.
+        if include_transpiled:
+            transpiled, input_categories = self._build_transpiled_options()
+        else:
+            transpiled, input_categories = [], []
         judf = getattr(sc._jvm, "org.apache.spark.sql.execution.python.UserDefinedPythonFunction")(
             self._name,
             wrapped_func,
@@ -542,7 +602,9 @@ class UserDefinedFunction:
         # rejects named arguments). Resolve kwargs to positional here
         # using the parameter list captured at transpilation time so the
         # rewritten expression sees plain column refs in declared order.
-        if kwargs and self.transpiled and self._transpiled_param_names:
+        # Tested against the analysis rather than ``self.transpiled``, which
+        # re-lowers the function on every access.
+        if kwargs and self._transpile_analysis is not None and self._transpiled_param_names:
             params = self._transpiled_param_names
             ordered: list = list(args)
             remaining_kwargs = dict(kwargs)
@@ -695,11 +757,11 @@ class UserDefinedFunction:
         # A transpiled rewrite replaces the (now nondeterministic) Python UDF
         # with a plain Catalyst expression, which the optimizer is free to
         # fold, reorder, or duplicate -- discarding the nondeterminism barrier
-        # the caller just asked for. Drop any transpiled options so a
-        # nondeterministic UDF always runs as interpreted Python.
-        self.transpiled = []
+        # the caller just asked for. Disable transpilation so a nondeterministic
+        # UDF always runs as interpreted Python.
+        self._transpile_disabled = True
+        self._transpile_analysis = None
         self._transpiled_param_names = []
-        self._transpiled_input_categories = []
         return self
 
 

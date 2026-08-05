@@ -620,7 +620,16 @@ object SQLConf {
         "UDF construction. Transpiled UDFS attempt to match the Python functionality but " +
         "may not be 100% equivalent. Some known differences include: overflows from input types " +
         "(you can precast to decimal to avoid), type coercion on comparison, and implicit " +
-        "returns. This initial version only works with non-Connect Spark; Spark Connect " +
+        "returns. A UDF that reads a free variable (a closure cell, a module global, or an " +
+        "attribute of a callable instance) has that value baked into the plan as a literal. " +
+        "The value is read when the UDF is first used, which is also when the interpreted " +
+        "path pickles the function, so both agree; rebinding the name after that point " +
+        "changes neither. Values are only baked when cloudpickle would have captured them " +
+        "by value, so a UDF defined as a top-level function in an importable module keeps " +
+        "reading its globals on the executor and falls back instead; writing it as a lambda " +
+        "or registering the module with cloudpickle.register_pickle_by_value makes it " +
+        "eligible. " +
+        "This initial version only works with non-Connect Spark; Spark Connect " +
         "support is to follow. This is an *experimental* feature."
     )
     .version("4.3.0")
