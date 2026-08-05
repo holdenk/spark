@@ -2399,9 +2399,51 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertEqual([], pudf.transpiled, "a deep inlining chain must fall back")
         self.assertTrue(warned)
         self.assertIn("nodes", str(warned[0].message))
+        # The budget must be enforced per BINDING, not only on the finished body.
+        # Checking only at the end means building the whole exponential tree
+        # first: 20 doubling assignments reach ~8.4M nodes, which took ~147s and
+        # ~3.6GB at UDF construction before falling back anyway. The message
+        # naming the binding is the observable proof it was caught early -- a
+        # regression here is a driver hang rather than a wrong answer, so it
+        # would otherwise be easy to miss.
+        self.assertIn(
+            "the binding of",
+            str(warned[0].message),
+            "the budget must be enforced while inlining each binding, not "
+            "only once the whole body has been built",
+        )
         with self.sql_conf(_TRANSPILE_ON):
             df = self.spark.createDataFrame([(1,)], "a long")
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 2048)
+
+        # A chain deep enough that late checking would be pathological must
+        # still be refused promptly. Bounded work, so this cannot hang.
+        def very_deep_chain(a):
+            z0 = a + a
+            z1 = z0 + z0
+            z2 = z1 + z1
+            z3 = z2 + z2
+            z4 = z3 + z3
+            z5 = z4 + z4
+            z6 = z5 + z5
+            z7 = z6 + z6
+            z8 = z7 + z7
+            z9 = z8 + z8
+            z10 = z9 + z9
+            z11 = z10 + z10
+            z12 = z11 + z11
+            z13 = z12 + z12
+            z14 = z13 + z13
+            z15 = z14 + z14
+            z16 = z15 + z15
+            z17 = z16 + z16
+            z18 = z17 + z17
+            z19 = z18 + z18
+            return z19 + z19
+
+        pudf, warned = self._fallback_warnings(very_deep_chain, LongType())
+        self.assertEqual([], pudf.transpiled)
+        self.assertIn("the binding of", str(warned[0].message))
 
     def test_udf_transpile_no_return_yields_null_and_warns(self):
         # Falling off the end of a function returns None in Python, which the
@@ -2463,6 +2505,22 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             df = self.spark.createDataFrame([(1,)], "a long")
             with self.assertRaises(Exception):
                 df.select(pudf("a")).collect()
+
+        # A generator also ends in a discarded expression, but calling it
+        # returns a generator object rather than None -- so it must fall back
+        # WITHOUT claiming the function returns None, which would be untrue.
+        def generator_udf(x):
+            yield x
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(generator_udf, LongType())
+            self.assertEqual([], pudf.transpiled, "a generator must not transpile")
+            self.assertFalse(
+                [w for w in caught if "no return statement" in str(w.message)],
+                "a generator does not return None; the no-return warning would lie",
+            )
 
     def test_udf_transpile_skips_docstring(self):
         # A docstring binds nothing and cannot raise, so it is dropped and the

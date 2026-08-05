@@ -241,6 +241,26 @@ class _EmptyCell:
 _EMPTY_CELL = _EmptyCell()
 
 
+def _check_node_budget(node: ast.AST, what: str) -> None:
+    """Refuse a tree that has grown past ``_MAX_NORMALIZED_NODES``.
+
+    Applied to each local binding as it is inlined, not only to the finished
+    body. Inlining doubles a binding's size per link in a chain like
+    ``z1 = z0 + z0; z2 = z1 + z1; ...``, so checking only at the end means
+    building the whole exponential tree before rejecting it -- 20 such
+    assignments reach ~8.4M nodes, taking minutes and gigabytes at UDF
+    construction time before falling back anyway. Bounding every binding keeps
+    the work proportional to the budget instead.
+    """
+    size = sum(1 for _ in ast.walk(node))
+    if size > _MAX_NORMALIZED_NODES:
+        raise UnsupportedOperationException(
+            f"inlining local assignments produced {size} expression nodes in "
+            f"{what}, over the {_MAX_NORMALIZED_NODES} limit; falling back to "
+            "interpreted Python rather than emitting a plan this large"
+        )
+
+
 def _is_docstring(stmt: ast.stmt) -> bool:
     """Whether ``stmt`` is a bare string expression (a docstring in position 0)."""
     return (
@@ -258,8 +278,15 @@ def _returns_none_implicitly(body: List[ast.stmt]) -> bool:
     because it is usually a mistake, and reported whether or not the body turns
     out to be transpilable: a function that always returns None (or raises) is
     worth flagging either way.
+
+    A generator is excluded: ``def f(x): yield x`` ends in a discarded
+    expression but calling it returns a generator object, not ``None``, so
+    saying otherwise would be untrue. Generators are refused during lowering
+    regardless.
     """
     if not body:
+        return False
+    if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for stmt in body for n in ast.walk(stmt)):
         return False
     return isinstance(body[-1], (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Pass))
 
@@ -552,6 +579,8 @@ class _ScopeNormalizer(ast.NodeTransformer):
                 # Inline against the env as of this point, then bind. Binding
                 # after visiting is what makes `b = b + 1` mean the old `b`.
                 inlined = self.visit(ast.fix_missing_locations(value))
+                # Bound here rather than only at the end: see _check_node_budget.
+                _check_node_budget(inlined, f"the binding of {names[0]!r}")
                 for name in names:
                     self._env[name] = inlined
                 if is_last:
@@ -603,30 +632,16 @@ def _normalize_function(
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
     # construction and again when its judf is created). Normalizing the original
     # would compound: `a = a + 1; return a * 2` would become `(a + 1) * 2`, then
-    # `((a + 1) + 1) * 2` on the next build. Work on a copy -- including the
-    # ``args`` the rewritten node carries below. Nothing mutates ``args`` today,
-    # but the whole point of copying here is to not depend on that holding.
+    # `((a + 1) + 1) * 2` on the next build. Work on a copy.
     source = copy.deepcopy(function_ast)
     statement = normalizer.normalize_body(source.body)
-    size = sum(1 for _ in ast.walk(statement))
-    if size > _MAX_NORMALIZED_NODES:
-        raise UnsupportedOperationException(
-            f"inlining local assignments produced {size} expression nodes, over "
-            f"the {_MAX_NORMALIZED_NODES} limit; falling back to interpreted "
-            "Python rather than emitting a plan this large"
-        )
-    # Constructed through an ``Any`` alias for the same typeshed reason as in
-    # ``_get_function_from_ast``: mypy's ``ast.FunctionDef`` overloads require a
-    # keyword-only ``type_params`` on 3.12+, which does not exist at runtime on
-    # every Python we support.
-    normalized: Any = ast.FunctionDef
-    rewritten = normalized(
-        name=source.name,
-        args=source.args,
-        body=[ast.fix_missing_locations(statement)],
-        decorator_list=[],
-    )
-    return rewritten
+    _check_node_budget(statement, "the function body")
+    # Replace the copy's body rather than constructing a fresh ``ast.FunctionDef``.
+    # Every other field (notably ``type_params``, which exists only on 3.12+)
+    # carries over untouched, so this needs no per-version handling -- and it
+    # avoids omitting constructor fields, which 3.13 deprecates and 3.15 rejects.
+    source.body = [ast.fix_missing_locations(statement)]
+    return source
 
 
 class CatalystTranspiler(AbstractTranspiler):
