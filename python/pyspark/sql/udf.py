@@ -206,13 +206,11 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
-        # Transpilation state. ``_transpile_analysis`` holds everything about the
-        # UDF that does not depend on the values it captures from its enclosing
-        # scope; the captured values themselves are only read when the ``judf``
-        # is built. That timing matters: ``_create_judf`` also cloudpickles the
-        # function for the interpreted path, so reading captures there makes the
-        # literals baked into the plan and the pickled snapshot agree exactly.
-        # See the capture-timing note in ``pyspark.sql.transpile``.
+        # Transpilation state. ``_transpile_analysis`` holds everything that does
+        # not depend on captured values; the captures are read only when the
+        # ``judf`` is built, which is also where ``_create_judf`` cloudpickles the
+        # function -- so the baked literals and the snapshot agree exactly. See
+        # the capture-timing note in ``pyspark.sql.transpile``.
         self._transpile_analysis: Optional[Any] = None
         # Set when transpilation must never be attempted (e.g. after
         # ``asNondeterministic()``), regardless of configuration.
@@ -286,13 +284,11 @@ class UserDefinedFunction:
                 analysis, errors = _analyze_func(func, self.returnType)
                 if analysis is not None:
                     self._transpiled_param_names = analysis.public_params
-                    # Lower once here purely to validate. An unsupported body
-                    # should be reported where the UDF is defined rather than
-                    # at first use, which is also what the existing tests
-                    # assert. The expressions are discarded: the ones that end
-                    # up in the plan come from a fresh lowering in
-                    # ``_create_judf``, whose captured values are read at the
-                    # same moment the function is pickled.
+                    # Lower once purely to validate, so an unsupported body is
+                    # reported where the UDF is defined rather than at first use
+                    # (which is what the existing tests assert). These
+                    # expressions are discarded; the ones that reach the plan
+                    # come from a fresh lowering in ``_create_judf``.
                     options, build_errors, _ = _build_transpiled(session, func, analysis)
                     errors = errors + build_errors
                     if options:

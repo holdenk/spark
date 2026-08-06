@@ -135,12 +135,17 @@ class _BoundMethodHolder:
         return x + self.k
 
     def add_global(self, x):
-        """Reads a module global, to pin the by-reference gate for bound methods.
+        """Reads a module global; the gate must key off the carrying function."""
+        return x + _CAPTURED_INT
 
-        The gate must key off this (importable) class, not off
-        ``type(bound_method)`` -- that is always ``types.MethodType``, which has
-        no importable qualified name and so looks by-value to cloudpickle.
-        """
+
+class _GlobalReadingBase:
+    """Importable base whose methods read a module global."""
+
+    def add_global(self, x):
+        return x + _CAPTURED_INT
+
+    def __call__(self, x):
         return x + _CAPTURED_INT
 
 
@@ -1641,14 +1646,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 11)
 
     def test_udf_transpile_repeated_lowering_is_idempotent(self):
-        # A UDF is lowered more than once: at construction to validate it, on
-        # every `.transpiled` access, and again when its judf is built. The
-        # normalization pass rewrites the AST in place, so it must work on a
-        # copy -- otherwise each build re-inlines the previous build's output and
-        # `a = a + 1; return a * 2` walks from `(a + 1) * 2` to
-        # `((a + 1) + 1) * 2` to `(((a + 1) + 1) + 1) * 2`. That produces a wrong
-        # answer rather than a fallback, so pin the invariant directly instead of
-        # relying on other tests to exercise it incidentally.
+        # A UDF is lowered more than once: at construction, on every
+        # `.transpiled` access, and again when its judf is built. Normalization
+        # rewrites the AST in place, so it must work on a copy -- otherwise each
+        # build re-inlines the last one's output and `a = a + 1; return a * 2`
+        # walks to `((a + 1) + 1) * 2` and on. That is a wrong answer rather than
+        # a fallback, so pin it directly instead of hoping another test trips it.
         import ast as _ast
 
         from pyspark.sql.transpile import _analyze_func, _normalize_function
@@ -2111,31 +2114,38 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     df = self.spark.createDataFrame([(1,)], "a long")
                     self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
 
-    def test_udf_transpile_bound_method_globals_follow_its_class(self):
-        # A bound method's globals are snapshotted only when its CLASS is pickled
-        # by value. The class here is importable, so the executor re-imports it
-        # and re-reads the global -- the driver's value must not be baked.
-        # ``type(bound_method)`` is ``types.MethodType``, which has no importable
-        # qualified name and so looks by-value to cloudpickle; keying the gate off
-        # it would wave through every bound method's globals.
-        holder = _BoundMethodHolder(4)
-        pudf, warned = self._fallback_warnings(holder.add_global, LongType())
-        self.assertEqual(
-            [], pudf.transpiled, "globals of a by-reference bound method must not be baked"
-        )
-        self.assertTrue(warned, "expected a fallback warning")
-        self.assertIn("pickled by reference", str(warned[0].message))
-        with self.sql_conf(_TRANSPILE_ON):
-            df = self.spark.createDataFrame([(1,)], "a long")
-            self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _CAPTURED_INT)
+    def test_udf_transpile_globals_follow_the_carrying_function(self):
+        # cloudpickle reduces a bound method to its ``__func__`` and ships
+        # ``__call__`` only from the class whose own ``__dict__`` holds it, so the
+        # gate belongs on that carrying function. Every case reaches it through a
+        # by-reference class, so the executor re-reads the global. Gating on the
+        # instance's class would pass cases 2 and 3: a dynamic subclass is itself
+        # pickled by value.
+        class _DynSubBoundMethod(_GlobalReadingBase):
+            pass
+
+        class _DynSubCallable(_GlobalReadingBase):
+            pass
+
+        for label, func in [
+            ("bound method on an importable class", _BoundMethodHolder(4).add_global),
+            ("inherited bound method", _DynSubBoundMethod().add_global),
+            ("inherited __call__", _DynSubCallable()),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label}: globals must not be baked")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertIn("pickled by reference", str(warned[0].message), label)
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _CAPTURED_INT, label)
 
     def test_udf_transpile_self_attr_gated_per_class_in_the_mro(self):
-        # cloudpickle decides by reference vs by value per class: a by-value class
-        # ships only its own ``__dict__``, and each base is pickled separately.
-        # This subclass is dynamic (defined in a function body, so not importable)
-        # but inherits ``K`` from an importable base, which the executor
-        # re-imports and re-reads -- so ``K`` must not be baked even though the
-        # most-derived class is by value.
+        # A by-value class ships only its own ``__dict__``, and each base is
+        # pickled separately. This subclass is dynamic (so by value) but inherits
+        # ``K`` from an importable base the executor re-imports, so ``K`` must not
+        # be baked even though the most-derived class is by value.
         class _DynamicSubOfImportableBase(_AttrBase):
             def __call__(self, x):
                 return x + self.K
@@ -2386,13 +2396,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertEqual([], pudf.transpiled, "a deep inlining chain must fall back")
         self.assertTrue(warned)
         self.assertIn("nodes", str(warned[0].message))
-        # The budget must be enforced per BINDING, not only on the finished body.
-        # Checking only at the end means building the whole exponential tree
-        # first: 20 doubling assignments reach ~8.4M nodes, which took ~147s and
-        # ~3.6GB at UDF construction before falling back anyway. The message
-        # naming the binding is the observable proof it was caught early -- a
-        # regression here is a driver hang rather than a wrong answer, so it
-        # would otherwise be easy to miss.
+        # The budget must be enforced per BINDING, not only on the finished body:
+        # 20 doubling assignments reach ~8.4M nodes, which took ~147s and ~3.6GB
+        # at UDF construction before falling back anyway. The message naming the
+        # binding is the observable proof it was caught early -- a regression
+        # here hangs the driver rather than returning a wrong answer, so it would
+        # otherwise be easy to miss.
         self.assertIn(
             "the binding of",
             str(warned[0].message),

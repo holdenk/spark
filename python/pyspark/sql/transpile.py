@@ -48,14 +48,10 @@ Baking a value is only sound when the interpreted path would have seen that
 same value, which means matching ``cloudpickle`` exactly: a captured name is
 resolved only when ``cloudpickle`` would snapshot it BY VALUE.
 
-Rather than re-deriving that rule, :func:`_capture_scope` reads the same
-``cloudpickle`` internals the pickling path does -- ``_extract_code_globals``
-for the globals it ships, ``_get_cell_contents`` / ``_empty_cell_value`` for
-closure cells, and ``_should_pickle_by_reference`` per function and per class in
-the MRO. Note that round-tripping the UDF through ``dumps``/``loads`` would
-*not* work as a shortcut: for a by-reference function ``loads`` hands back the
-driver's own object, so the executor's divergence -- the entire case that has to
-fall back -- is invisible.
+:func:`_capture_scope` therefore reads ``cloudpickle``'s own helpers rather than
+re-deriving the rule -- private, but vendored, so they move only on a deliberate
+upgrade. ``dumps``/``loads`` will not do: ``loads`` returns a by-reference
+function unchanged, hiding the divergence that must fall back.
 """
 
 import ast
@@ -215,13 +211,10 @@ _DISCARDABLE_NODES = (
 def _check_node_budget(node: ast.AST, what: str) -> None:
     """Refuse a tree that has grown past ``_MAX_NORMALIZED_NODES``.
 
-    Applied to each local binding as it is inlined, not only to the finished
-    body. Inlining doubles a binding's size per link in a chain like
-    ``z1 = z0 + z0; z2 = z1 + z1; ...``, so checking only at the end means
-    building the whole exponential tree before rejecting it -- 20 such
-    assignments reach ~8.4M nodes, taking minutes and gigabytes at UDF
-    construction time before falling back anyway. Bounding every binding keeps
-    the work proportional to the budget instead.
+    Applied per local binding as it is inlined, not just to the finished body:
+    inlining doubles a binding's size per link in ``z1 = z0 + z0; z2 = z1 + z1;
+    ...``, so 20 such assignments reach ~8.4M nodes -- minutes and gigabytes
+    spent at UDF construction before falling back anyway.
     """
     size = sum(1 for _ in ast.walk(node))
     if size > _MAX_NORMALIZED_NODES:
@@ -286,18 +279,12 @@ def _underlying_function(func: Callable) -> Optional[types.FunctionType]:
 
 
 def _pickled_by_value(obj: Any) -> bool:
-    """Whether ``cloudpickle`` would snapshot ``obj`` rather than re-import it.
+    """Whether ``cloudpickle`` snapshots ``obj`` rather than re-importing it.
 
-    Anything pickled by reference is re-imported on the executor, so values
-    reached through it are whatever that process holds -- not what the driver
-    saw -- and must not be baked into the plan.
+    A by-reference object is re-imported on the executor, so anything reached
+    through it is whatever that process holds -- not what the driver saw.
     """
-    try:
-        return not _should_pickle_by_reference(obj)
-    except TypeError:
-        # Not a function / class / module. cloudpickle pickles such objects
-        # (e.g. a callable class instance) by value.
-        return True
+    return not _should_pickle_by_reference(obj)
 
 
 class _CapturedScope:
@@ -317,8 +304,7 @@ class _CapturedScope:
     ) -> None:
         self._local_names = local_names
         self._cells = cells
-        # ``None`` means the UDF is pickled by reference, so no global is
-        # readable; a dict holds exactly the globals cloudpickle would ship.
+        # ``None`` == pickled by reference, so no global is readable.
         self._global_values = global_values
         self._instance = instance
 
@@ -370,12 +356,9 @@ class _CapturedScope:
             instance_dict = {}
         if attr in instance_dict:
             return instance_dict[attr]
-        # Walk the MRO gating each class on its OWN pickling mode, because that
-        # is the granularity cloudpickle decides at: a by-value class ships only
-        # its own ``__dict__`` (``_class_getstate``), while each base is pickled
-        # separately and may well go by reference. Gating the whole walk on the
-        # most-derived class would bake an attribute inherited from an importable
-        # base, which the executor re-imports and re-reads.
+        # Gate each class on its OWN mode: cloudpickle ships only a by-value
+        # class's own ``__dict__`` and pickles each base separately, so a
+        # by-value subclass can inherit from a by-reference base.
         for klass in type(self._instance).__mro__:
             if attr not in klass.__dict__:
                 continue
@@ -387,10 +370,9 @@ class _CapturedScope:
                     "holds there; falling back to interpreted Python"
                 )
             value = klass.__dict__[attr]
-            # Read the class ``__dict__`` rather than using ``getattr`` so a
-            # descriptor (property, method, classmethod) is never invoked: its
-            # result is computed per process and is not what cloudpickle
-            # snapshots.
+            # Read the class ``__dict__`` rather than ``getattr`` so a descriptor
+            # (property, method, classmethod) is never invoked: its result is
+            # computed per process, not snapshotted.
             if hasattr(type(value), "__get__"):
                 raise UnsupportedOperationException(
                     f"`self.{attr}` resolves to a descriptor "
@@ -413,9 +395,8 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             "could not determine the UDF's code object, so its scope cannot be resolved"
         )
     code = fn.__code__
-    # ``_get_cell_contents`` / ``_empty_cell_value`` are cloudpickle's own, so an
-    # unassigned cell is represented here by the very object the executor would
-    # receive for it.
+    # cloudpickle's own sentinel, so an unassigned cell is the object the
+    # executor would receive.
     cells = dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
 
     if inspect.ismethod(func):
@@ -425,23 +406,18 @@ def _capture_scope(func: Callable) -> _CapturedScope:
     else:
         instance = func
 
-    # Globals live in the module the UDF's *owner* is imported from: for a
-    # callable instance or a bound method that is its class, which is what the
-    # executor re-imports. Deriving the owner from the instance rather than from
-    # ``type(func)`` matters for bound methods -- ``type(bound_method)`` is
-    # ``types.MethodType``, which has no importable qualified name and so looks
-    # by-value to cloudpickle, which would wave through the globals of every
-    # bound method no matter how importable its class.
-    owner: Any = type(instance) if instance is not None else fn
-    # Mirror ``cloudpickle._function_getstate``: the only globals shipped are
-    # those the code actually references, so those are the only ones readable.
+    # Globals follow the function that CARRIES the code: ``_method_reduce``
+    # reduces a bound method to its ``__func__``, and a class ships ``__call__``
+    # only if that function is in its own ``__dict__``. Gating on the instance's
+    # class would bake globals for a method inherited from a by-reference base.
+    # Mirror ``_function_getstate``: only the globals the code references ship.
     global_values = (
         {
             name: fn.__globals__[name]
             for name in _extract_code_globals(code)
             if name in fn.__globals__
         }
-        if _pickled_by_value(owner)
+        if _pickled_by_value(fn)
         else None
     )
     return _CapturedScope(
@@ -470,15 +446,11 @@ class _ScopeNormalizer(ast.NodeTransformer):
     def _bake(description: str, value: Any) -> ast.expr:
         if value is None or isinstance(value, _BAKEABLE_TYPES):
             # Python ints are unbounded, so a capture can exceed what LongType
-            # holds. Refuse explicitly rather than relying on ``lit`` to throw:
-            # the outcome would be the same fallback today, but only because the
-            # JVM raises, and the resulting warning is a Java stack trace. Worse,
-            # were ``lit`` ever to accept such a value (as a decimal, say), the
-            # constant would still be classified "numeric" here, so the option
-            # would be matched against a bigint column and fail CheckAnalysis --
-            # which kills the whole query, because options are type-checked as
-            # children of TranspiledPythonUDF before ConvertToCatalyst can drop
-            # them. ``bool`` is excluded: it subclasses int but is only 0/1.
+            # holds. Refuse explicitly rather than letting ``lit`` throw a Java
+            # stack trace -- and were ``lit`` ever to accept such a value (a
+            # decimal, say), it would still classify as "numeric" and then fail
+            # CheckAnalysis against a bigint column, killing the query instead of
+            # falling back. ``bool`` is excluded: it subclasses int but is 0/1.
             if (
                 isinstance(value, int)
                 and not isinstance(value, bool)
