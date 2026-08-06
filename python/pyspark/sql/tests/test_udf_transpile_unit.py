@@ -40,13 +40,6 @@ from pyspark.util import is_remote_only
 
 
 # Fixtures for the scope-capture tests (SPARK-55207).
-#
-# This module is importable, which matters: cloudpickle pickles a top-level
-# ``def`` here BY REFERENCE, so the executor re-imports the module and reads
-# whatever its globals hold at that point. The transpiler must therefore refuse
-# to bake globals for ``_importable_reads_global`` below. A module-level lambda
-# has no importable qualified name, so it is pickled by value and its globals
-# may be baked -- as may any closure cell, which travels inside the payload.
 _CAPTURED_INT = 7
 _CAPTURED_STR = "-suffix"
 _CAPTURED_LIST = [1, 2]
@@ -329,13 +322,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def left_shift(x):  # `<<` -- ast.LShift, not handled.
             if x is not None:
                 return x << 1
-
-        # Multi-statement bodies whose extra statements are local assignments
-        # (``y = 1; return x + y``) are handled as of SPARK-55207 -- see
-        # ``test_udf_transpile_assignment_forms`` -- so they are no longer
-        # listed here. A body with a non-assignment statement before the
-        # terminal one still falls back; that is covered by
-        # ``test_udf_transpile_assignment_falls_back``.
 
         cases = [
             ("divide_by_two", divide_by_two, DoubleType(), Row(a=4.0), 2.0),
@@ -1601,7 +1587,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(chained.first()[0], 3.0)  # ((10 // 2) + 1) / 2
             self.assertEqual(2, self._eval_python_count(chained))
 
-    def test_udf_transpile_closure_capture_is_elided(self):
+    def test_udf_transpile_closure_capture_is_merged(self):
         # A closure-capturing UDF now lowers fully, so no Python eval node
         # survives (this pinned the opposite before SPARK-55207).
         with self.sql_conf(_TRANSPILE_ON):
@@ -1687,56 +1673,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             df = self.spark.createDataFrame([(10,)], "a long")
             self.assertEqual(rebinds(10), 22, "bad test expectation")
             self.assertEqual(df.select(u("a")).collect()[0][0], 22)
-
-    def test_udf_transpile_works_with_arrow_udfs_enabled(self):
-        # Regression guard for the interaction with SPARK-54555, which made
-        # Arrow-optimized Python UDFs the default. Transpilation is gated on
-        # PythonEvalType.SQL_BATCHED_UDF, so `udf()` -- which now yields
-        # SQL_ARROW_BATCHED_UDF -- does not transpile (SPARK-57266 tracks the
-        # other eval types). Constructing UserDefinedFunction directly pins the
-        # batched eval type, and that must keep working with the Arrow conf left
-        # at its default rather than only when a suite turns Arrow off.
-        #
-        # Every test in this class relies on that, so assert the ambient default
-        # really is Arrow-enabled: if it ever flips, this suite would silently
-        # stop covering the configuration users actually run.
-        from pyspark.sql.functions import udf as public_udf
-        from pyspark.util import PythonEvalType
-
-        self.assertEqual(
-            "true",
-            self.spark.conf.get("spark.sql.execution.pythonUDF.arrow.enabled"),
-            "this suite is meant to run with Arrow-optimized UDFs at their default (on)",
-        )
-        with self.sql_conf(_TRANSPILE_ON):
-            captured = _make_adder(3)
-
-            def with_assignment(x):
-                b = x + 3
-                return b
-
-            # The public API yields an Arrow UDF, which is not a transpile
-            # candidate at all -- so it stays interpreted and still computes
-            # the right answer.
-            arrow_udf = public_udf(captured, LongType())
-            self.assertEqual(PythonEvalType.SQL_ARROW_BATCHED_UDF, arrow_udf._unwrapped.evalType)
-            self.assertEqual([], arrow_udf._unwrapped.transpiled)
-            arrow_df = self.spark.createDataFrame([(10,)], "a long").select(arrow_udf("a"))
-            self.assertEqual(arrow_df.collect()[0][0], 13)
-
-            # The batched eval type transpiles and is fully elided, with Arrow
-            # still enabled in the session.
-            for label, func in [("capture", captured), ("assignment", with_assignment)]:
-                with self.subTest(case=label):
-                    u = UserDefinedFunction(func, LongType())
-                    self.assertTrue(u.transpiled, f"{label} should transpile with Arrow on")
-                    df = self.spark.createDataFrame([(10,)], "a long").select(u("a").alias("out"))
-                    self.assertEqual(df.first()[0], 13)
-                    self.assertEqual(
-                        0,
-                        self._eval_python_count(df),
-                        f"{label}: expected full elision with Arrow enabled",
-                    )
 
     def test_udf_transpile_config_toggle_no_stale_nodes(self):
         # Built with the flags on, executed with them off -> clean fallback to

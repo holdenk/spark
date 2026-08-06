@@ -351,28 +351,6 @@ lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 
 
 # Scope capture and local assignment (SPARK-55207).
-#
-# Captures are built by factory functions so the value lands in a closure cell,
-# which cloudpickle always snapshots by value. A top-level ``def`` in this module
-# would instead be pickled by reference, and the transpiler deliberately refuses
-# to bake globals in that case -- ``_run`` asserts transpilation actually
-# happened, so such a fixture would fail loudly rather than silently compare
-# interpreted against interpreted.
-#
-# Bodies are written as a prefix of assignments followed by exactly one terminal
-# statement, which is the shape the transpiler supports; an early-return guard
-# before the terminal statement is control flow (SPARK-55218) and still falls
-# back. The assignment bodies therefore evaluate their arithmetic
-# unconditionally, so a NULL input raises TypeError in Python while the lowered
-# form yields NULL -- the pre-existing, documented divergence that
-# ``plus_four_unsafe`` also exercises and that ``_run`` tolerates by design.
-#
-# Arithmetic stays within ``_LONG_ARITH_BOUND``, which is sized so that the
-# operations here cannot overflow LongType: the widest is a doubling, and
-# 2 * 2**61 is still below Long.MAX. Squaring a bound-sized value would
-# overflow, and because the Python UDF runner silently wraps out-of-range
-# results even under ANSI, that shows up as a spurious mismatch rather than
-# "both raised" -- so these fixtures double rather than square.
 
 
 def _make_plus_captured(offset):

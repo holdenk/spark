@@ -47,42 +47,6 @@ wrote with the literal spelled out.
 Baking a value is only sound when the interpreted path would have seen that
 same value, which means matching ``cloudpickle`` exactly: a captured name is
 resolved only when ``cloudpickle`` would snapshot it BY VALUE.
-
-* A closure cell (``co_freevars``) is always by value -- it travels inside the
-  pickled function object.
-* A module global is by value only when the UDF itself is pickled by value.
-  A function importable by qualified name from a module is pickled BY
-  REFERENCE, so the executor re-imports the module and reads whatever the
-  global holds there; baking the driver's value would diverge. Lambdas, nested
-  functions and ``__main__``-defined functions are pickled by value, so their
-  globals are safe. ``_should_pickle_by_reference`` is the predicate, and it
-  honours ``cloudpickle.register_pickle_by_value``.
-
-  This is why a UDF written as a top-level ``def`` in an importable module does
-  not get its module constants baked, while the same body written as a lambda
-  or returned from a factory function does. Calling
-  ``cloudpickle.register_pickle_by_value(my_module)`` switches that module to
-  by-value pickling, which makes the interpreted path snapshot the constant too
-  and so opens this up without introducing a disagreement.
-* ``self.attr`` on a callable instance is by value when the attribute lives in
-  the instance ``__dict__``; a class attribute follows the class's own pickling
-  mode.
-
-Captured values are read when the UDF's ``judf`` is created -- the same moment
-``_wrap_function`` pickles the function for the interpreted path -- so both
-paths snapshot together and agree. Rebinding a captured name before the UDF is
-first called affects both paths equally; rebinding it afterwards affects
-neither, because the pickled function is cached. Only ``None`` and the basic
-scalar types (``int``, ``float``, ``str``, ``bool``, ``bytes``) can be baked;
-anything else falls back to interpreted Python.
-
-A leading docstring is skipped, and a function that falls off its end -- no
-``return``, a trailing assignment, a bare expression, or ``pass`` -- returns
-``None`` in Python and is lowered to a NULL literal. That always warns, since
-it is usually a mistake. The one case that additionally falls back is a
-trailing expression whose evaluation could raise (``def f(x): x % 0``):
-discarding it would turn Python's error into a NULL, so the interpreted path
-runs instead.
 """
 
 import ast
