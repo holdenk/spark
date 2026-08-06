@@ -47,6 +47,15 @@ wrote with the literal spelled out.
 Baking a value is only sound when the interpreted path would have seen that
 same value, which means matching ``cloudpickle`` exactly: a captured name is
 resolved only when ``cloudpickle`` would snapshot it BY VALUE.
+
+Rather than re-deriving that rule, :func:`_capture_scope` reads the same
+``cloudpickle`` internals the pickling path does -- ``_extract_code_globals``
+for the globals it ships, ``_get_cell_contents`` / ``_empty_cell_value`` for
+closure cells, and ``_should_pickle_by_reference`` per function and per class in
+the MRO. Note that round-tripping the UDF through ``dumps``/``loads`` would
+*not* work as a shortcut: for a by-reference function ``loads`` hands back the
+driver's own object, so the executor's divergence -- the entire case that has to
+fall back -- is invisible.
 """
 
 import ast
@@ -57,7 +66,12 @@ import inspect
 import itertools
 import textwrap
 import warnings
-from pyspark.cloudpickle.cloudpickle import _should_pickle_by_reference
+from pyspark.cloudpickle.cloudpickle import (
+    _empty_cell_value,
+    _extract_code_globals,
+    _get_cell_contents,
+    _should_pickle_by_reference,
+)
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
 from pyspark.sql.types import (
@@ -198,13 +212,6 @@ _DISCARDABLE_NODES = (
 )
 
 
-class _EmptyCell:
-    """Sentinel for a closure cell that has not been assigned yet."""
-
-
-_EMPTY_CELL = _EmptyCell()
-
-
 def _check_node_budget(node: ast.AST, what: str) -> None:
     """Refuse a tree that has grown past ``_MAX_NORMALIZED_NODES``.
 
@@ -251,23 +258,10 @@ def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
 
 
 def _returns_only_none_implicitly(body: List[ast.stmt]) -> bool:
-    """Whether the function has no ``return`` statement at all, so every call
+    """Whether the function has no ``return`` statement at all, so every* call
     falls off its end and hands back ``None``.
 
-    Reported to the user because a body with no ``return`` anywhere is nearly
-    always a forgotten one (``def f(x): x + x``), and reported whether or not the
-    body turns out to be transpilable: a function that always returns None (or
-    raises) is worth flagging either way.
-
-    Deliberately narrower than "this call returns None". A function whose
-    ``return`` sits under a condition (``def f(x):\\n if x: return 1``) also
-    returns None when that condition does not hold, but the author wrote a
-    ``return``, so the None branch is far more likely intentional -- warning
-    about it would be noise.
-
-    A generator is excluded: ``def f(x): yield x`` has no ``return`` either, but
-    calling it hands back a generator object rather than ``None``, so the warning
-    would be untrue. Generators are refused during lowering regardless.
+    * Technically could also throw.
     """
     nodes = list(_own_scope_nodes(body))
     if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in nodes):
@@ -319,16 +313,14 @@ class _CapturedScope:
         local_names: Set[str],
         cells: Dict[str, Any],
         global_values: Optional[Dict[str, Any]],
-        globals_by_reference: bool,
         instance: Optional[Any],
-        class_attrs_by_value: bool,
     ) -> None:
         self._local_names = local_names
         self._cells = cells
+        # ``None`` means the UDF is pickled by reference, so no global is
+        # readable; a dict holds exactly the globals cloudpickle would ship.
         self._global_values = global_values
-        self._globals_by_reference = globals_by_reference
         self._instance = instance
-        self._class_attrs_by_value = class_attrs_by_value
 
     def lookup_name(self, name: str) -> Any:
         if name in self._local_names:
@@ -344,7 +336,7 @@ class _CapturedScope:
             )
         if name in self._cells:
             value = self._cells[name]
-            if value is _EMPTY_CELL:
+            if value is _empty_cell_value:
                 raise UnsupportedOperationException(
                     f"closure cell for {name!r} has not been assigned yet; "
                     "falling back to interpreted Python"
@@ -352,7 +344,7 @@ class _CapturedScope:
             return value
         if self._global_values is not None and name in self._global_values:
             return self._global_values[name]
-        if self._globals_by_reference:
+        if self._global_values is None:
             raise UnsupportedOperationException(
                 f"cannot capture the global {name!r}: this UDF is pickled by "
                 "reference, so the executor re-imports its module and reads "
@@ -378,22 +370,35 @@ class _CapturedScope:
             instance_dict = {}
         if attr in instance_dict:
             return instance_dict[attr]
-        if self._class_attrs_by_value:
-            for klass in type(self._instance).__mro__:
-                if attr in klass.__dict__:
-                    value = klass.__dict__[attr]
-                    # Read the class ``__dict__`` rather than using ``getattr``
-                    # so a descriptor (property, method, classmethod) is never
-                    # invoked: its result is computed per process and is not
-                    # what cloudpickle snapshots.
-                    if hasattr(type(value), "__get__"):
-                        raise UnsupportedOperationException(
-                            f"`self.{attr}` resolves to a descriptor "
-                            f"({type(value).__name__}), whose value is not "
-                            "captured by cloudpickle; falling back to "
-                            "interpreted Python"
-                        )
-                    return value
+        # Walk the MRO gating each class on its OWN pickling mode, because that
+        # is the granularity cloudpickle decides at: a by-value class ships only
+        # its own ``__dict__`` (``_class_getstate``), while each base is pickled
+        # separately and may well go by reference. Gating the whole walk on the
+        # most-derived class would bake an attribute inherited from an importable
+        # base, which the executor re-imports and re-reads.
+        for klass in type(self._instance).__mro__:
+            if attr not in klass.__dict__:
+                continue
+            if not _pickled_by_value(klass):
+                raise UnsupportedOperationException(
+                    f"`self.{attr}` is defined on {klass.__name__}, which "
+                    "cloudpickle pickles by reference, so the executor "
+                    "re-imports that class and reads whatever the attribute "
+                    "holds there; falling back to interpreted Python"
+                )
+            value = klass.__dict__[attr]
+            # Read the class ``__dict__`` rather than using ``getattr`` so a
+            # descriptor (property, method, classmethod) is never invoked: its
+            # result is computed per process and is not what cloudpickle
+            # snapshots.
+            if hasattr(type(value), "__get__"):
+                raise UnsupportedOperationException(
+                    f"`self.{attr}` resolves to a descriptor "
+                    f"({type(value).__name__}), whose value is not "
+                    "captured by cloudpickle; falling back to "
+                    "interpreted Python"
+                )
+            return value
         raise UnsupportedOperationException(
             f"`self.{attr}` could not be resolved to a value cloudpickle would "
             "capture by value; falling back to interpreted Python"
@@ -408,13 +413,10 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             "could not determine the UDF's code object, so its scope cannot be resolved"
         )
     code = fn.__code__
-    cells: Dict[str, Any] = {}
-    closure = fn.__closure__ or ()
-    for name, cell in zip(code.co_freevars, closure):
-        try:
-            cells[name] = cell.cell_contents
-        except ValueError:
-            cells[name] = _EMPTY_CELL
+    # ``_get_cell_contents`` / ``_empty_cell_value`` are cloudpickle's own, so an
+    # unassigned cell is represented here by the very object the executor would
+    # receive for it.
+    cells = dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
 
     if inspect.ismethod(func):
         instance: Optional[Any] = func.__self__
@@ -424,16 +426,29 @@ def _capture_scope(func: Callable) -> _CapturedScope:
         instance = func
 
     # Globals live in the module the UDF's *owner* is imported from: for a
-    # callable instance that is its class, which is what the executor re-imports.
-    owner: Any = type(func) if instance is not None else fn
-    globals_by_value = _pickled_by_value(owner)
+    # callable instance or a bound method that is its class, which is what the
+    # executor re-imports. Deriving the owner from the instance rather than from
+    # ``type(func)`` matters for bound methods -- ``type(bound_method)`` is
+    # ``types.MethodType``, which has no importable qualified name and so looks
+    # by-value to cloudpickle, which would wave through the globals of every
+    # bound method no matter how importable its class.
+    owner: Any = type(instance) if instance is not None else fn
+    # Mirror ``cloudpickle._function_getstate``: the only globals shipped are
+    # those the code actually references, so those are the only ones readable.
+    global_values = (
+        {
+            name: fn.__globals__[name]
+            for name in _extract_code_globals(code)
+            if name in fn.__globals__
+        }
+        if _pickled_by_value(owner)
+        else None
+    )
     return _CapturedScope(
         local_names=set(code.co_varnames),
         cells=cells,
-        global_values=fn.__globals__ if globals_by_value else None,
-        globals_by_reference=not globals_by_value,
+        global_values=global_values,
         instance=instance,
-        class_attrs_by_value=instance is not None and _pickled_by_value(type(func)),
     )
 
 

@@ -134,6 +134,15 @@ class _BoundMethodHolder:
     def add_k(self, x):
         return x + self.k
 
+    def add_global(self, x):
+        """Reads a module global, to pin the by-reference gate for bound methods.
+
+        The gate must key off this (importable) class, not off
+        ``type(bound_method)`` -- that is always ``types.MethodType``, which has
+        no importable qualified name and so looks by-value to cloudpickle.
+        """
+        return x + _CAPTURED_INT
+
 
 class _AddPropertyAttr:
     def __init__(self):
@@ -2101,6 +2110,48 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(1,)], "a long")
                     self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
+
+    def test_udf_transpile_bound_method_globals_follow_its_class(self):
+        # A bound method's globals are snapshotted only when its CLASS is pickled
+        # by value. The class here is importable, so the executor re-imports it
+        # and re-reads the global -- the driver's value must not be baked.
+        # ``type(bound_method)`` is ``types.MethodType``, which has no importable
+        # qualified name and so looks by-value to cloudpickle; keying the gate off
+        # it would wave through every bound method's globals.
+        holder = _BoundMethodHolder(4)
+        pudf, warned = self._fallback_warnings(holder.add_global, LongType())
+        self.assertEqual(
+            [], pudf.transpiled, "globals of a by-reference bound method must not be baked"
+        )
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("pickled by reference", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _CAPTURED_INT)
+
+    def test_udf_transpile_self_attr_gated_per_class_in_the_mro(self):
+        # cloudpickle decides by reference vs by value per class: a by-value class
+        # ships only its own ``__dict__``, and each base is pickled separately.
+        # This subclass is dynamic (defined in a function body, so not importable)
+        # but inherits ``K`` from an importable base, which the executor
+        # re-imports and re-reads -- so ``K`` must not be baked even though the
+        # most-derived class is by value.
+        class _DynamicSubOfImportableBase(_AttrBase):
+            def __call__(self, x):
+                return x + self.K
+
+        func = _DynamicSubOfImportableBase()
+        pudf, warned = self._fallback_warnings(func, LongType())
+        self.assertEqual(
+            [],
+            pudf.transpiled,
+            "an attribute inherited from a by-reference base must not be baked",
+        )
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("pickles by reference", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _AttrBase.K)
 
     def test_udf_transpile_assignment_forms(self):
         # Local bindings are inlined at their use sites; every assignment form
