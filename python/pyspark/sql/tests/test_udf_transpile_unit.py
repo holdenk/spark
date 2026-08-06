@@ -2458,6 +2458,91 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 "a generator does not return None; the no-return warning would lie",
             )
 
+        # The warning is about a MISSING `return`, not about a call that happens
+        # to produce None. Once the author wrote a `return`, a path that falls
+        # past it is far more likely deliberate than forgotten, so these stay
+        # quiet even though each returns None for some input.
+        def conditional_return(x):
+            if x > 0:
+                return 1
+
+        def return_then_trailing_statement(x):
+            if x > 0:
+                return 1
+            y = x  # noqa: F841
+
+        for label, func in [
+            ("conditional return", conditional_return),
+            ("trailing statement after a return", return_then_trailing_statement),
+        ]:
+            with self.subTest(case=label):
+                self.assertIsNone(func(-1), f"{label}: bad test expectation")
+                with self.sql_conf(_TRANSPILE_ON):
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        UserDefinedFunction(func, LongType())
+                    self.assertFalse(
+                        [w for w in caught if "no return statement" in str(w.message)],
+                        f"{label}: has a `return`, so the no-return warning is noise",
+                    )
+
+        # A `return` in a nested scope is not this function's return, so the
+        # outer function still falls off its end and still warns.
+        def returns_only_from_a_nested_def(x):
+            def inner():
+                return x
+
+            inner()
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                UserDefinedFunction(returns_only_from_a_nested_def, LongType())
+            self.assertIsNone(returns_only_from_a_nested_def(1), "bad test expectation")
+            self.assertTrue(
+                [w for w in caught if "no return statement" in str(w.message)],
+                "a nested def's `return` is not the outer function's",
+            )
+
+        # Statements the old last-statement heuristic did not recognize (a loop,
+        # a `with`, ...) return None just the same when nothing returns.
+        def loops_without_returning(x):
+            for _ in range(x):
+                pass
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                UserDefinedFunction(loops_without_returning, LongType())
+            self.assertIsNone(loops_without_returning(1), "bad test expectation")
+            self.assertTrue(
+                [w for w in caught if "no return statement" in str(w.message)],
+                "a body that never returns should warn whatever its last statement is",
+            )
+
+        # A lambda has no `return` statement in its source, so a naive "does the
+        # body contain an ast.Return" check would warn about every lambda UDF.
+        # `_get_function_from_ast` synthesizes `body=[Return(<lambda body>)]`, so
+        # the check sees the return the source never spelled out.
+        identity = lambda x: x + 1  # noqa: E731
+
+        def make_adder(n):
+            # `inspect.getsource` yields just this `return` line, so the lambda
+            # arrives through a different unwrapping path than the one above.
+            return lambda x: x + n
+
+        for label, func in [("bound lambda", identity), ("factory lambda", make_adder(3))]:
+            with self.subTest(case=label):
+                self.assertEqual(func(1), 4 if label == "factory lambda" else 2)
+                with self.sql_conf(_TRANSPILE_ON):
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        UserDefinedFunction(func, LongType())
+                    self.assertFalse(
+                        [w for w in caught if "no return statement" in str(w.message)],
+                        f"{label}: a lambda returns its body; the warning would lie",
+                    )
+
     def test_udf_transpile_skips_docstring(self):
         # A docstring binds nothing and cannot raise, so it is dropped and the
         # rest of the body normalized as usual. Docstrings are common enough in

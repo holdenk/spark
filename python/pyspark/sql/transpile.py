@@ -52,7 +52,7 @@ resolved only when ``cloudpickle`` would snapshot it BY VALUE.
 import ast
 import copy
 import types
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 import inspect
 import itertools
 import textwrap
@@ -234,25 +234,45 @@ def _is_docstring(stmt: ast.stmt) -> bool:
     )
 
 
-def _returns_none_implicitly(body: List[ast.stmt]) -> bool:
-    """Whether the function falls off its end instead of returning a value.
+def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
+    """Every node under ``body`` that belongs to the enclosing function itself.
 
-    True when the last statement binds a name, discards an expression, or is
-    ``pass`` -- all of which make Python return ``None``. Reported to the user
-    because it is usually a mistake, and reported whether or not the body turns
-    out to be transpilable: a function that always returns None (or raises) is
-    worth flagging either way.
-
-    A generator is excluded: ``def f(x): yield x`` ends in a discarded
-    expression but calling it returns a generator object, not ``None``, so
-    saying otherwise would be untrue. Generators are refused during lowering
-    regardless.
+    Nested ``def``/``lambda``/``class`` bodies are skipped, because a ``return``
+    or ``yield`` inside one of them belongs to that scope, not to ours:
+    ``ast.walk`` would descend and report ``def f(x):\\n def g(): return 1``
+    as having a return.
     """
-    if not body:
+    stack: List[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _returns_only_none_implicitly(body: List[ast.stmt]) -> bool:
+    """Whether the function has no ``return`` statement at all, so every call
+    falls off its end and hands back ``None``.
+
+    Reported to the user because a body with no ``return`` anywhere is nearly
+    always a forgotten one (``def f(x): x + x``), and reported whether or not the
+    body turns out to be transpilable: a function that always returns None (or
+    raises) is worth flagging either way.
+
+    Deliberately narrower than "this call returns None". A function whose
+    ``return`` sits under a condition (``def f(x):\\n if x: return 1``) also
+    returns None when that condition does not hold, but the author wrote a
+    ``return``, so the None branch is far more likely intentional -- warning
+    about it would be noise.
+
+    A generator is excluded: ``def f(x): yield x`` has no ``return`` either, but
+    calling it hands back a generator object rather than ``None``, so the warning
+    would be untrue. Generators are refused during lowering regardless.
+    """
+    nodes = list(_own_scope_nodes(body))
+    if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in nodes):
         return False
-    if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for stmt in body for n in ast.walk(stmt)):
-        return False
-    return isinstance(body[-1], (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Pass))
+    return not any(isinstance(n, ast.Return) for n in nodes)
 
 
 def _underlying_function(func: Callable) -> Optional[types.FunctionType]:
@@ -1569,7 +1589,7 @@ def _build_transpiled(
     # reported whether or not it turns out to be transpilable. A trailing
     # expression that could raise (`def f(x): x % 0`) falls back below, but the
     # user still wants to know the function never returns a value.
-    if _returns_none_implicitly(analysis.function_ast.body):
+    if _returns_only_none_implicitly(analysis.function_ast.body):
         warnings.warn(
             f"UDF {func} has no return statement, so it always returns None "
             "(NULL) or raises; add a `return` if that was not intended.",
