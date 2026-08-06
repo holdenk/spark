@@ -52,6 +52,10 @@ resolved only when ``cloudpickle`` would snapshot it BY VALUE.
 re-deriving the rule -- private, but vendored, so they move only on a deliberate
 upgrade. ``dumps``/``loads`` will not do: ``loads`` returns a by-reference
 function unchanged, hiding the divergence that must fall back.
+
+Capture timing: captured values are read when the UDF's ``judf`` is created, the
+same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
+snapshot cannot disagree even if a captured global is rebound in between.
 """
 
 import ast
@@ -349,17 +353,26 @@ class _CapturedScope:
                 "attribute access on `self` is only supported for callable "
                 "instances and bound methods"
             )
-        try:
-            instance_dict = vars(self._instance)
-        except TypeError:
-            # ``__slots__`` classes have no instance ``__dict__``.
-            instance_dict = {}
+        receiver = self._instance
+        if isinstance(receiver, type):
+            # A bound classmethod's receiver IS the class, so there is no
+            # instance ``__dict__`` to snapshot: every attribute comes from the
+            # MRO and has to clear the per-class gate below.
+            instance_dict: Dict[str, Any] = {}
+            mro = receiver.__mro__
+        else:
+            try:
+                instance_dict = vars(receiver)
+            except TypeError:
+                # ``__slots__`` classes have no instance ``__dict__``.
+                instance_dict = {}
+            mro = type(receiver).__mro__
         if attr in instance_dict:
             return instance_dict[attr]
         # Gate each class on its OWN mode: cloudpickle ships only a by-value
         # class's own ``__dict__`` and pickles each base separately, so a
         # by-value subclass can inherit from a by-reference base.
-        for klass in type(self._instance).__mro__:
+        for klass in mro:
             if attr not in klass.__dict__:
                 continue
             if not _pickled_by_value(klass):

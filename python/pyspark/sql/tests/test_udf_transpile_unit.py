@@ -149,6 +149,16 @@ class _GlobalReadingBase:
         return x + _CAPTURED_INT
 
 
+class _ClassMethodHolder:
+    """Importable class whose classmethod names its first parameter ``self``."""
+
+    K = 3
+
+    @classmethod
+    def add_k(self, x):
+        return x + self.K
+
+
 class _AddPropertyAttr:
     def __init__(self):
         self.n = 1
@@ -2140,6 +2150,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(1,)], "a long")
                     self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _CAPTURED_INT, label)
+
+    def test_udf_transpile_bound_classmethod_receiver_is_gated(self):
+        # A bound classmethod's receiver is the CLASS, so there is no instance
+        # ``__dict__``: ``self.K`` comes from the MRO and follows the class's own
+        # mode. This class is importable, so the executor re-imports it. The
+        # plain-function refusal for a first parameter named ``self`` does not
+        # cover this -- ``inspect.isfunction`` is False for a bound method.
+        pudf, warned = self._fallback_warnings(_ClassMethodHolder.add_k, LongType())
+        self.assertEqual([], pudf.transpiled, "a by-reference class attr must not be baked")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("pickles by reference", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _ClassMethodHolder.K)
 
     def test_udf_transpile_self_attr_gated_per_class_in_the_mro(self):
         # A by-value class ships only its own ``__dict__``, and each base is
