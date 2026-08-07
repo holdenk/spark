@@ -60,6 +60,7 @@ snapshot cannot disagree even if a captured global is rebound in between.
 
 import ast
 import copy
+import copyreg
 import types
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 import inspect
@@ -177,6 +178,9 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
 
 # Only these can be baked into the plan as literals: they are immutable, they
 # map onto a Spark column category, and ``cloudpickle`` snapshots them by value.
+# Matched by EXACT type, not ``isinstance``: a subclass may override an operator
+# (``int.__radd__``, ``str.__radd__``, ...) that Catalyst would then apply with
+# base-type semantics, and ``bool`` is only safe here because it is listed.
 _BAKEABLE_TYPES = (int, float, str, bool, bytes)
 
 # A captured int must fit LongType; see the guard in ``_ScopeNormalizer._bake``.
@@ -291,6 +295,28 @@ def _pickled_by_value(obj: Any) -> bool:
     return not _should_pickle_by_reference(obj)
 
 
+# Only default pickling ships ``vars(instance)`` verbatim. ``reducer_override``
+# declines ordinary instances, so they go through ``__reduce_ex__`` -- and any of
+# these hooks can rewrite or drop the dict on the way.
+_PICKLE_STATE_HOOKS = ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__")
+
+
+def _instance_dict_is_shipped(receiver: Any) -> bool:
+    """Whether ``vars(receiver)`` is what the executor will actually receive."""
+    cls = type(receiver)
+    if cls in copyreg.dispatch_table:
+        return False
+    return all(
+        getattr(cls, hook, None) is getattr(object, hook, None) for hook in _PICKLE_STATE_HOOKS
+    )
+
+
+def _is_data_descriptor(value: Any) -> bool:
+    """Whether ``value`` outranks an instance / class ``__dict__`` entry."""
+    vtype = type(value)
+    return hasattr(vtype, "__set__") or hasattr(vtype, "__delete__")
+
+
 class _CapturedScope:
     """The values a UDF body may safely read from its enclosing scope.
 
@@ -318,7 +344,9 @@ class _CapturedScope:
             # somewhere in the body and is therefore local for the WHOLE body.
             # Reading it before that assignment raises UnboundLocalError in
             # Python, so resolving it from an enclosing scope here would return
-            # a value where the UDF actually fails.
+            # a value where the UDF actually fails. This catches only
+            # ``co_varnames``: a body-local that a nested scope closes over moves
+            # to ``co_cellvars`` instead, and refuses below as unresolvable.
             raise UnsupportedOperationException(
                 f"{name!r} is a local variable that is read before it is "
                 "assigned; Python raises UnboundLocalError here, so the "
@@ -354,12 +382,36 @@ class _CapturedScope:
                 "instances and bound methods"
             )
         receiver = self._instance
+        # Reading the dicts below only tracks real attribute access while the
+        # default lookup is in force; a custom ``__getattribute__`` can return
+        # anything. ``__getattr__`` needs no guard: it only fires when lookup
+        # fails, and a lookup that finds nothing here already refuses.
+        if type(receiver).__getattribute__ not in (
+            object.__getattribute__,
+            type.__getattribute__,
+        ):
+            raise UnsupportedOperationException(
+                f"{type(receiver).__name__} overrides `__getattribute__`, so "
+                f"`self.{attr}` need not be the value stored on the instance or "
+                "class; falling back to interpreted Python"
+            )
         if isinstance(receiver, type):
             # A bound classmethod's receiver IS the class, so there is no
             # instance ``__dict__`` to snapshot: every attribute comes from the
             # MRO and has to clear the per-class gate below.
             instance_dict: Dict[str, Any] = {}
             mro = receiver.__mro__
+            # ``type.__getattribute__`` consults the METACLASS for a data
+            # descriptor before the class's own ``__dict__``, so one found there
+            # outranks everything ``mro`` holds.
+            metaclass: Any = type(receiver)
+            meta = next((m for m in metaclass.__mro__ if attr in m.__dict__), None)
+            if meta is not None and _is_data_descriptor(meta.__dict__[attr]):
+                raise UnsupportedOperationException(
+                    f"`self.{attr}` resolves to a data descriptor on the metaclass "
+                    f"{meta.__name__}, which outranks the class attribute and is "
+                    "computed per process; falling back to interpreted Python"
+                )
         else:
             try:
                 instance_dict = vars(receiver)
@@ -367,37 +419,51 @@ class _CapturedScope:
                 # ``__slots__`` classes have no instance ``__dict__``.
                 instance_dict = {}
             mro = type(receiver).__mro__
+        if attr in instance_dict and not _instance_dict_is_shipped(receiver):
+            raise UnsupportedOperationException(
+                f"`self.{attr}` comes from the instance `__dict__`, but "
+                f"{type(receiver).__name__} customizes pickling, so the executor "
+                "may reconstruct it with a different value; falling back to "
+                "interpreted Python"
+            )
+        # Resolve against the MRO before the instance ``__dict__``: a data
+        # descriptor outranks it in Python's real lookup, so an instance hit
+        # cannot be trusted until we know what the MRO holds.
+        owner = next((klass for klass in mro if attr in klass.__dict__), None)
+        if owner is None:
+            # Nothing in the MRO, so the instance dict is the whole story.
+            if attr in instance_dict:
+                return instance_dict[attr]
+            raise UnsupportedOperationException(
+                f"`self.{attr}` could not be resolved to a value cloudpickle "
+                "would capture by value; falling back to interpreted Python"
+            )
+        value = owner.__dict__[attr]
+        # Read the class ``__dict__`` rather than ``getattr`` so a descriptor
+        # (property, method, classmethod) is never invoked: its result is computed
+        # per process, not snapshotted. Refused even when the instance ``__dict__``
+        # also holds the name -- only a data descriptor would actually win there,
+        # and telling the two apart is not worth it for a collision this rare.
+        if hasattr(type(value), "__get__"):
+            raise UnsupportedOperationException(
+                f"`self.{attr}` resolves to a descriptor "
+                f"({type(value).__name__}), whose value is not "
+                "captured by cloudpickle; falling back to "
+                "interpreted Python"
+            )
         if attr in instance_dict:
             return instance_dict[attr]
-        # Gate each class on its OWN mode: cloudpickle ships only a by-value
-        # class's own ``__dict__`` and pickles each base separately, so a
+        # Gate the defining class on its OWN mode: cloudpickle ships only a
+        # by-value class's own ``__dict__`` and pickles each base separately, so a
         # by-value subclass can inherit from a by-reference base.
-        for klass in mro:
-            if attr not in klass.__dict__:
-                continue
-            if not _pickled_by_value(klass):
-                raise UnsupportedOperationException(
-                    f"`self.{attr}` is defined on {klass.__name__}, which "
-                    "cloudpickle pickles by reference, so the executor "
-                    "re-imports that class and reads whatever the attribute "
-                    "holds there; falling back to interpreted Python"
-                )
-            value = klass.__dict__[attr]
-            # Read the class ``__dict__`` rather than ``getattr`` so a descriptor
-            # (property, method, classmethod) is never invoked: its result is
-            # computed per process, not snapshotted.
-            if hasattr(type(value), "__get__"):
-                raise UnsupportedOperationException(
-                    f"`self.{attr}` resolves to a descriptor "
-                    f"({type(value).__name__}), whose value is not "
-                    "captured by cloudpickle; falling back to "
-                    "interpreted Python"
-                )
-            return value
-        raise UnsupportedOperationException(
-            f"`self.{attr}` could not be resolved to a value cloudpickle would "
-            "capture by value; falling back to interpreted Python"
-        )
+        if not _pickled_by_value(owner):
+            raise UnsupportedOperationException(
+                f"`self.{attr}` is defined on {owner.__name__}, which "
+                "cloudpickle pickles by reference, so the executor "
+                "re-imports that class and reads whatever the attribute "
+                "holds there; falling back to interpreted Python"
+            )
+        return value
 
 
 def _capture_scope(func: Callable) -> _CapturedScope:
@@ -420,9 +486,17 @@ def _capture_scope(func: Callable) -> _CapturedScope:
         instance = func
 
     # Globals follow the function that CARRIES the code: ``_method_reduce``
-    # reduces a bound method to its ``__func__``, and a class ships ``__call__``
-    # only if that function is in its own ``__dict__``. Gating on the instance's
+    # reduces a bound method to its ``__func__``, so gating on the instance's
     # class would bake globals for a method inherited from a by-reference base.
+    globals_travel = _pickled_by_value(fn)
+    if globals_travel and instance is not None and not inspect.ismethod(func):
+        # A callable instance reaches its code through ``type(func).__call__``,
+        # which cloudpickle ships only when the class OWNING it is also by value.
+        # A by-reference class is re-imported with its original ``__call__``,
+        # however the driver's was patched, so the carrying function alone is not
+        # enough here.
+        owner = next((k for k in type(func).__mro__ if "__call__" in k.__dict__), None)
+        globals_travel = owner is not None and _pickled_by_value(owner)
     # Mirror ``_function_getstate``: only the globals the code references ship.
     global_values = (
         {
@@ -430,7 +504,7 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             for name in _extract_code_globals(code)
             if name in fn.__globals__
         }
-        if _pickled_by_value(fn)
+        if globals_travel
         else None
     )
     return _CapturedScope(
@@ -457,7 +531,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
 
     @staticmethod
     def _bake(description: str, value: Any) -> ast.expr:
-        if value is None or isinstance(value, _BAKEABLE_TYPES):
+        if value is None or type(value) in _BAKEABLE_TYPES:
             # Python ints are unbounded, so a capture can exceed what LongType
             # holds. Refuse explicitly rather than letting ``lit`` throw a Java
             # stack trace -- and were ``lit`` ever to accept such a value (a
@@ -492,6 +566,16 @@ class _ScopeNormalizer(ast.NodeTransformer):
         if node.id in self._env:
             # Each use gets its own copy so the tree stays free of shared nodes.
             return copy.deepcopy(self._env[node.id])
+        if node.id == self._self_param:
+            # A body that references the receiver itself (`return self`) has no
+            # column equivalent: it is not bound at the call site. Refused here,
+            # where the receiver's name is known, so the lowering only ever sees
+            # names the caller actually supplies.
+            raise UnsupportedOperationException(
+                f"references to the receiver {node.id!r} in a callable's body "
+                "are not supported by the transpiler; falling back to "
+                "interpreted Python"
+            )
         if node.id in self._params:
             return node
         return self._bake(f"captured name {node.id!r}", self._scope.lookup_name(node.id))
@@ -502,10 +586,13 @@ class _ScopeNormalizer(ast.NodeTransformer):
             and self._self_param is not None
             and isinstance(node.value, ast.Name)
             and node.value.id == self._self_param
-            # A rebound `self` is no longer the receiver.
+            # A rebound receiver is no longer the receiver.
             and node.value.id not in self._env
         ):
-            return self._bake(f"`self.{node.attr}`", self._scope.lookup_self_attr(node.attr))
+            return self._bake(
+                f"`{self._self_param}.{node.attr}`",
+                self._scope.lookup_self_attr(node.attr),
+            )
         return self.generic_visit(node)
 
     def _desugar_assignment(self, stmt: ast.stmt) -> Tuple[List[str], ast.expr]:
@@ -596,13 +683,24 @@ class _ScopeNormalizer(ast.NodeTransformer):
 
 
 def _normalize_function(
-    func: Callable, function_ast: ast.FunctionDef, params: List[str]
+    func: Callable,
+    function_ast: ast.FunctionDef,
+    params: List[str],
+    receiver: Optional[str],
 ) -> ast.FunctionDef:
     """Resolve scope and inline assignments, yielding a one-statement body.
+
+    ``receiver`` is the name of the implicit first parameter, or ``None`` when the
+    call site supplies every parameter. It is determined from the binding by
+    :func:`_analyze_func`, not from the name.
 
     Raises :class:`UnsupportedOperationException` when anything cannot be
     resolved soundly, which the caller turns into a fallback.
     """
+    # This walk covers nested scopes, not just the top level: ``_extract_code_globals``
+    # recurses into nested code objects, so a nested ``global x`` puts a name that is
+    # ALSO a body-local into the global capture table, where it would resolve to the
+    # module value for a body that raises UnboundLocalError.
     for node in ast.walk(function_ast):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             raise UnsupportedOperationException(
@@ -610,8 +708,7 @@ def _normalize_function(
                 "function and are not supported by the transpiler"
             )
     scope = _capture_scope(func)
-    self_param = params[0] if params and params[0] == "self" else None
-    normalizer = _ScopeNormalizer(params, scope, self_param)
+    normalizer = _ScopeNormalizer(params, scope, receiver)
     # ``ast.NodeTransformer`` rewrites in place, and the caller holds onto
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
     # construction and again when its judf is created). Normalizing the original
@@ -868,10 +965,9 @@ class CatalystTranspiler(AbstractTranspiler):
                     "category; falling back to interpreted Python"
                 )
             case ast.Name(id=name) if name in params:
-                index = params.index(name)
-                if params and params[0] == "self":
-                    index -= 1
-                return self._param_categories.get(index, "numeric")
+                # ``params`` is already receiver-free, so its index IS the
+                # call-site position the category map is keyed by.
+                return self._param_categories.get(params.index(name), "numeric")
             case ast.BinOp(left=left, op=op, right=right):
                 lc = self._category(params, left)
                 rc = self._category(params, right)
@@ -1173,24 +1269,11 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Name(id=name, ctx=ast.Load()):
                 # Insert columns referencing the param indexes for children
                 if name in params:
-                    param_index = params.index(name)
-                    # Special hack for self on callables
-                    if params[0] == "self":
-                        # A body that references the receiver itself (e.g.
-                        # ``return self``) has no column equivalent: ``self``
-                        # is not an argument at the call site, and offsetting
-                        # would emit ``_udf_param_-1``, which the JVM builder
-                        # rejects with an AnalysisException at call
-                        # construction instead of falling back. Refuse so the
-                        # UDF stays interpreted.
-                        if name == "self":
-                            raise UnsupportedOperationException(
-                                "references to `self` in a callable's body "
-                                "are not supported by the transpiler; falling "
-                                "back to interpreted Python"
-                            )
-                        param_index -= 1
-                    return col(f"_udf_param_{param_index}")
+                    # ``params`` is receiver-free, so the index maps straight onto
+                    # the positional placeholder the JVM binds. A reference to the
+                    # receiver never reaches here -- ``_normalize_function``
+                    # refuses it, where the receiver's real name is known.
+                    return col(f"_udf_param_{params.index(name)}")
                 else:
                     # ``_normalize_function`` rewrites every resolvable
                     # non-parameter name into a constant before lowering runs,
@@ -1461,6 +1544,7 @@ class _TranspileAnalysis:
         function_ast: ast.FunctionDef,
         params: List[str],
         public_params: List[str],
+        receiver: Optional[str],
         returnType: "DataTypeOrString",
         combos: List[dict],
     ) -> None:
@@ -1469,6 +1553,9 @@ class _TranspileAnalysis:
         self.function_ast = function_ast
         self.params = params
         self.public_params = public_params
+        # Name of the implicit first parameter (``self`` / ``cls`` / whatever the
+        # author called it), or ``None`` when the call site supplies every one.
+        self.receiver = receiver
         self.returnType = returnType
         self.combos = combos
 
@@ -1544,23 +1631,34 @@ def _analyze_func(
             "positional-only arguments are not supported by the transpiler"
         ]
     params = _get_parameter_list(function_ast)
-    # The transpiler strips a leading ``self`` on the assumption that the
-    # source came from a bound ``__call__`` / method whose receiver is not
-    # supplied at the call site. A PLAIN function whose first parameter
-    # happens to be named ``self`` breaks that assumption: every arg IS
-    # supplied at the call site, and stripping would misnumber the
-    # ``_udf_param_N`` placeholders (emitting ``_udf_param_-1``). Refuse
-    # and fall back rather than guess.
-    if params and params[0] == "self" and inspect.isfunction(func):
+    # Which leading declared parameters are the implicit receiver? Derive it from
+    # the BINDING rather than the parameter's NAME: ``self`` and ``cls`` are only
+    # conventions, so a name test both misses ``def __call__(this, x)`` and a
+    # ``cls``-named classmethod, and misfires on a plain function that happens to
+    # call its first argument ``self``. ``inspect.signature`` already reports the
+    # call-site view, so the difference IS the receiver: a bound method, a bound
+    # classmethod and a callable instance each hide one declared parameter, while
+    # a plain function, a lambda and a ``staticmethod`` hide none.
+    try:
+        visible = len(inspect.signature(func).parameters)
+    except (TypeError, ValueError) as e:
         return None, [
-            "plain function with first parameter named 'self' is "
-            "ambiguous to the transpiler's self-stripping; falling "
-            "back to interpreted Python"
+            f"could not determine the UDF's call signature ({e}), so the "
+            "transpiler cannot tell which parameters the call site supplies"
         ]
-    # Strip ``self`` for the caller-facing param list -- callers will
-    # match user-supplied kwargs against this, and the user doesn't
-    # name ``self`` at the call site.
-    public_params = params[1:] if params and params[0] == "self" else list(params)
+    hidden = len(params) - visible
+    if hidden not in (0, 1):
+        # A ``__signature__`` override or an unwrappable callable: refuse rather
+        # than guess how declared parameters line up with bound columns.
+        return None, [
+            f"the UDF declares {len(params)} parameter(s) but accepts {visible} "
+            "at the call site, which the transpiler cannot map onto columns; "
+            "falling back to interpreted Python"
+        ]
+    # The caller matches user-supplied kwargs against these, and the user does
+    # not name the receiver at the call site.
+    public_params = params[hidden:]
+    receiver = params[0] if hidden else None
     return (
         _TranspileAnalysis(
             src=src,
@@ -1568,6 +1666,7 @@ def _analyze_func(
             function_ast=function_ast,
             params=params,
             public_params=public_params,
+            receiver=receiver,
             returnType=returnType,
             combos=_param_category_combos(function_ast, public_params),
         ),
@@ -1599,7 +1698,9 @@ def _build_transpiled(
         # Resolve free variables and inline local assignments once, up front:
         # the result is value-dependent but category-independent, so it is
         # shared by every input-type variant below.
-        normalized = _normalize_function(func, analysis.function_ast, analysis.params)
+        normalized = _normalize_function(
+            func, analysis.function_ast, analysis.params, analysis.receiver
+        )
     except Exception as e:
         return [], [str(e)], []
     transpiled: List[Column] = []
@@ -1615,7 +1716,10 @@ def _build_transpiled(
                     analysis.src,
                     analysis.ast_info,
                     normalized,
-                    analysis.params,
+                    # The receiver is already stripped: ``_normalize_function``
+                    # refuses any reference to it, so every name the lowering can
+                    # still see is a column the call site binds.
+                    analysis.public_params,
                     analysis.returnType,
                     combo,
                 )
@@ -1627,41 +1731,3 @@ def _build_transpiled(
             except Exception as e:
                 errors.append(str(e))
     return transpiled, errors, input_categories
-
-
-def _transpile_func(
-    session: "SparkSession",
-    func: Callable[..., Any],
-    returnType: "DataTypeOrString",
-) -> Tuple[List[Column], List[str], List[str], List[List[str]]]:
-    """
-    An experimental internal function that attempts to transpile a callable function.
-
-    Analyzes and lowers in one step. Callers that need the captured values read
-    at a specific moment (see the capture-timing note in this module's
-    docstring) should use :func:`_analyze_func` and :func:`_build_transpiled`
-    separately instead.
-
-    Returns
-    -------
-    list of transpiled options (one per backend x input-type variant)
-    list of errors as strings
-    list of positional parameter names (excluding ``self`` for callable
-    instances) -- needed so the caller can resolve named-argument
-    invocations to positional order at call time, since the ``_udf_param_N``
-    substitution in :class:`UserDefinedPythonFunction` is positional.
-    list of per-option input-type categories (``"numeric"`` / ``"string"`` per
-    public param) -- the JVM picks the option whose categories match the bound
-    column types, or falls back to the Python UDF when none match.
-    """
-    try:
-        analysis, errors = _analyze_func(func, returnType)
-        if analysis is None:
-            return ([], errors, [], [])
-        transpiled, build_errors, input_categories = _build_transpiled(session, func, analysis)
-        return (transpiled, errors + build_errors, analysis.public_params, input_categories)
-    except Exception as e:
-        # Don't re-raise: an inability to transpile must never break a
-        # working UDF. The caller treats an empty ``transpiled`` list as a
-        # silent fall-back to interpreted Python.
-        return ([], [str(e)], [], [])

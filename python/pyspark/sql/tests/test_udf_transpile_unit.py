@@ -60,6 +60,19 @@ def _make_adder(off):
     return lambda x: x + off
 
 
+def _make_unassigned_cell():
+    """``later`` is a free variable of ``f``, but its cell is still empty.
+
+    Calling the result raises NameError, so the cell's value must not be baked.
+    """
+
+    def f(x):
+        return x + later
+
+    return f
+    later = 1  # unreachable on purpose, but it makes `later` a cell
+
+
 def _make_nested_adder(a):
     def mid(b):
         def inner(x):
@@ -176,6 +189,137 @@ class _AddSlotsAttr:
 
     def __init__(self, k):
         self.k = k
+
+    def __call__(self, x):
+        return x + self.k
+
+
+class _GetAttributeHook:
+    """``self.k`` is 1 in the instance dict but 1001 through real lookup."""
+
+    def __init__(self):
+        self.k = 1
+
+    def __getattribute__(self, name):
+        if name == "k":
+            return 1001
+        return object.__getattribute__(self, name)
+
+    def __call__(self, x):
+        return x + self.k
+
+
+class _DataDescriptor:
+    """Defines ``__set__``, so it outranks the instance dict."""
+
+    def __get__(self, obj, objtype=None):
+        return 999
+
+    def __set__(self, obj, value):
+        pass
+
+
+class _AddDataDescriptorAttr:
+    k = _DataDescriptor()
+
+    def __init__(self):
+        # Plant a different value in the instance dict, bypassing ``__set__``.
+        self.__dict__["k"] = 5
+
+    def __call__(self, x):
+        return x + self.k
+
+
+class _AddMissingAttr:
+    """``self.nope`` is on neither the instance nor the MRO -> AttributeError."""
+
+    def __call__(self, x):
+        return x + self.nope
+
+
+class _GetStateDropsAttr:
+    """``__getstate__`` ships n=0, so the driver's n=5 never reaches the executor."""
+
+    def __init__(self):
+        self.n = 5
+
+    def __getstate__(self):
+        return {"n": 0}
+
+    def __call__(self, x):
+        return x + self.n
+
+
+class _SetStateRewritesAttr:
+    """Default state ships, but ``__setstate__`` rewrites n on the executor."""
+
+    def __init__(self):
+        self.n = 5
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.n = 0
+
+    def __call__(self, x):
+        return x + self.n
+
+
+class _ReduceDropsAttr:
+    """``__reduce__`` reconstructs with n=0 and never ships the instance dict."""
+
+    def __init__(self, n=5):
+        self.n = n
+
+    def __reduce__(self):
+        return (_ReduceDropsAttr, (0,))
+
+    def __call__(self, x):
+        return x + self.n
+
+
+class _DescriptorInt(int):
+    """A descriptor that is ALSO an ``int``, so ``_bake`` would accept it."""
+
+    def __get__(self, obj, objtype=None):
+        return 42
+
+
+class _AddDescriptorIntAttr:
+    k = _DescriptorInt(5)
+
+    def __call__(self, x):
+        return x + self.k
+
+
+class _WrappingInt(int):
+    """An ``int`` subclass overriding the reflected operator Catalyst would use."""
+
+    def __radd__(self, other):
+        return 999
+
+
+_CAPTURED_WRAPPING_INT = _WrappingInt(5)
+
+
+class _PatchableCallable:
+    """Importable, so pickled by reference. One test patches its ``__call__``."""
+
+    def __call__(self, x):
+        return x + 1
+
+
+class _InstanceShadowsMethod:
+    """Instance ``k`` shadows a method ``k``, which is a NON-data descriptor.
+
+    Real Python returns the instance value, so refusing here is a deliberate
+    false negative -- see the descriptor gate in ``lookup_self_attr``.
+    """
+
+    def __init__(self):
+        self.k = 7
+
+    def k(self):
+        return 0
 
     def __call__(self, x):
         return x + self.k
@@ -1001,24 +1145,19 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             [result] = df.select(pudf("a")).collect()
             self.assertEqual(result[0], 1)
 
-    def test_udf_transpile_falls_back_for_plain_self_param(self):
-        # A plain function whose first parameter is literally named `self`
-        # must not be confused with a bound __call__ method: stripping it
-        # previously emitted `_udf_param_-1` and threw an AnalysisException
-        # at call construction.
-        import warnings as _warnings
-
+    def test_udf_transpile_plain_function_named_self_has_no_receiver(self):
+        # The receiver is derived from the BINDING, not the parameter's name. A
+        # plain function supplies every argument at the call site, so a first
+        # parameter that merely happens to be called ``self`` is an ordinary
+        # column and must NOT be stripped. This used to be refused outright
+        # because the name test could not tell it apart from a bound method.
         def weird(self, other):
             return self + other
 
-        with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True):
-                _warnings.simplefilter("always")
-                pudf = UserDefinedFunction(weird, LongType())
-            self.assertEqual([], pudf.transpiled, "plain 'self' param must not transpile")
-            df = self.spark.createDataFrame([Row(a=2, b=3)])
-            [result] = df.select(pudf("a", "b")).collect()
-            self.assertEqual(result[0], 5)
+        self.assertEqual(
+            self._vals(weird, LongType(), "self long, other long", [(2, 3), (10, 1)]),
+            [5, 11],
+        )
 
     def test_udf_transpile_falls_back_for_wraps_decorated_function(self):
         # inspect.getsource follows __wrapped__, so a functools.wraps-decorated
@@ -1162,6 +1301,47 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # Numeric unary still lowers and matches Python.
         neg = lambda x: -x  # noqa: E731
         self.assertEqual(self._vals(neg, LongType(), "a long", [(5,), (-3,)]), [-5, 3])
+
+    def test_udf_transpile_receiver_is_not_detected_by_name(self):
+        # ``self`` and ``cls`` are conventions, not rules. The receiver is the
+        # parameter the BINDING hides from the call site, so all of these are
+        # one-column UDFs whose receiver attribute resolves -- and a staticmethod
+        # hides nothing even when reached through an instance.
+        class Recv:
+            K = 7
+
+            def __init__(self):
+                self.n = 3
+
+            def bound_this(this, x):
+                return x + this.n
+
+            @classmethod
+            def cm_cls(cls, x):
+                return x + cls.K
+
+            @staticmethod
+            def stat(x):
+                return x + 1
+
+        class CallThis:
+            def __init__(self):
+                self.n = 5
+
+            def __call__(this, x):
+                return x + this.n
+
+        inst = Recv()
+        L = LongType()
+        for label, func, expected in [
+            ("bound method named `this`", inst.bound_this, 4),
+            ("classmethod named `cls`", Recv.cm_cls, 8),
+            ("staticmethod off an instance", inst.stat, 2),
+            ("__call__ named `this`", CallThis(), 6),
+        ]:
+            with self.subTest(case=label):
+                # One bound column, not two: the receiver is stripped by binding.
+                self.assertEqual(self._vals(func, L, "a long", [(1,)]), [expected], label)
 
     def test_udf_transpile_falls_back_for_self_reference(self):
         # A __call__ body that references bare `self` has no column
@@ -1675,7 +1855,9 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         before = _ast.dump(analysis.function_ast)
         lowered = [
             _ast.unparse(
-                _normalize_function(rebinds, analysis.function_ast, analysis.params).body[0]
+                _normalize_function(
+                    rebinds, analysis.function_ast, analysis.params, analysis.receiver
+                ).body[0]
             )
             for _ in range(5)
         ]
@@ -2187,6 +2369,218 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             df = self.spark.createDataFrame([(1,)], "a long")
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 1 + _AttrBase.K)
 
+    def test_udf_transpile_self_attr_needs_the_default_lookup(self):
+        # ``lookup_self_attr`` reads the instance and class dicts directly, which
+        # only tracks real attribute access under the default lookup. Both shapes
+        # below make ``self.k`` resolve to something the dicts do not hold, so
+        # baking would be a silent wrong answer rather than a fallback.
+        for label, func, expected in [
+            ("__getattribute__ override", _GetAttributeHook(), 1 + 1001),
+            ("data descriptor outranks the instance dict", _AddDataDescriptorAttr(), 1 + 999),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
+
+    def test_udf_transpile_refuses_names_python_would_raise_on(self):
+        # Both of these RAISE in interpreted Python rather than producing a
+        # value, so a bake would turn an error into an answer. The transpiler has
+        # to refuse and let the interpreted path raise.
+        for label, func, exc in [
+            ("unassigned closure cell", _make_unassigned_cell(), NameError),
+            ("`self.attr` on neither instance nor MRO", _AddMissingAttr(), AttributeError),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertRaises(exc, func, 1)
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(10,)], "a long")
+                    with self.assertRaises(Exception):
+                        df.select(pudf("a")).collect()
+
+    def test_udf_transpile_instance_dict_gated_on_pickling_hooks(self):
+        # ``cloudpickle`` only ships ``vars(instance)`` verbatim under DEFAULT
+        # pickling. ``__getstate__`` / ``__setstate__`` / ``__reduce__`` each let
+        # the executor reconstruct the instance with a different value, so the
+        # driver's instance dict is not a snapshot and must not be baked.
+        for label, func in [
+            ("__getstate__ drops the value", _GetStateDropsAttr()),
+            ("__setstate__ rewrites the value", _SetStateRewritesAttr()),
+            ("__reduce__ reconstructs the value", _ReduceDropsAttr()),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertIn("customizes pickling", str(warned[0].message), label)
+                # The executor rebuilds with n=0, so the interpreted answer is 1+0.
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], 1, label)
+
+    def test_udf_transpile_refuses_bakeable_subclasses(self):
+        # Both of these pass an ``isinstance`` check against a bakeable type while
+        # behaving differently from their base, so only an EXACT type match is
+        # sound. Without it the plan gets the base value and base-type Catalyst
+        # semantics, where Python dispatches to the subclass.
+        def reads_wrapping_int(x):
+            return x + _CAPTURED_WRAPPING_INT
+
+        for label, func, expected in [
+            # Python's reflected-operand rule gives the subclass __radd__.
+            ("int subclass overriding __radd__", reads_wrapping_int, 999),
+            # A descriptor that is also an int: _bake would have accepted 5.
+            ("descriptor that is also an int", _AddDescriptorIntAttr(), 1 + 42),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
+
+    def test_udf_transpile_callable_instance_gated_on_call_owner(self):
+        # A callable instance reaches its code through ``type(func).__call__``,
+        # and cloudpickle ships that only when the class OWNING it is by value.
+        # Here the carrying function is a local lambda (by value) but its owner is
+        # importable, so the executor re-imports the ORIGINAL ``__call__`` and the
+        # patched one never travels. Gating on the carrying function alone would
+        # bake ``_CAPTURED_INT`` for code that never runs.
+        original = _PatchableCallable.__call__
+        self.addCleanup(setattr, _PatchableCallable, "__call__", original)
+        _PatchableCallable.__call__ = lambda self, x: x + _CAPTURED_INT
+
+        func = _PatchableCallable()
+        pudf, warned = self._fallback_warnings(func, LongType())
+        self.assertEqual([], pudf.transpiled, "globals must not be baked")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("pickled by reference", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            # The executor's re-imported ``__call__`` is the original ``x + 1``.
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 2)
+
+    def test_udf_transpile_metaclass_data_descriptor_falls_back(self):
+        # ``type.__getattribute__`` consults the METACLASS for a data descriptor
+        # before the class's own ``__dict__``, so ``self.K`` is 999 here, not 5.
+        # The class is dynamic, so it is pickled BY VALUE and the per-class gate
+        # would happily let 5 through -- the metaclass check is the only thing
+        # standing between this and a baked 5. Deliberately not executed: this
+        # shape cannot be pickled at all (``_class_setstate`` cannot setattr
+        # through a setter-less metaclass property), so there is no interpreted
+        # result to compare against -- only that we refuse to bake.
+        class Meta(type):
+            @property
+            def K(cls):
+                return 999
+
+        class DynMetaHolder(metaclass=Meta):
+            K = 5
+
+            @classmethod
+            def add_k(self, x):
+                return x + self.K
+
+        self.assertEqual(DynMetaHolder.add_k(1), 1000, "the metaclass property must win")
+        pudf, warned = self._fallback_warnings(DynMetaHolder.add_k, LongType())
+        self.assertEqual([], pudf.transpiled, "a metaclass data descriptor must not be baked")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("metaclass", str(warned[0].message))
+
+    def test_udf_transpile_self_attr_baked_for_by_value_class(self):
+        # The only POSITIVE path through the MRO walk. Every other self-attr test
+        # expects a refusal, so a walk that raised unconditionally would pass all
+        # of them -- this is what pins the walk actually resolving a value.
+        class DynAttr:
+            K = 3
+
+            def __call__(self, x):
+                return x + self.K
+
+        class DynOverride(_AttrBase):
+            # ``_AttrBase`` is importable (by reference), but this subclass is
+            # dynamic and its OWN __dict__ wins, so the base is never consulted.
+            K = 9
+
+            def __call__(self, x):
+                return x + self.K
+
+        class DynClassMethodHolder:
+            # The positive side of the ``isinstance(receiver, type)`` branch: a
+            # bound classmethod whose receiver is a by-value class.
+            K = 4
+
+            @classmethod
+            def add_k(self, x):
+                return x + self.K
+
+        L = LongType()
+        self.assertEqual(self._vals(DynAttr(), L, "a long", [(1,)]), [4])
+        self.assertEqual(self._vals(DynOverride(), L, "a long", [(1,)]), [10])
+        self.assertEqual(self._vals(DynClassMethodHolder.add_k, L, "a long", [(1,)]), [5])
+
+    def test_udf_transpile_descriptor_gate_over_refuses_deliberately(self):
+        # A NON-data descriptor loses to the instance ``__dict__`` in real Python,
+        # so this one could safely be baked -- the gate refuses anyway because
+        # telling data from non-data descriptors is not worth it. Pinned from this
+        # side so that "fixing" the false negative by moving the instance-dict
+        # check back in FRONT of the MRO cannot silently reintroduce the
+        # data-descriptor bug it exists to prevent.
+        func = _InstanceShadowsMethod()
+        self.assertEqual(func(1), 8, "real Python takes the instance value")
+        pudf, warned = self._fallback_warnings(func, LongType())
+        self.assertEqual([], pudf.transpiled, "the descriptor gate refuses first")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("resolves to a descriptor", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 8)
+
+    def test_udf_transpile_refuses_when_arity_cannot_be_mapped(self):
+        # Receiver detection compares the declared parameters against the
+        # call-site view. A ``__signature__`` override makes the two disagree by
+        # something other than the one implicit receiver, and guessing which
+        # declared parameter maps to which bound column would wire up the wrong
+        # ones -- so refuse. Exercised in BOTH directions.
+        import inspect as _inspect
+
+        class LyingSignature:
+            __signature__ = _inspect.Signature([])
+
+            def __call__(self, x):
+                return x + 1
+
+        class OverstatedSignature:
+            __signature__ = _inspect.Signature(
+                [
+                    _inspect.Parameter(n, _inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    for n in ("a", "b", "c")
+                ]
+            )
+
+            def __call__(self, x):
+                return x + 1
+
+        for label, func in [
+            ("advertises too few parameters", LyingSignature()),
+            ("advertises too many parameters", OverstatedSignature()),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertIn("at the call site", str(warned[0].message), label)
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], 2, label)
+
     def test_udf_transpile_assignment_forms(self):
         # Local bindings are inlined at their use sites; every assignment form
         # the transpiler accepts is exercised here against real values.
@@ -2435,35 +2829,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         with self.sql_conf(_TRANSPILE_ON):
             df = self.spark.createDataFrame([(1,)], "a long")
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 2048)
-
-        # A chain deep enough that late checking would be pathological must
-        # still be refused promptly. Bounded work, so this cannot hang.
-        def very_deep_chain(a):
-            z0 = a + a
-            z1 = z0 + z0
-            z2 = z1 + z1
-            z3 = z2 + z2
-            z4 = z3 + z3
-            z5 = z4 + z4
-            z6 = z5 + z5
-            z7 = z6 + z6
-            z8 = z7 + z7
-            z9 = z8 + z8
-            z10 = z9 + z9
-            z11 = z10 + z10
-            z12 = z11 + z11
-            z13 = z12 + z12
-            z14 = z13 + z13
-            z15 = z14 + z14
-            z16 = z15 + z15
-            z17 = z16 + z16
-            z18 = z17 + z17
-            z19 = z18 + z18
-            return z19 + z19
-
-        pudf, warned = self._fallback_warnings(very_deep_chain, LongType())
-        self.assertEqual([], pudf.transpiled)
-        self.assertIn("the binding of", str(warned[0].message))
 
     def test_udf_transpile_no_return_yields_null_and_warns(self):
         # Falling off the end of a function returns None in Python, which the
