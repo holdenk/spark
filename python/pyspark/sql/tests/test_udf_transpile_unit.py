@@ -237,6 +237,61 @@ class _AddMissingAttr:
         return x + self.nope
 
 
+# The formatter must not split the next line: two lambdas sharing ONE source line
+# is precisely the shape ``inspect.getsource`` cannot disambiguate, and it is what
+# the source-versus-binding arity cross-check is tested against.
+# fmt: off
+_LINE_SHARER_A = lambda x, y: y * 2; _LINE_SHARER_B = lambda x: x + 1  # noqa: E731,E702
+# fmt: on
+
+
+def _make_dynamic_base(off):
+    """Returns a BY-VALUE class (its qualname has ``<locals>``)."""
+
+    class _DynBase:
+        K = off
+
+        def __call__(self, x):
+            return x + _CAPTURED_INT
+
+    return _DynBase
+
+
+class _ByRefHolderOverDynBase(_make_dynamic_base(5)):
+    """By-reference class inheriting ``K`` from a by-value dynamic base.
+
+    The executor re-imports this module, which re-runs the factory, so the base
+    the driver holds is never shipped however by-value it looks.
+    """
+
+    def __call__(self, x):
+        return x + self.K
+
+
+class _ByRefDerivedInheritsCall(_make_dynamic_base(5)):
+    """Same shape, but inheriting ``__call__`` (which reads a module global)."""
+
+
+class _StateInjectingAttr:
+    """``off`` is absent from the driver's instance dict but ``__setstate__`` adds it.
+
+    The hook gate must key off the hook, not off whether the attribute happens to
+    be present on the driver -- otherwise ``off`` resolves from the class.
+    """
+
+    off = 1
+
+    def __init__(self):
+        self.tag = "t"
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.off = 100
+
+    def __call__(self, x):
+        return x + self.off
+
+
 class _GetStateDropsAttr:
     """``__getstate__`` ships n=0, so the driver's n=5 never reaches the executor."""
 
@@ -2580,6 +2635,59 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(1,)], "a long")
                     self.assertEqual(df.select(pudf("a")).collect()[0][0], 2, label)
+
+    def test_udf_transpile_source_arity_must_match_the_binding(self):
+        # The receiver is the parameter the BINDING hides. Deriving it from the
+        # arity difference alone is not enough: when ``inspect.getsource`` hands
+        # back the wrong function -- two lambdas on one source line, where
+        # ``body[0]`` is the other one -- the difference is not a receiver, and
+        # treating it as one shifts every column by one position. A plain function
+        # can never have a receiver, so the two derivations must agree.
+        f = _LINE_SHARER_B
+
+        self.assertEqual(f(3), 4)
+        pudf, warned = self._fallback_warnings(f, LongType())
+        self.assertEqual([], pudf.transpiled, "a source/binding arity mismatch must not transpile")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("does not match how it is bound", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(3,)], "a long")
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 4)
+
+    def test_udf_transpile_state_injecting_hook_gates_class_attr(self):
+        # The pickling-hook gate must fire for ANY attribute once a hook is
+        # non-default, not only for ones the driver's instance dict holds: a
+        # ``__setstate__`` that INJECTS state would otherwise be answered from the
+        # class, baking the driver's value where the executor has another.
+        func = _StateInjectingAttr()
+        self.assertEqual(func(5), 6, "the driver resolves `off` from the class")
+        pudf, warned = self._fallback_warnings(func, LongType())
+        self.assertEqual([], pudf.transpiled, "injected state must not be baked")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("customizes pickling", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(5,)], "a long")
+            # ``__setstate__`` sets off=100 on the executor, so 5 + 100.
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 105)
+
+    def test_udf_transpile_by_reference_receiver_gates_by_value_base(self):
+        # A class travels only if BOTH it and the class defining the attribute are
+        # by value. These receivers are importable (by reference), so the executor
+        # re-imports them and re-runs the factory that built their base -- the
+        # by-value base the driver holds never ships. Gating only the DEFINING
+        # class would see "dynamic, therefore by value" and bake.
+        for label, func, expected in [
+            ("`self.K` from a by-value base", _ByRefHolderOverDynBase(), 1 + 5),
+            ("global via an inherited `__call__`", _ByRefDerivedInheritsCall(), 1 + _CAPTURED_INT),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                self.assertIn("by reference", str(warned[0].message), label)
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(1,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
 
     def test_udf_transpile_assignment_forms(self):
         # Local bindings are inlined at their use sites; every assignment form

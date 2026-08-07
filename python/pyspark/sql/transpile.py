@@ -317,6 +317,28 @@ def _is_data_descriptor(value: Any) -> bool:
     return hasattr(vtype, "__set__") or hasattr(vtype, "__delete__")
 
 
+def _receiver_count_from_binding(func: Callable) -> int:
+    """How many leading parameters the call protocol hides, per the OBJECT.
+
+    ``inspect.signature`` reports the call-site view, but only of the object --
+    it says nothing about whether the source we parsed is really that object's
+    body. When ``inspect.getsource`` picks up the wrong function (two lambdas on
+    one line) the arity difference is not a receiver at all, so the signature
+    figure is cross-checked against this one rather than trusted alone.
+    """
+    if inspect.ismethod(func):
+        # Bound method or bound classmethod: ``__self__`` supplies the first.
+        return 1
+    if isinstance(func, types.FunctionType):
+        # Plain function, lambda, or a ``staticmethod`` reached off an instance:
+        # a receiver is impossible, whatever the declared parameters look like.
+        return 0
+    # Callable instance: a plain function in the class dict binds the receiver, a
+    # ``staticmethod`` does not. Read it statically so the descriptor is not run.
+    call = inspect.getattr_static(type(func), "__call__", None)
+    return 1 if isinstance(call, types.FunctionType) else 0
+
+
 class _CapturedScope:
     """The values a UDF body may safely read from its enclosing scope.
 
@@ -419,11 +441,14 @@ class _CapturedScope:
                 # ``__slots__`` classes have no instance ``__dict__``.
                 instance_dict = {}
             mro = type(receiver).__mro__
-        if attr in instance_dict and not _instance_dict_is_shipped(receiver):
+        # Any non-default pickling hook can rewrite or INJECT state, so it makes
+        # the whole instance untrustworthy -- not just the attributes the driver
+        # happens to hold. A ``__setstate__`` that sets an attribute absent here
+        # would otherwise be answered from the class, silently.
+        if not _instance_dict_is_shipped(receiver):
             raise UnsupportedOperationException(
-                f"`self.{attr}` comes from the instance `__dict__`, but "
                 f"{type(receiver).__name__} customizes pickling, so the executor "
-                "may reconstruct it with a different value; falling back to "
+                f"may reconstruct it with a different `{attr}`; falling back to "
                 "interpreted Python"
             )
         # Resolve against the MRO before the instance ``__dict__``: a data
@@ -453,7 +478,18 @@ class _CapturedScope:
             )
         if attr in instance_dict:
             return instance_dict[attr]
-        # Gate the defining class on its OWN mode: cloudpickle ships only a
+        # Two gates, because a class travels only if BOTH hold. The receiver's own
+        # class first: when that is by reference the executor re-imports it and
+        # rebuilds its whole hierarchy, so a by-value base is never shipped and
+        # its attribute is whatever re-import produces.
+        receiver_class = receiver if isinstance(receiver, type) else type(receiver)
+        if not _pickled_by_value(receiver_class):
+            raise UnsupportedOperationException(
+                f"`{attr}` is reached through {receiver_class.__name__}, which "
+                "cloudpickle pickles by reference, so the executor re-imports it "
+                "and rebuilds its bases; falling back to interpreted Python"
+            )
+        # Then the defining class on its OWN mode: cloudpickle ships only a
         # by-value class's own ``__dict__`` and pickles each base separately, so a
         # by-value subclass can inherit from a by-reference base.
         if not _pickled_by_value(owner):
@@ -491,12 +527,14 @@ def _capture_scope(func: Callable) -> _CapturedScope:
     globals_travel = _pickled_by_value(fn)
     if globals_travel and instance is not None and not inspect.ismethod(func):
         # A callable instance reaches its code through ``type(func).__call__``,
-        # which cloudpickle ships only when the class OWNING it is also by value.
-        # A by-reference class is re-imported with its original ``__call__``,
-        # however the driver's was patched, so the carrying function alone is not
-        # enough here.
+        # which cloudpickle ships only when BOTH the class owning ``__call__`` and
+        # the receiver's own class are by value. A by-reference class anywhere on
+        # that path is re-imported with its original ``__call__``, however the
+        # driver's was patched, so the carrying function alone is not enough.
         owner = next((k for k in type(func).__mro__ if "__call__" in k.__dict__), None)
-        globals_travel = owner is not None and _pickled_by_value(owner)
+        globals_travel = (
+            owner is not None and _pickled_by_value(owner) and _pickled_by_value(type(func))
+        )
     # Mirror ``_function_getstate``: only the globals the code references ship.
     global_values = (
         {
@@ -1647,13 +1685,17 @@ def _analyze_func(
             "transpiler cannot tell which parameters the call site supplies"
         ]
     hidden = len(params) - visible
-    if hidden not in (0, 1):
-        # A ``__signature__`` override or an unwrappable callable: refuse rather
-        # than guess how declared parameters line up with bound columns.
+    if hidden != _receiver_count_from_binding(func):
+        # The parsed source's arity disagrees with how the object is actually
+        # bound, so the difference is NOT a receiver -- either a lying
+        # ``__signature__`` or (more likely) ``inspect.getsource`` handed us a
+        # different function than the one being called. Treating the extra
+        # parameter as a receiver would shift every column by one.
         return None, [
-            f"the UDF declares {len(params)} parameter(s) but accepts {visible} "
-            "at the call site, which the transpiler cannot map onto columns; "
-            "falling back to interpreted Python"
+            f"the UDF's source declares {len(params)} parameter(s) but the "
+            f"callable accepts {visible} at the call site, which does not match "
+            "how it is bound; the transpiler cannot map parameters onto columns "
+            "reliably, so it falls back to interpreted Python"
         ]
     # The caller matches user-supplied kwargs against these, and the user does
     # not name the receiver at the call site.
