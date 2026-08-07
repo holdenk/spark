@@ -273,6 +273,12 @@ object TranspiledUDFParameter {
    * `f(rand(1), rand(1))` owes the body two draws however identical the copies look, and an
    * argument nested inside another is evaluated again as part of the outer one.
    *
+   * Hoisting also makes a shared argument eager, which changes when an ANSI error surfaces: with
+   * `lambda x, y: (x + x) if y > 0 else 0.0` over `f(a / b, y)`, `a / b` used to be skipped on rows
+   * where the branch was not taken and now raises for every row with `b = 0`. That is the
+   * interpreted UDF's behaviour -- it computes every argument column -- so the change is towards
+   * Python, not away from it, but it is a visible difference for queries that relied on the branch.
+   *
    * The [[With]] wraps the whole option rather than each shared subtree, since one nested in a
    * conditional branch just gets inlined again -- a common expression can't be hoisted into an
    * always-evaluated Project from a branch that may not run.
@@ -315,10 +321,15 @@ object TranspiledUDFParameter {
       Nil
     } else {
       tags.groupBy(_.index).toSeq.sortBy(_._1).collect {
-        // A ref needs its definition's type, so an unresolved argument stays inline, as does a
-        // parameter some earlier rewrite left with a single tag or with disagreeing copies.
-        case (index, ps) if ps.length > 1 && ps.map(_.child).distinct.length == 1 &&
-            ps.head.child.resolved =>
+        // The tags already say which copies are one parameter, so we do not require them to be
+        // structurally equal -- analysis rewrites each copy independently, and for an argument
+        // whose seed was still unresolved (`expr("rand()")`, or SQL text) `ResolveRandomSeed` gives
+        // each one a different seed. Demanding equality there would skip the very case this exists
+        // for and leave `x == x` returning false. All we actually need is a type every use site
+        // accepts, since a ref carries the definition's dataType and nullability; when the copies
+        // disagree on that, no single ref can stand in for them, so leave the parameter inline.
+        case (index, ps) if ps.length > 1 && ps.forall(_.child.resolved) &&
+            ps.map(p => (p.child.dataType, p.child.nullable)).distinct.length == 1 =>
           index -> CommonExpressionDef(ps.head.child)
       }
     }

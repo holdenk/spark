@@ -1499,6 +1499,25 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertNotIn("transpiledpythonudf", self._optimized_plan(df).lower())
             self.assertEqual(0, self._eval_python_count(df))
 
+    def test_udf_transpile_shares_an_unseeded_random_input(self):
+        # SPARK-58626: `functions.rand()` bakes a literal seed in on the Python side, but
+        # `expr("rand()")` and SQL text arrive with the seed still unresolved, and ResolveRandomSeed
+        # then gives each spliced copy its OWN seed -- substitution runs first, so analysis rewrites
+        # the copies independently. Sharing has to key off the parameter, not the copies' shape:
+        # otherwise `x == x` compares two independent draws and returns False on every row, where
+        # the interpreted UDF sees one column and returns True.
+        from pyspark.sql.functions import expr
+
+        eq_self = lambda x: x == x  # noqa: E731
+        with self.sql_conf(_TRANSPILE_ON):
+            u = UserDefinedFunction(eq_self, BooleanType())
+            self.assertTrue(u.transpiled)
+            df = self.spark.range(20).select(u(expr("rand()")).alias("v"))
+            plan = self._optimized_plan(df)
+            # One draw, folded to `true` once Catalyst can see both uses are the same value.
+            self.assertEqual(0, plan.count("rand("))
+            self.assertTrue(all(r[0] for r in df.collect()))
+
     def test_udf_transpile_shares_per_parameter_for_identical_arguments(self):
         # SPARK-58626: two parameters are two columns to Python, so f(rand(1), rand(1)) owes the
         # body two draws even though the spliced copies are indistinguishable. Sharing is decided

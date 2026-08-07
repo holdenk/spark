@@ -440,6 +440,44 @@ class ConvertToCatalystSuite extends PlanTest {
     }
   }
 
+  test("shares a parameter whose copies were reseeded independently") {
+    transpileOn {
+      // An argument whose seed was unresolved at call time (`expr("rand()")`, or SQL text) is
+      // reseeded per copy by ResolveRandomSeed, because substitution runs first and analysis then
+      // rewrites each copy on its own. The tags still say both copies are parameter 0, so they must
+      // share: otherwise `lambda x: x == x` compares two independent draws and returns false, while
+      // the interpreted UDF sees one column and returns true.
+      val copyA = Rand(Literal(11L))
+      val copyB = Rand(Literal(22L))
+      val option = EqualTo(p(copyA, 0), p(copyB, 0))
+      val result = ConvertToCatalyst.applyExpr(
+        makeDoubleTypedTPUDF(copyA, option), parentIsUdf = false)
+      result match {
+        case With(child, Seq(exprDef)) =>
+          assert(exprDef.child == copyA, s"Expected the first copy as the def, got: $exprDef")
+          assert(child.collect { case r: CommonExpressionRef => r }.size == 2,
+            s"Expected both copies to become references, got: $child")
+          assert(!child.exists(_.isInstanceOf[Rand]), s"A draw is still inline in: $child")
+          assertNoTags(result)
+        case other => fail(s"Expected a With expression, got: $other")
+      }
+    }
+  }
+
+  test("leaves a parameter inline when its copies disagree on type") {
+    transpileOn {
+      // A ref carries the definition's dataType, so if analysis left the copies with different
+      // types no single ref can stand in for both and the parameter has to stay inline.
+      val asLong = attrA
+      val asInt = Cast(attrA, IntegerType)
+      val option = Add(Cast(p(asLong, 0), IntegerType), p(asInt, 0))
+      val result = ConvertToCatalyst.applyExpr(
+        makeTwoArgTPUDF(Seq(attrA), option), parentIsUdf = false)
+      assert(!result.exists(_.isInstanceOf[With]), s"Unexpected With for mixed types: $result")
+      assertNoTags(result)
+    }
+  }
+
   test("converts a nested transpiled UDF sitting at the root of the option") {
     transpileOn {
       // An option whose root is a substituted argument (a body that is nothing but
