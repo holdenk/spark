@@ -623,12 +623,19 @@ object SQLConf {
         "returns. A UDF that reads a free variable (a closure cell, a module global, or an " +
         "attribute of a callable instance) has that value baked into the plan as a literal. " +
         "The value is read when the UDF is first used, which is also when the interpreted " +
-        "path pickles the function, so both agree; rebinding the name after that point " +
-        "changes neither. Values are only baked when cloudpickle would have captured them " +
+        "path pickles the function, so the two agree in practice; rebinding the name after " +
+        "that point changes neither. Values are only baked when cloudpickle would have " +
+        "captured them " +
         "by value, so a UDF defined as a top-level function in an importable module keeps " +
         "reading its globals on the executor and falls back instead; writing it as a lambda " +
         "or registering the module with cloudpickle.register_pickle_by_value makes it " +
         "eligible. " +
+        "A local assignment is inlined at its read sites rather than evaluated where it " +
+        "appears, so a binding whose value could raise (for example `%`, a comparison, or " +
+        "arithmetic that would be a TypeError on the bound column's type) has to be read " +
+        "unconditionally. Reading it in the test of an `if` or a ternary counts; one that " +
+        "is never read, or is read only inside a branch or after a short-circuit, falls " +
+        "back instead of discarding or deferring an error Python raises eagerly. " +
         "This initial version only works with non-Connect Spark; Spark Connect " +
         "support is to follow. This is an *experimental* feature."
     )

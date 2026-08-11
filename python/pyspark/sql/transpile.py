@@ -55,14 +55,17 @@ function unchanged, hiding the divergence that must fall back.
 
 Capture timing: captured values are read when the UDF's ``judf`` is created, the
 same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
-snapshot cannot disagree even if a captured global is rebound in between.
+snapshot agree even if a captured global is rebound in between. The two reads are
+adjacent rather than atomic; see ``_create_judf`` in ``udf.py`` for the residual
+window and why closing it is not worth the coupling.
 """
 
 import ast
+import contextlib
 import copy
 import copyreg
 import types
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, cast
 import inspect
 import itertools
 import textwrap
@@ -213,6 +216,62 @@ _DISCARDABLE_NODES = (
     ast.BoolOp,
     ast.And,
     ast.Or,
+)
+
+
+def _may_raise(node: ast.AST) -> bool:
+    """Whether evaluating ``node`` could raise, per ``_DISCARDABLE_NODES``.
+
+    Conservative: any node type not on the allow-list counts as raising, so new
+    syntax is unsafe-by-default rather than silently discardable.
+
+    Only sound for a DISCARDED expression, and only because the allow-listed
+    operators there are same-category (`x + x`). It is deliberately not reused
+    for bindings -- see ``_binding_may_raise`` for why the same allow-list is too
+    generous once the value can be dropped before the per-category checks run.
+    """
+    return not all(isinstance(inner, _DISCARDABLE_NODES) for inner in ast.walk(node))
+
+
+# A binding that is inlined away is never lowered, so the per-input-category
+# checks in ``_category`` never run on it. That makes ``_DISCARDABLE_NODES`` too
+# generous to reuse here: it treats `+`/`-`/`*` as unable to raise, which holds
+# for a numeric column (Python does not raise on overflow, so ANSI's overflow is
+# a divergence in the safe direction) but NOT across categories -- Python raises
+# TypeError for `a + "x"` on a numeric column, and a dropped binding never
+# reaches the check that would have rejected that variant. Which categories a UDF
+# is lowered for is decided later, per combo, so the only values exempt from the
+# read obligation are the ones no operator touches.
+_BINDING_SAFE_NODES = (ast.Constant, ast.Name, ast.Load)
+
+
+def _binding_may_raise(node: ast.AST) -> bool:
+    """Whether an assignment's value must be read unconditionally to stay sound."""
+    return not all(isinstance(inner, _BINDING_SAFE_NODES) for inner in ast.walk(node))
+
+
+# Constructs that evaluate their children exactly where they appear, so a read
+# inside one is as certain as the construct itself. Everything else -- a
+# comprehension, a lambda body, a loop, a `try` -- may skip or defer evaluation,
+# and ``_ScopeNormalizer.visit`` treats it as such. The conditional CHILDREN of
+# the three entries that have them are handled by their own visitors.
+_EVALUATED_WHERE_IT_APPEARS = (
+    ast.Return,
+    ast.Expr,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Compare,
+    ast.Name,
+    ast.Constant,
+    ast.Attribute,
+    ast.Load,
+    ast.IfExp,
+    ast.BoolOp,
+    ast.If,
+    ast.operator,
+    ast.unaryop,
+    ast.boolop,
+    ast.cmpop,
 )
 
 
@@ -566,6 +625,98 @@ class _ScopeNormalizer(ast.NodeTransformer):
         self._self_param = self_param
         # name -> already-normalized expression it is bound to
         self._env: Dict[str, ast.expr] = {}
+        # Inlining moves an assignment's right-hand side to its USE sites, so a
+        # binding that is never read, or is read only inside a ternary branch or
+        # after a short-circuit, loses Python's eager evaluation of it. That is
+        # only safe when evaluating it could not have raised, so a binding whose
+        # value may raise owes an unconditional read; see _note_use.
+        self._cond_depth = 0
+        # A single assignment can bind several names (`a = b = x % 2`), and any
+        # one of them being read unconditionally evaluates the shared value, so
+        # the obligation belongs to the assignment (a group), not to each name.
+        self._raiser_group: Dict[str, int] = {}
+        self._pending_groups: Dict[int, str] = {}
+        self._next_group = 0
+
+    def _note_use(self, name: str) -> None:
+        """Record a read of ``name``, discharging its group when unconditional."""
+        group = self._raiser_group.get(name)
+        if group is None or self._cond_depth:
+            # A conditional read cannot stand in for Python's eager evaluation:
+            # the branch may not be taken, and then nothing evaluates the value.
+            return
+        # Reached whenever this value is evaluated, so Python would have raised
+        # here too. When the read is inside another binding's right-hand side
+        # that binding inherits the obligation -- splicing this tree in carries
+        # the raising node along, so normalize_body registers it as a raiser too.
+        self._pending_groups.pop(group, None)
+
+    def check_deferred_raisers(self) -> None:
+        """Refuse a body that dropped or made conditional a raising assignment."""
+        if self._pending_groups:
+            what = ", ".join(sorted(self._pending_groups.values()))
+            raise UnsupportedOperationException(
+                f"the assignment to {what} may raise but its value is never read "
+                "unconditionally, so inlining it would discard or defer an error "
+                "Python raises eagerly; falling back to interpreted Python"
+            )
+
+    @contextlib.contextmanager
+    def _deferred(self) -> Iterator[None]:
+        """Mark reads inside this block as not-certainly-evaluated."""
+        self._cond_depth += 1
+        try:
+            yield
+        finally:
+            self._cond_depth -= 1
+
+    def visit(self, node: ast.AST) -> Any:
+        # Default-deny: the three visitors below know exactly which of their
+        # children are conditional, but every OTHER construct is treated as
+        # deferring. A comprehension over an empty iterable, an uncalled lambda
+        # body, a loop body, a `try` that swallows -- each can skip evaluating a
+        # read, and enumerating them would make this guard depend on that list
+        # staying complete. The lowering rejects all of them today, so this only
+        # ever adds conservatism; without it the guard would be sound only by
+        # accident of the other allow-list.
+        if isinstance(node, _EVALUATED_WHERE_IT_APPEARS):
+            return super().visit(node)
+        with self._deferred():
+            return super().visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
+        # `body if test else orelse`: only ``test`` is certain to be evaluated.
+        # This and the two visitors below re-implement the child walk to bracket
+        # it with a depth change. No visitor in this class ever returns ``None``
+        # or a list -- the ``NodeTransformer`` idioms for removing or splicing
+        # nodes -- so replacing ``generic_visit`` cannot drop a child here, which
+        # is also what makes the ``cast`` calls safe.
+        node.test = cast(ast.expr, self.visit(node.test))
+        with self._deferred():
+            node.body = cast(ast.expr, self.visit(node.body))
+            node.orelse = cast(ast.expr, self.visit(node.orelse))
+        return node
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        # `a and b` / `a or b` short-circuit, so only the first operand is
+        # certain to be evaluated.
+        values = [cast(ast.expr, self.visit(node.values[0]))]
+        with self._deferred():
+            values.extend(cast(ast.expr, self.visit(v)) for v in node.values[1:])
+        node.values = values
+        return node
+
+    def visit_If(self, node: ast.If) -> ast.AST:
+        # A trailing `if` / `elif` / `else` lowers to a CASE, so a read inside a
+        # branch is no more certain than one in a ternary branch. Without this
+        # the generic walk would visit the branches at depth 0 and treat such a
+        # read as unconditional. `elif` nests another ``ast.If`` in ``orelse``,
+        # which just compounds the depth.
+        node.test = cast(ast.expr, self.visit(node.test))
+        with self._deferred():
+            node.body = [cast(ast.stmt, self.visit(s)) for s in node.body]
+            node.orelse = [cast(ast.stmt, self.visit(s)) for s in node.orelse]
+        return node
 
     @staticmethod
     def _bake(description: str, value: Any) -> ast.expr:
@@ -602,6 +753,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
         # later read must see the new expression. Checking parameters first would
         # turn `def f(a): a = a + 1; return a * 2` into `a * 2`.
         if node.id in self._env:
+            self._note_use(node.id)
             # Each use gets its own copy so the tree stays free of shared nodes.
             return copy.deepcopy(self._env[node.id])
         if node.id == self._self_param:
@@ -673,6 +825,17 @@ class _ScopeNormalizer(ast.NodeTransformer):
         return names, stmt.value
 
     def normalize_body(self, body: List[ast.stmt]) -> ast.stmt:
+        """Collapse ``body`` to one statement, refusing unsound assignments.
+
+        The deferred-raise check runs here rather than in the caller: this method
+        has several exits, and a guard the caller has to remember to invoke is one
+        refactor away from being silently dropped.
+        """
+        statement = self._normalize_body(body)
+        self.check_deferred_raisers()
+        return statement
+
+    def _normalize_body(self, body: List[ast.stmt]) -> ast.stmt:
         """Collapse ``body`` to one statement."""
         # Python treats a leading string expression as the docstring: it binds
         # nothing and cannot raise, so drop it and normalize what follows. Only
@@ -691,7 +854,17 @@ class _ScopeNormalizer(ast.NodeTransformer):
                 # Bound here rather than only at the end: see _check_node_budget.
                 _check_node_budget(inlined, f"the binding of {names[0]!r}")
                 for name in names:
+                    # Drop any obligation the OLD binding of this name carried:
+                    # once rebound, reads resolve to the new value and can no
+                    # longer evaluate the old one. `a = x % 0; a = 5; return a`
+                    # must still fall back, because Python evaluates `x % 0`.
+                    self._raiser_group.pop(name, None)
                     self._env[name] = inlined
+                if _binding_may_raise(inlined):
+                    self._pending_groups[self._next_group] = ", ".join(map(repr, names))
+                    for name in names:
+                        self._raiser_group[name] = self._next_group
+                    self._next_group += 1
                 if is_last:
                     return ast.Return(value=None)
                 continue
@@ -704,7 +877,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
                 # have raised: dropping e.g. `x % 0` would turn Python's
                 # ZeroDivisionError into a NULL. The caller has already warned
                 # that this function returns None either way.
-                if not all(isinstance(inner, _DISCARDABLE_NODES) for inner in ast.walk(stmt)):
+                if _may_raise(stmt):
                     raise UnsupportedOperationException(
                         "this function returns None but its final expression "
                         "could raise when evaluated, so discarding it would "

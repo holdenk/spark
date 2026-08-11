@@ -2894,6 +2894,192 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.assertRaises(Exception):
                     df.select(pudf("a")).collect()
 
+    def test_udf_transpile_assignment_raising_value_must_be_read(self):
+        # Inlining moves an assignment's right-hand side to its READ sites, so a
+        # binding that is never read -- or is read only inside a ternary branch,
+        # an `if`/`elif` branch, or after a short-circuit -- loses Python's eager
+        # evaluation of it. When that value can raise, dropping or deferring it
+        # turns an exception into a wrong answer. See ``_binding_may_raise``:
+        # only a constant or a bare name is exempt, because a dropped binding is
+        # never lowered and so never reaches the per-category checks that would
+        # have rejected e.g. `a + "x"` on a numeric column.
+        def unread_raiser(a):
+            b = a % 0  # noqa: F841
+            return 5
+
+        def ternary_branch_raiser(a):
+            b = 100 % a
+            return b if a != 0 else -1
+
+        def rebound_raiser(a):
+            # The rebinding cannot discharge the first assignment: reads resolve
+            # to 5, so nothing ever evaluates ``a % 0``.
+            b = a % 0
+            b = 5
+            return b
+
+        def trailing_bare_raiser(a):
+            b = a % 0
+            b
+
+        def if_branch_raiser(a):
+            # A trailing `if` lowers to a CASE, so this read is conditional too.
+            b = 100 % a
+            if a != 0:
+                return b
+            else:
+                return -1
+
+        def elif_branch_raiser(a):
+            b = 100 % a
+            if a > 5:
+                return b
+            elif a != 0:
+                return b + 1
+            else:
+                return -1
+
+        def transfer_unread(a):
+            # ``b``'s obligation transfers to ``c`` (the tree is spliced in), and
+            # ``c`` is never read, so the chain as a whole must fall back.
+            b = a % 2
+            c = b + 1  # noqa: F841
+            return 5
+
+        def multi_target_unread(a):
+            # One assignment, two names, neither read.
+            b = c = a % 2  # noqa: F841
+            return 5
+
+        def arithmetic_unread(a):
+            # `+` cannot raise on a numeric column but CAN across categories
+            # (`a + "x"` is a TypeError in Python), and a dropped binding never
+            # reaches the check that drops the mismatched variant.
+            b = a + 1  # noqa: F841
+            return 5
+
+        for label, func in (
+            ("unread", unread_raiser),
+            ("ternary branch", ternary_branch_raiser),
+            ("rebound", rebound_raiser),
+            ("trailing bare", trailing_bare_raiser),
+            ("if branch", if_branch_raiser),
+            ("elif branch", elif_branch_raiser),
+            ("transferred then unread", transfer_unread),
+            ("multi target unread", multi_target_unread),
+            ("arithmetic unread", arithmetic_unread),
+        ):
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, LongType())
+                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                self.assertTrue(warned, f"{label}: expected a fallback warning")
+                # Pin the REASON, so a future guard refusing these shapes for an
+                # unrelated cause cannot keep this test green.
+                self.assertIn("never read unconditionally", str(warned[0].message), label)
+
+        # Read unconditionally, so an inlined error surfaces exactly where Python
+        # raises it. These must still transpile -- the guard is about unread and
+        # conditional bindings, not about `%` itself.
+        def read_unconditionally(a):
+            b = a % 3
+            return b + 1
+
+        def chained_unconditionally(a):
+            b = a % 3
+            c = b + 1
+            return c * 2
+
+        def multi_target_one_read(a):
+            # Reading either name evaluates the shared value, so one read is
+            # enough; the obligation is per assignment, not per name.
+            b = c = a % 2  # noqa: F841
+            return c + 1
+
+        def if_test_read(a):
+            # The `if` test always runs, so a read there IS unconditional. Pins
+            # that ``visit_If`` visits ``test`` at depth 0 and does not
+            # over-refuse.
+            b = a % 3
+            if b > 1:
+                return 1
+            else:
+                return 2
+
+        for label, func, expected in (
+            ("read unconditionally", read_unconditionally, 2),
+            ("chained unconditionally", chained_unconditionally, 4),
+            ("multi target, one read", multi_target_one_read, 2),
+            ("read in if test", if_test_read, 2),
+        ):
+            with self.subTest(case=label):
+                # Analysis happens at construction, so the conf must be on for
+                # both that and the ``transpiled`` read below.
+                with self.sql_conf(_TRANSPILE_ON):
+                    pudf = UserDefinedFunction(func, LongType())
+                    self.assertNotEqual([], pudf.transpiled, f"{label} must transpile")
+                    df = self.spark.createDataFrame([(7,)], "a long")
+                    self.assertEqual(df.select(pudf("a")).collect()[0][0], expected, label)
+
+        # ``and`` / ``or`` short-circuit, so only the FIRST operand is certain to
+        # be evaluated. The pair pins the asymmetry ``visit_BoolOp`` exists for.
+        def boolop_tail_read(a):
+            b = 100 % a
+            return (a != 0) and (b > 1)
+
+        def boolop_head_read(a):
+            b = 100 % a
+            return (b > 1) and (a != 0)
+
+        with self.subTest(case="short-circuit tail"):
+            pudf, warned = self._fallback_warnings(boolop_tail_read, BooleanType())
+            self.assertEqual([], pudf.transpiled, "a read in the `and` tail is conditional")
+            self.assertIn("never read unconditionally", str(warned[0].message))
+        with self.subTest(case="short-circuit head"):
+            with self.sql_conf(_TRANSPILE_ON):
+                pudf = UserDefinedFunction(boolop_head_read, BooleanType())
+                self.assertNotEqual([], pudf.transpiled, "the head operand always runs")
+                df = self.spark.createDataFrame([(7,)], "a long")
+                self.assertEqual(df.select(pudf("a")).collect()[0][0], True)
+
+        # The point of the refusal: with the binding inlined away the UDF
+        # returned 5 where Python raises. Falling back keeps the error.
+        with self.subTest(case="dropped binding still raises"):
+            self.assertRaises(ZeroDivisionError, unread_raiser, 10)
+            with self.sql_conf(_TRANSPILE_ON):
+                pudf = UserDefinedFunction(unread_raiser, LongType())
+                df = self.spark.createDataFrame([(10,)], "a long")
+                with self.assertRaises(Exception):
+                    df.select(pudf("a")).collect()
+
+    def test_udf_transpile_lowering_uses_the_given_session(self):
+        # ``_create_judf`` builds the JVM UDF against the session it resolves
+        # with ``_getActiveSessionOrCreate``, so the lowering has to read THAT
+        # session's confs. ``_instantiatedSession`` is a different accessor and
+        # under multiple sessions need not be the same object, which would let a
+        # UDF be lowered against one session's confs and planned into another's.
+        # ``pyTranspilers`` is session-scoped, so it shows which session was
+        # consulted.
+        def plus_one(a):
+            return a + 1
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(plus_one, LongType())
+            self.assertNotEqual(
+                [],
+                pudf._build_transpiled_options(self.spark)[0],
+                "sanity: this UDF must transpile against the test session",
+            )
+
+            other = self.spark.newSession()
+            other.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "")
+            self.assertEqual(
+                [],
+                pudf._build_transpiled_options(other)[0],
+                "lowering must honour the session it was handed, not the default one",
+            )
+            # The other session's conf must not have leaked into this one.
+            self.assertNotEqual([], pudf._build_transpiled_options(self.spark)[0])
+
     def test_udf_transpile_assignment_node_budget(self):
         # Inlining duplicates a binding at each use, so a doubling chain grows
         # exponentially. A modest chain still transpiles; a deep one must fall
@@ -2947,9 +3133,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def bare_expression(x):
             x + x
 
-        def trailing_assignment(x):
-            y = x + 1  # noqa: F841
-
         def just_pass(x):
             pass
 
@@ -2958,7 +3141,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         for label, func in [
             ("bare expression", bare_expression),
-            ("trailing assignment", trailing_assignment),
             ("pass", just_pass),
             ("docstring only", docstring_only),
         ]:
@@ -2996,6 +3178,29 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             # Python raises, and falling back means the query raises too.
             self.assertRaises(ZeroDivisionError, discards_a_raise, 1)
             df = self.spark.createDataFrame([(1,)], "a long")
+            with self.assertRaises(Exception):
+                df.select(pudf("a")).collect()
+
+        # An unread BINDING is the same trap one step removed. `x + 1` cannot
+        # raise on a numeric column, but it is a TypeError in Python on a string
+        # one -- and because the binding is inlined away it never reaches the
+        # per-category check that drops the string variant, so transpiling it
+        # returned NULL for `a string` where Python raises. See
+        # ``_binding_may_raise``.
+        def trailing_assignment(x):
+            y = x + 1  # noqa: F841
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter("always")
+                pudf = UserDefinedFunction(trailing_assignment, LongType())
+            self.assertEqual([], pudf.transpiled, "an unread raising binding must fall back")
+            self.assertTrue(
+                [w for w in caught if "no return statement" in str(w.message)],
+                "expected a no-return warning even though it fell back",
+            )
+            self.assertIsNone(trailing_assignment(1))
+            df = self.spark.createDataFrame([("7",)], "a string")
             with self.assertRaises(Exception):
                 df.select(pudf("a")).collect()
 
