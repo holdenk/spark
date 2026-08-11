@@ -254,7 +254,7 @@ def _binding_may_raise(node: ast.AST) -> bool:
 # inside one is as certain as the construct itself. Everything else -- a
 # comprehension, a lambda body, a loop, a `try` -- may skip or defer evaluation,
 # and ``_ScopeNormalizer.visit`` treats it as such. The conditional CHILDREN of
-# the three entries that have them are handled by their own visitors.
+# the entries that have them are handled by their own visitors.
 _EVALUATED_WHERE_IT_APPEARS = (
     ast.Return,
     ast.Expr,
@@ -671,9 +671,9 @@ class _ScopeNormalizer(ast.NodeTransformer):
             self._cond_depth -= 1
 
     def visit(self, node: ast.AST) -> Any:
-        # Default-deny: the three visitors below know exactly which of their
-        # children are conditional, but every OTHER construct is treated as
-        # deferring. A comprehension over an empty iterable, an uncalled lambda
+        # Default-deny: the visitors below know exactly which of their children
+        # are conditional, but every OTHER construct is treated as deferring. A
+        # comprehension over an empty iterable, an uncalled lambda
         # body, a loop body, a `try` that swallows -- each can skip evaluating a
         # read, and enumerating them would make this guard depend on that list
         # staying complete. The lowering rejects all of them today, so this only
@@ -704,6 +704,19 @@ class _ScopeNormalizer(ast.NodeTransformer):
         with self._deferred():
             values.extend(cast(ast.expr, self.visit(v)) for v in node.values[1:])
         node.values = values
+        return node
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        # A chained comparison short-circuits: `a < b < c` never evaluates `c`
+        # when `a < b` is false, so only ``left`` and the FIRST comparator are
+        # certain. The lowering refuses chains outright, so omitting this would
+        # not be observable today -- but that is exactly the accidental
+        # soundness the ``visit`` override above exists to avoid.
+        node.left = cast(ast.expr, self.visit(node.left))
+        comparators = [cast(ast.expr, self.visit(node.comparators[0]))]
+        with self._deferred():
+            comparators.extend(cast(ast.expr, self.visit(c)) for c in node.comparators[1:])
+        node.comparators = comparators
         return node
 
     def visit_If(self, node: ast.If) -> ast.AST:
@@ -1874,6 +1887,18 @@ def _analyze_func(
     # not name the receiver at the call site.
     public_params = params[hidden:]
     receiver = params[0] if hidden else None
+    # Warned here rather than while lowering, because this depends only on the
+    # AST: ``_build_transpiled`` runs again for every ``judf`` and every read of
+    # the ``transpiled`` property, so warning there repeats one message for the
+    # life of the UDF. Warned even though transpilation may still fail below --
+    # a trailing expression that could raise (`def f(x): x % 0`) falls back, but
+    # the user still wants to know the function never returns a value.
+    if _returns_only_none_implicitly(function_ast.body):
+        warnings.warn(
+            f"UDF {func} has no return statement, so it always returns None "
+            "(NULL) or raises; add a `return` if that was not intended.",
+            RuntimeWarning,
+        )
     return (
         _TranspileAnalysis(
             src=src,
@@ -1899,16 +1924,6 @@ def _build_transpiled(
     ``_wrap_function``'s ``cloudpickle`` snapshot sees.
     """
     errors: List[str] = []
-    # Warn before normalizing, so a function that always returns None is
-    # reported whether or not it turns out to be transpilable. A trailing
-    # expression that could raise (`def f(x): x % 0`) falls back below, but the
-    # user still wants to know the function never returns a value.
-    if _returns_only_none_implicitly(analysis.function_ast.body):
-        warnings.warn(
-            f"UDF {func} has no return statement, so it always returns None "
-            "(NULL) or raises; add a `return` if that was not intended.",
-            RuntimeWarning,
-        )
     try:
         # Resolve free variables and inline local assignments once, up front:
         # the result is value-dependent but category-independent, so it is

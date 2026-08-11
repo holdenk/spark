@@ -3041,6 +3041,21 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 df = self.spark.createDataFrame([(7,)], "a long")
                 self.assertEqual(df.select(pudf("a")).collect()[0][0], True)
 
+        # A chained comparison short-circuits too: `a < 2 < b` skips `b` when
+        # `a < 2` is false, so ``visit_Compare`` defers everything past the first
+        # comparator. The lowering refuses chains outright, so this shape falls
+        # back either way -- the assertion on the REASON is what pins that the
+        # read guard catches it, rather than leaving it sound by accident. For
+        # the same reason there is no transpiling counterpart to assert here.
+        def chained_compare_tail_read(a):
+            b = 100 % a
+            return a < 2 < b
+
+        with self.subTest(case="chained comparison tail"):
+            pudf, warned = self._fallback_warnings(chained_compare_tail_read, BooleanType())
+            self.assertEqual([], pudf.transpiled, "a read past the first comparator is conditional")
+            self.assertIn("never read unconditionally", str(warned[0].message))
+
         # The point of the refusal: with the binding inlined away the UDF
         # returned 5 where Python raises. Falling back keeps the error.
         with self.subTest(case="dropped binding still raises"):

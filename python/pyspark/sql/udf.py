@@ -345,14 +345,15 @@ class UserDefinedFunction:
             options, errors, input_categories = _build_transpiled(
                 session, self.func, self._transpile_analysis
             )
-            if not options:
+            if not options and errors:
                 # This UDF validated at construction, so a refusal here means the
                 # captured values changed since (a cell rebound to something
                 # unbakeable, say). Warn rather than fall back mutely: every other
                 # fallback path tells the user, and a silent one looks like the
-                # transpiler simply chose not to fire.
-                detail = f": {errors}" if errors else ""
-                warnings.warn(f"Unable to transpile UDF {self.func}{detail}")
+                # transpiler simply chose not to fire. No errors means no
+                # transpiler was configured for THIS session, which is a
+                # deliberate setting rather than something to warn about.
+                warnings.warn(f"Unable to transpile UDF {self.func}: {errors}")
             return options, input_categories
         except Exception as e:
             # Same contract as construction: never break a working UDF.
