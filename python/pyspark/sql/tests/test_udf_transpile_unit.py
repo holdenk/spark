@@ -1448,20 +1448,21 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertIn("_common_expr", self._optimized_plan(mod_df))
             self.assertEqual(expected, [r[0] for r in mod_df.collect()])
 
-    def test_udf_transpile_does_not_force_single_use_input_in_a_branch(self):
-        # SPARK-58626, KNOWN GAP -- not fixed by input sharing, and not introduced by it.
+    def test_udf_transpile_optimizer_falls_back_for_single_use_input_in_a_branch(self):
+        # SPARK-58626: a nondeterministic argument used exactly once inside a conditional branch
+        # stays inline, so it would be drawn only on the rows that take the branch and drift from
+        # the Python UDF (which evaluates every argument column once per row). Rather than emit
+        # that drift, ConvertToCatalyst falls back at optimization time to interpreted Python
+        # (distinct from the build-time refusal the other `..._falls_back_...` tests assert: here
+        # the UDF still transpiles). A `With` definition cannot close the gap --
+        # RewriteWithExpression inlines any definition holding a single ref -- so a real fix needs a
+        # mechanism other than `With` and is future work.
         #
-        # Sharing only gives a definition to a parameter used more than once. A parameter used
-        # exactly once stays inline, so when that single use sits in a conditional branch the
-        # argument is evaluated only on the rows that take the branch. With `a if b > 0.5 else 0.0`
-        # over f(rand(1), rand(1)), `a`'s draw advances only on rows where `b`'s test passed, so
-        # the transpiled result includes non-zero values <= 0.5 that the interpreted UDF (which
-        # computes both argument columns every row, in lockstep) can never return.
-        #
-        # A definition would not close it: RewriteWithExpression inlines any definition holding a
-        # single ref, so forcing pre-evaluation needs a mechanism other than `With`. This test
-        # therefore pins the mechanism -- that `b` is shared and `a` is not -- rather than the
-        # divergent values, so it starts failing if someone thinks they have fixed this.
+        # `a if b > 0.5 else 0.0` over f(rand(1), rand(1)): `b` is repeated by the null-guard
+        # lowering (so it would be shared), but `a` is used once, only in the branch. With equal
+        # seeds a == b every row, so the interpreted UDF returns 0.0 (b <= 0.5) or a == b > 0.5 --
+        # never a non-zero value <= 0.5. The old transpiled drift produced exactly those; falling
+        # back restores the invariant.
         from pyspark.sql.functions import rand
 
         pick = lambda a, b: a if b > 0.5 else 0.0  # noqa: E731
@@ -1469,13 +1470,90 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             u = UserDefinedFunction(pick, DoubleType())
             self.assertTrue(u.transpiled)
             df = self.spark.range(400).select(u(rand(1), rand(1)).alias("v"))
-            plan = self._optimized_plan(df)
-            # Two draws, one per parameter, and only the repeated one is pre-evaluated.
-            self.assertEqual(2, plan.count("rand("))
-            self.assertIn("_common_expr", plan)
-            # `a` is still evaluated inside the branch, so its draw can disagree with `b`'s.
+            # Fell back to interpreted Python: an EvalPython runs and no shared option was emitted.
+            # (A stripped-away TranspiledPythonUDF alone proves nothing -- ConvertToCatalyst removes
+            # it whether it transpiled or fell back -- so the EvalPython count is the load-bearing
+            # check and the absent `_common_expr` confirms no transpiled option survived.)
+            self.assertGreater(self._eval_python_count(df), 0)
+            self.assertNotIn("_common_expr", self._optimized_plan(df))
+            # No drift: every non-zero result is > 0.5 (a == b > 0.5 on the branch-taken rows).
             vals = [r[0] for r in df.collect()]
             self.assertTrue(any(v != 0.0 for v in vals), vals[:5])
+            self.assertTrue(
+                all(v == 0.0 or v > 0.5 for v in vals),
+                [v for v in vals if 0.0 < v <= 0.5][:5],
+            )
+
+    def test_udf_transpile_optimizer_falls_back_when_call_sits_in_a_branch(self):
+        # SPARK-58626: when the UDF call itself sits in a conditional branch, the argument is
+        # evaluated only on branch-taken rows, while the interpreted UDF (hoisted out by
+        # ExtractPythonUDFs) draws every row -- so it drifts. This holds whether the body uses the
+        # input once or repeatedly (a repeated one would also have its sharing `With` inlined back
+        # into the branch). ConvertToCatalyst tracks the branch context and falls back to
+        # interpreted Python for both; a real fix is future work. Outside a branch each transpiles.
+        from pyspark.sql.functions import col, lit, rand, when
+
+        twice = lambda x: x + x  # noqa: E731
+        once = lambda x: x + 1.0  # noqa: E731
+        with self.sql_conf(_TRANSPILE_ON):
+            u_twice = UserDefinedFunction(twice, DoubleType())
+            u_once = UserDefinedFunction(once, DoubleType())
+            self.assertTrue(u_twice.transpiled and u_once.transpiled)
+
+            # Both, called in a `when` branch -> fall back to interpreted Python, and no drift: the
+            # in-branch draw stays in lockstep with an out-of-branch `rand(1)` of the same seed, so
+            # the body's result matches recomputing it from that column. The old drift broke this.
+            for u, expected in ((u_twice, lambda r: 2.0 * r), (u_once, lambda r: r + 1.0)):
+                df = self.spark.range(200).select(
+                    when(col("id") % 2 == 0, u(rand(1))).otherwise(lit(0.0)).alias("v"),
+                    rand(1).alias("r"),
+                    (col("id") % 2 == 0).alias("taken"),
+                )
+                self.assertGreater(self._eval_python_count(df), 0)
+                self.assertNotIn("_common_expr", self._optimized_plan(df))
+                rows = df.collect()
+                self.assertTrue(any(row["taken"] for row in rows))
+                for row in rows:
+                    if row["taken"]:
+                        self.assertEqual(row["v"], expected(row["r"]))
+
+            # Outside any branch: the repeated one shares, the single-use one stays inline; neither
+            # falls back to Python.
+            shared = self.spark.range(50).select(u_twice(rand(1)).alias("v"))
+            self.assertIn("_common_expr", self._optimized_plan(shared))
+            self.assertEqual(0, self._eval_python_count(shared))
+            inline = self.spark.range(50).select(u_once(rand(1)).alias("v"))
+            self.assertEqual(0, self._eval_python_count(inline))
+
+    def test_udf_transpile_optimizer_falls_back_for_call_in_short_circuit_operand(self):
+        # SPARK-58626: `&`/`|` (Column `and`/`or`) short-circuit their right operand but are not
+        # ConditionalExpressions. A transpiled call with a single-use nondeterministic input in that
+        # operand is evaluated only when the left permits, so it drifts from the interpreted UDF
+        # (drawn every row) -- ConvertToCatalyst tracks the short-circuit and falls back. In the
+        # always-evaluated left operand the same call is safe and still transpiles.
+        #
+        # (A body-level `and` between two comparisons does NOT need this: the transpiler's null
+        # guards repeat each comparison operand, so a nondeterministic one is shared into an
+        # always-run Project and never drifts. The short-circuit only bites a genuinely single-use
+        # input, which is why the body here uses its argument once.)
+        from pyspark.sql.functions import col, rand
+
+        once = lambda x: x + 1.0  # noqa: E731
+        with self.sql_conf(_TRANSPILE_ON):
+            u = UserDefinedFunction(once, DoubleType())
+            self.assertTrue(u.transpiled)
+
+            # Call in the short-circuit (right) operand of `&` -> falls back to interpreted Python.
+            right = self.spark.range(200).select(
+                ((col("id") % 2 == 0) & (u(rand(1)) > 0.5)).alias("v")
+            )
+            self.assertGreater(self._eval_python_count(right), 0)
+
+            # Call in the always-evaluated (left) operand -> still transpiles, no fallback.
+            left = self.spark.range(200).select(
+                ((u(rand(1)) > 0.5) & (col("id") % 2 == 0)).alias("v")
+            )
+            self.assertEqual(0, self._eval_python_count(left))
 
     def test_udf_transpile_lowers_a_nested_transpiled_call(self):
         # A transpiled call feeding another lowers all the way: no TranspiledPythonUDF survives the

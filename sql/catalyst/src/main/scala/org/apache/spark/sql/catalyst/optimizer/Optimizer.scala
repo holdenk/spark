@@ -1037,13 +1037,23 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
     // here could otherwise escape and reach execution un-stripped.
     plan.transformDownWithSubqueriesAndPruning(
       _.containsPattern(TRANSPILED_PYTHON_UDF), ruleId) {
-      case p => p.transformExpressionsWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
-        case s: TranspiledPythonUDF => applyExpr(s, parentIsUdf = false)
+      // Drive the walk from each top-level expression rather than jumping straight to the
+      // TranspiledPythonUDF nodes, so applyExpr can track whether it has descended into a
+      // conditional branch on the way down -- a transpiled UDF under a branch may fall back.
+      case p => p.mapExpressions { e =>
+        if (e.containsPattern(TRANSPILED_PYTHON_UDF)) {
+          applyExpr(e, parentIsUdf = false, inConditionalBranch = false)
+        } else {
+          e
+        }
       }
     }
   }
 
-  def applyExpr(expression: Expression, parentIsUdf: Boolean = false): Expression = {
+  def applyExpr(
+      expression: Expression,
+      parentIsUdf: Boolean = false,
+      inConditionalBranch: Boolean = false): Expression = {
     expression match {
       case s: TranspiledPythonUDF =>
         // We _shouldn't_ have these nodes if ANSI is not enabled or transpilation is disabled
@@ -1053,12 +1063,12 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
             log"${MDC(LogKeys.CONFIG, SQLConf.ANSI_ENABLED.key)} is disabled. The transpiler " +
             log"targets ANSI semantics and refuses to rewrite plans under non-ANSI mode. " +
             log"Enable ANSI or disable transpilation to silence this warning.")
-          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true))
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true, inConditionalBranch))
         } else if (!conf.getConf(SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS)) {
           logWarning(log"Skipping Python UDF transpilation: " +
             log"${MDC(LogKeys.CONFIG, SQLConf.ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS.key)} " +
             log"is disabled but we still got TranspiledPythonUDFs in our plan.")
-          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true))
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true, inConditionalBranch))
         } else if (!parentIsUdf || !s.hasOnlyPythonUDFInputs) {
           // Walk the full list of transpiled options and pick the first one,
           // falling back to the original Python UDF if none are available.
@@ -1074,35 +1084,57 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
           // schema.
           s.transpiledOptions.headOption match {
             case None =>
-              s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true))
+              s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true, inConditionalBranch))
             case Some(catalystExpr) =>
               // A parameter used many times in the body (null guards, sign handling, both branches
               // of a conditional, ...) was spliced in once per use, but the UDF this replaces
               // evaluates each argument once, so give it a single evaluation first.
               val shared = TranspiledUDFParameter.shareTaggedParameters(catalystExpr)
-              // Recurse on the option itself, not just its children: an option's root can be a
-              // substituted argument (a body that is nothing but `_udf_param_N`), and if that
-              // argument is a TranspiledPythonUDF then mapChildren walks straight past the node
-              // that needs converting and leaves an Unevaluable behind -- this rule is the only one
-              // that strips them. The built-in transpiler casts every option to the UDF's return
-              // type, so its roots are always Casts and it cannot hit this; a custom transpiler,
-              // whose contract is only that the option's dataType already matches, can. Recursing
-              // from the top also lets the option's root decide whether its children see a UDF
-              // parent, rather than assuming they don't, which preserves an inner UDF's pipeline.
-              applyExpr(shared, parentIsUdf = false)
+              if (TranspiledUDFParameter.hasUnsupportedNondeterministicInput(
+                    catalystExpr, shared, inConditionalBranch)) {
+                // A per-row nondeterministic argument we can't pin to one evaluation per row (a
+                // single use in a body branch, a shared input under an enclosing branch, or a
+                // repeated input in an aggregating option) would silently drift from the Python
+                // UDF. Fall back to interpreted execution, which is always correct; a transpiling
+                // fix for these shapes is future work.
+                s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true, inConditionalBranch))
+              } else {
+                // Recurse on the option itself, not just its children: an option's root can be a
+                // substituted argument (a body that is nothing but `_udf_param_N`), and if that
+                // argument is a TranspiledPythonUDF then mapChildren walks straight past the node
+                // that needs converting and leaves an Unevaluable behind -- this rule is the only
+                // one that strips them. The built-in transpiler casts every option to the UDF's
+                // return type, so its roots are always Casts and it cannot hit this; a custom
+                // transpiler, whose contract is only that the option's dataType already matches,
+                // can. Recursing from the top also lets the option's root decide whether its
+                // children see a UDF parent, rather than assuming they don't, which preserves an
+                // inner UDF's pipeline.
+                applyExpr(shared, parentIsUdf = false, inConditionalBranch)
+              }
           }
         } else {
           // We should avoid converting a UDF node where that could break pipelining.
           // For example: (UDF -> UDF -> UDF) is often cheaper than UDF -> Catalyst -> UDF.
-          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true))
+          s.pythonUDFExpr.mapChildren(applyExpr(_, parentIsUdf = true, inConditionalBranch))
         }
       case _ =>
-        // Not a TranspiledPythonUDF: recurse down, telling the children whether
-        // this node is itself a scalar Python UDF so a transpiled child can
-        // preserve the UDF batch pipeline (e.g. an outer UDF that could not be
-        // transpiled wrapping one that could).
-        expression.mapChildren(
-          applyExpr(_, parentIsUdf = isScalarPythonUDF(expression)))
+        // Not a TranspiledPythonUDF: recurse down, threading two things to each child.
+        //  - Whether this node is itself a scalar Python UDF, so a transpiled child can preserve
+        //    the UDF batch pipeline (e.g. an outer UDF that could not be transpiled wrapping one
+        //    that could).
+        //  - Whether the child sits in a position that may be skipped at runtime -- a conditional
+        //    branch or an `and`/`or` short-circuit operand (see conditionallyEvaluatedChildren). A
+        //    transpiled UDF reached through one may carry a nondeterministic input that cannot be
+        //    shared without drifting, so it must know to fall back (see
+        //    hasUnsupportedNondeterministicInput). Once set, the flag stays set for all below.
+        val branchChildren = TranspiledUDFParameter.conditionallyEvaluatedChildren(expression)
+        val childParentIsUdf = isScalarPythonUDF(expression)
+        expression.mapChildren { child =>
+          applyExpr(
+            child,
+            parentIsUdf = childParentIsUdf,
+            inConditionalBranch = inConditionalBranch || branchChildren.exists(_.eq(child)))
+        }
     }
   }
 }

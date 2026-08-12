@@ -158,12 +158,10 @@ class ConvertToCatalystSuite extends PlanTest {
   }
 
   test("apply(plan) reaches TranspiledPythonUDF nodes below the root") {
-    // Regression test for the traversal bug where ``plan.mapExpressions`` only
-    // walks expressions on the root plan node. With that bug, a TPUDF inside a
-    // Filter (or any non-root node) would survive the optimizer rule as an
-    // ``Unevaluable`` expression and crash at execution. The fix uses
-    // ``transformAllExpressionsWithPruning`` which descends through child
-    // plans; this test pins that contract.
+    // A TPUDF in a non-root node (here a Filter condition) must still be converted; if it were
+    // left behind it would reach execution as an ``Unevaluable`` and crash. ``apply`` descends the
+    // plan (and its subqueries) with ``transformDownWithSubqueriesAndPruning`` and walks each
+    // node's expressions with ``mapExpressions``, so this pins that non-root nodes are reached.
     transpileOn {
       val attrB = $"b".long
       val relation = LocalRelation(attrA, attrB)
@@ -408,6 +406,119 @@ class ConvertToCatalystSuite extends PlanTest {
       val result = ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false)
       assert(result == catalystAgg, s"Expected the option inline and untagged, got: $result")
       assertNoTags(result)
+    }
+  }
+
+  test("falls back to the Python UDF for a single-use nondeterministic input in a branch") {
+    transpileOn {
+      // A body like `x if c else 0.0` whose condition `c` does not involve the draw (here it tests
+      // an unrelated column): the single use of `rand()` sits only in the then-branch, so it would
+      // advance only on rows the branch takes -- a value the interpreted UDF cannot produce.
+      // Detected, so we fall back rather than emit the drift.
+      val arg = Rand(Literal(1L))
+      val option = If(GreaterThan(attrA, Literal(0L)), p(arg, 0), Literal(0.0))
+      val tpudf = makeDoubleTypedTPUDF(arg, option)
+      val result = ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false)
+      assert(result == tpudf.pythonUDFExpr, s"Expected the interpreted Python UDF, got: $result")
+    }
+  }
+
+  test("falls back to the Python UDF when a shared nondeterministic input sits under a branch") {
+    transpileOn {
+      // `when(c, udf(rand()))` with a body that uses its argument twice: the draw would be shared,
+      // but the hoisting `With` lands in the enclosing branch and RewriteWithExpression re-inlines
+      // it, so the shared copies drift. Under a branch we fall back; not under one we still share.
+      val arg = Rand(Literal(1L))
+      val option = Add(p(arg, 0), p(arg, 0))
+      val tpudf = makeDoubleTypedTPUDF(arg, option)
+      val underBranch =
+        ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false, inConditionalBranch = true)
+      assert(underBranch == tpudf.pythonUDFExpr,
+        s"Expected the interpreted Python UDF under a branch, got: $underBranch")
+      val notUnderBranch = ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false)
+      assert(notUnderBranch.isInstanceOf[With],
+        s"Expected sharing when not under a branch, got: $notUnderBranch")
+    }
+  }
+
+  test("falls back for a repeated nondeterministic input in an aggregating option") {
+    transpileOn {
+      // A grouped-agg UDF whose body uses a nondeterministic argument twice. `With` cannot share
+      // under an AggregateExpression, so the repeated draw would drift; fall back instead. Contrast
+      // with the deterministic-argument aggregating test above, which still transpiles inline.
+      val arg = Rand(Literal(1L))
+      val pyAgg = makePyUDAF(arg).toAggregateExpression()
+      val catalystAgg = Count(Seq(arg, arg)).toAggregateExpression()
+      val taggedAgg = catalystAgg.transformUp { case e if e == arg => p(arg, 0) }
+      val tpudf = TranspiledPythonUDF("agg", pyAgg, List(taggedAgg))
+      val result = ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false)
+      assert(result == pyAgg, s"Expected the interpreted PythonUDAF aggregate, got: $result")
+    }
+  }
+
+  test("falls back for a single-use nondeterministic input only when the call is under a branch") {
+    transpileOn {
+      // The draw is used once and outside any branch of the body. Not under a branch it is safe
+      // (one draw per row, matching the interpreted UDF). Under one, the interpreted UDF -- hoisted
+      // out by ExtractPythonUDFs -- still draws every row while the inline option draws only on
+      // branch-taken rows, so it drifts and must fall back. This is the case a repeated-only guard
+      // would miss.
+      val arg = Rand(Literal(1L))
+      val tpudf = makeDoubleTypedTPUDF(arg, Add(p(arg, 0), Literal(1.0)))
+      assert(!ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false).isInstanceOf[PythonUDF],
+        "Expected transpilation when not under a branch")
+      assert(
+        ConvertToCatalyst.applyExpr(tpudf, parentIsUdf = false, inConditionalBranch = true) ==
+          tpudf.pythonUDFExpr,
+        "Expected the interpreted Python UDF when the call is under a branch")
+      // Control: only nondeterminism triggers the fallback. A deterministic input under a branch
+      // still transpiles -- otherwise a dropped nondeterminism check would silently disable
+      // transpilation for every branch.
+      val detTpudf = makeDoubleTypedTPUDF(attrA, Add(p(attrA, 0), Literal(1.0)))
+      assert(
+        !ConvertToCatalyst.applyExpr(detTpudf, parentIsUdf = false, inConditionalBranch = true)
+          .isInstanceOf[PythonUDF],
+        "Expected transpilation for a deterministic input under a branch")
+    }
+  }
+
+  test("falls back for a nondeterministic input in a short-circuit and/or operand") {
+    transpileOn {
+      // `and`/`or` are not ConditionalExpressions but short-circuit their right operand, and the
+      // transpiler emits them for Python `and`/`or`. A draw in the right operand is evaluated only
+      // when the left permits, so it drifts and must fall back; in the always-run left operand
+      // the same single draw is safe.
+      val arg = Rand(Literal(1L))
+      val inRight = makeTwoArgTPUDF(Seq(arg),
+        And(GreaterThan(attrA, Literal(0L)), GreaterThan(p(arg, 0), Literal(0.5))), BooleanType)
+      assert(ConvertToCatalyst.applyExpr(inRight, parentIsUdf = false) == inRight.pythonUDFExpr,
+        "Expected fallback for a draw in the short-circuit (right) operand")
+      val inLeft = makeTwoArgTPUDF(Seq(arg),
+        And(GreaterThan(p(arg, 0), Literal(0.5)), GreaterThan(attrA, Literal(0L))), BooleanType)
+      assert(!ConvertToCatalyst.applyExpr(inLeft, parentIsUdf = false).isInstanceOf[PythonUDF],
+        "Expected transpilation for a draw in the always-evaluated (left) operand")
+    }
+  }
+
+  test("apply keeps a transpilable UDF Python when wrapped by a non-transpiled Python UDF") {
+    // The walk starts at the top expression and threads parentIsUdf down, so a transpilable UDF
+    // whose inputs are all plain Python UDFs and which is itself an argument to a non-transpiled
+    // Python UDF stays Python to preserve the batch pipeline, rather than being converted and
+    // splitting the chain Python -> Catalyst -> Python. Exercised through apply, which the direct
+    // applyExpr tests bypass.
+    transpileOn {
+      val plain = makePyUDF(attrA)
+      val midPy = makePyUDF(plain)
+      val midTPUDF = makeTPUDF(midPy, Add(plain, Literal(4L)))
+      assert(midTPUDF.hasOnlyPythonUDFInputs)
+      val outerPy = makePyUDF(midTPUDF)
+      val optimized = ConvertToCatalyst(Project(Seq(Alias(outerPy, "v")()), LocalRelation(attrA)))
+      val exprs = optimized.flatMap(_.expressions)
+      assert(!exprs.exists(_.exists(_.isInstanceOf[TranspiledPythonUDF])),
+        s"TranspiledPythonUDF survived: $optimized")
+      // Three Python UDFs remain (outer, mid, plain); the mid was not converted to its Add option.
+      assert(exprs.map(_.collect { case u: PythonUDF => u }.size).sum == 3,
+        s"Expected the mid UDF to stay Python (3 PythonUDFs), got: $optimized")
     }
   }
 

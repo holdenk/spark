@@ -34,6 +34,29 @@ UDF's parameters (e.g. ``def f(a: int, b: str)``) pins each category and
 keeps the option matrix small; prefer doing so. To bound plan growth,
 functions with more than three untyped parameters only emit the
 all-numeric and all-string variants.
+
+A parameter the transpiled body uses more than once is evaluated a single
+time -- projected once below the operator and referenced -- because the
+Python eval operator it replaces computes one column per argument. A side
+effect is that such a repeated argument becomes *eager*: with
+``lambda x, y: (x + x) if y > 0 else 0.0`` over ``f(a / b, y)``, ``a / b``
+used to be skipped on the rows where the branch was not taken and now
+raises for every row with ``b = 0``. This moves toward the interpreted
+UDF's behaviour -- it computes every argument column regardless of which
+branch runs -- but it is a visible difference for a query that leaned on
+the branch to guard an error. (An argument used exactly once outside any
+branch stays inline and is still evaluated once per row.)
+
+A few shapes cannot be given a single per-row evaluation this way: a per-row
+nondeterministic argument left inline in a conditional branch or ``and``/``or``
+short-circuit operand, a nondeterministic argument when the UDF call itself
+sits in such a position, or a repeated nondeterministic argument in a
+grouped-aggregate UDF. In each the transpiled draw would diverge from the
+interpreted UDF (which evaluates every argument column once per row) -- by
+advancing only on the rows a branch takes, or by drawing independently on
+each repeated use. Rather than emit that drift, the call falls back to
+interpreted Python execution. See the nondeterminism notes on
+``TranspiledUDFParameter.shareTaggedParameters`` in ``PythonUDF.scala``.
 """
 
 import ast

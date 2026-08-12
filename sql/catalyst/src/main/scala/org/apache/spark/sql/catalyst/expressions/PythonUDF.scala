@@ -283,55 +283,41 @@ object TranspiledUDFParameter {
    * conditional branch just gets inlined again -- a common expression can't be hoisted into an
    * always-evaluated Project from a branch that may not run.
    *
-   * That last point leaves two gaps, both of them a nondeterministic argument evaluated lazily
-   * instead of once per row. Neither is introduced here and neither is closed here:
+   * That last point, plus the aggregate guard above, leaves three shapes where a per-row
+   * nondeterministic argument cannot be pinned to one evaluation per row with `With` alone:
    *
    *  - A parameter used exactly *once* stays inline, so when that use sits in a conditional branch
-   *    the argument is only evaluated on the rows taking the branch. `lambda a, b: a if b > 0.5
-   *    else 0.0` over `f(rand(1), rand(1))` then returns values the interpreted UDF cannot, since
-   *    `a`'s draw advances only on the rows where `b`'s test passed. A definition would not fix it:
-   *    `RewriteWithExpression` inlines any definition holding a single ref, so forcing this one to
-   *    pre-evaluate needs a mechanism other than `With`.
-   *  - When the UDF call itself sits in a conditional branch (`when(c, udf(rand()))`) the `With`
-   *    lands in that branch and is inlined for the same reason, so even shared copies drift.
+   *    the argument is only evaluated on the rows taking the branch (`lambda a, b: a if b > 0.5
+   *    else 0.0` over `f(rand(1), rand(1))`: `a`'s draw advances only on rows where `b` passed).
+   *    A definition would not fix it -- `RewriteWithExpression` inlines any definition holding a
+   *    single ref, so forcing pre-evaluation needs a mechanism other than `With`.
+   *  - When the UDF call itself sits in a conditional branch (`when(c, udf(rand()))`) the argument
+   *    is likewise evaluated only on branch-taken rows, where the interpreted UDF (hoisted by
+   *    `ExtractPythonUDFs`) computes it for every row; and a `With` hoisted there is inlined back
+   *    into the branch, so even shared copies drift.
+   *  - An aggregating option shares nothing (the guard above), so a repeated nondeterministic
+   *    argument there keeps drifting.
    *
-   * See the nondeterminism TODO in `RewriteWithExpression`.
+   * "Conditional branch" here also covers the short-circuited right operand of `and` / `or`, which
+   * the transpiler emits and which is skipped at runtime just like a `when` branch.
+   *
+   * Rather than emit a silently-drifting option, `ConvertToCatalyst` detects these shapes via
+   * [[hasUnsupportedNondeterministicInput]] and falls back to the interpreted Python UDF, which is
+   * always correct. Closing them properly -- a single-evaluation mechanism that does not rely on
+   * `With`, and a Project-below-aggregate hoist -- is future work. See also the nondeterminism TODO
+   * in `RewriteWithExpression`.
    */
   def shareTaggedParameters(option: Expression): Expression = {
-    // Stop at a nested TranspiledPythonUDF: its options carry tags for their own call's parameters,
-    // which are handled when ConvertToCatalyst recurses into it, and whose indexes would otherwise
-    // collide with ours.
-    def tagsOf(e: Expression): Seq[TranspiledUDFParameter] = e match {
-      case p: TranspiledUDFParameter => Seq(p)
-      case _: TranspiledPythonUDF => Nil
-      case _ => e.children.flatMap(tagsOf)
-    }
     val tags = tagsOf(option)
     if (tags.isEmpty) {
       return option
     }
-    // `With` forbids an AggregateExpression in its child from referencing a common expression
-    // defined in the same scope, so an aggregating option -- a transpiled grouped-agg UDF -- keeps
-    // its inputs inline. Deliberately broader than the restriction needs, in two ways: only a
-    // shared argument *under* the aggregate trips it, and unlike the walks around it this looks
-    // inside a nested call too. The cost is that an aggregating option keeps the pre-existing drift
-    // for a repeated nondeterministic argument; the benefit is staying well clear of `With`'s
-    // assert, which would fail the query outright rather than skew a value.
-    val shared = if (option.exists(_.isInstanceOf[AggregateExpression])) {
-      Nil
-    } else {
-      tags.groupBy(_.index).toSeq.sortBy(_._1).collect {
-        // The tags already say which copies are one parameter, so we do not require them to be
-        // structurally equal -- analysis rewrites each copy independently, and for an argument
-        // whose seed was still unresolved (`expr("rand()")`, or SQL text) `ResolveRandomSeed` gives
-        // each one a different seed. Demanding equality there would skip the very case this exists
-        // for and leave `x == x` returning false. All we actually need is a type every use site
-        // accepts, since a ref carries the definition's dataType and nullability; when the copies
-        // disagree on that, no single ref can stand in for them, so leave the parameter inline.
-        case (index, ps) if ps.length > 1 && ps.forall(_.child.resolved) &&
-            ps.map(p => (p.child.dataType, p.child.nullable)).distinct.length == 1 =>
-          index -> CommonExpressionDef(ps.head.child)
-      }
+    // Give each shareable index (see sharedIndices for the criteria and the aggregate/type
+    // exclusions) one definition holding the raw argument; the copies that belong together are the
+    // tags with that index.
+    val byIndex = tags.groupBy(_.index)
+    val shared = sharedIndices(option).toSeq.sorted.map { index =>
+      index -> CommonExpressionDef(byIndex(index).head.child)
     }
     val refs = shared.map { case (index, d) => index -> new CommonExpressionRef(d) }.toMap
     // Unwrap every tag on the way out, shared or not -- the marker has no business surviving into
@@ -343,6 +329,106 @@ object TranspiledUDFParameter {
       case _ => e.mapChildren(unwrap)
     }
     if (shared.isEmpty) unwrap(option) else With(unwrap(option), shared.map(_._2))
+  }
+
+  /**
+   * Whether `option` carries a per-row nondeterministic argument that its shared form (from
+   * [[shareTaggedParameters]]) cannot pin to one evaluation per row, so `ConvertToCatalyst` should
+   * fall back to the interpreted Python UDF instead of emitting a silently-drifting option. The
+   * shapes, all documented on [[shareTaggedParameters]]:
+   *
+   *  - a nondeterministic argument left inline in a position that may be skipped at runtime -- a
+   *    conditional branch or `and`/`or` short-circuit operand of the body, or anywhere in the
+   *    option when the whole call sits in such a position (`inConditionalBranch`). Found by walking
+   *    `shared` seeded with `inConditionalBranch`: every shared copy is a [[CommonExpressionRef]]
+   *    by now -- a deterministic leaf -- so anything still nondeterministic under a skippable
+   *    position is a genuinely inline argument, whether used once or repeated;
+   *  - a repeated nondeterministic argument that sharing left inline anyway -- an aggregating
+   *    option (which shares nothing) or, in principle, copies unresolved or disagreeing on type.
+   *
+   * A nondeterministic argument used once in an always-evaluated position, and any deterministic
+   * argument, is safe and keeps transpiling. `shared` is [[shareTaggedParameters]]'s output for
+   * `option`; the two agree on what was shared because both consult [[sharedIndices]].
+   */
+  def hasUnsupportedNondeterministicInput(
+      option: Expression, shared: Expression, inConditionalBranch: Boolean): Boolean = {
+    // A repeated nondeterministic parameter that sharing did NOT hoist into one definition stays
+    // inline in every use, so its copies drift. That is every repeated nondeterministic parameter
+    // in an aggregating option (which shares nothing) and, in principle, one whose copies are
+    // unresolved or disagree on type. `exists` over the copies, not `head`: they need not be
+    // structurally equal, so any nondeterministic copy makes the parameter unsafe.
+    val shareable = sharedIndices(option)
+    val unsharedRepeatedNondet = tagsOf(option).groupBy(_.index).exists {
+      case (index, ps) =>
+        ps.length > 1 && ps.exists(!_.child.deterministic) && !shareable.contains(index)
+    }
+    // A nondeterministic argument left inline in a position that may be skipped at runtime: a
+    // conditional branch or short-circuit operand of the body, or -- when the whole call sits in
+    // one (`inConditionalBranch`, so seed the walk with it) -- anywhere in the option, since a
+    // `With` hoisted there is inlined back into the branch and its shared copies drift too. Shared
+    // copies are deterministic refs by now, so only genuinely inline nondeterministic arguments
+    // trip this; a nested TranspiledPythonUDF is skipped, its inputs handled when the rule recurses
+    // into it. A node is the nondeterministic one when it is itself nondeterministic with
+    // deterministic children; otherwise recurse so a nondeterministic descendant is found with the
+    // branch context that reaches it.
+    def nondetInBranch(e: Expression, inBranch: Boolean): Boolean = e match {
+      case _: TranspiledPythonUDF => false
+      case n if inBranch && !n.deterministic && n.children.forall(_.deterministic) => true
+      case _ =>
+        val branchChildren = conditionallyEvaluatedChildren(e)
+        e.children.exists { child =>
+          nondetInBranch(child, inBranch || branchChildren.exists(_.eq(child)))
+        }
+    }
+    nondetInBranch(shared, inBranch = inConditionalBranch) || unsharedRepeatedNondet
+  }
+
+  // Stop at a nested TranspiledPythonUDF: its options carry tags for their own call's parameters,
+  // which are handled when ConvertToCatalyst recurses into it, and whose indexes would otherwise
+  // collide with ours.
+  private def tagsOf(e: Expression): Seq[TranspiledUDFParameter] = e match {
+    case p: TranspiledUDFParameter => Seq(p)
+    case _: TranspiledPythonUDF => Nil
+    case _ => e.children.flatMap(tagsOf)
+  }
+
+  // Indices of parameters that shareTaggedParameters hoists into one CommonExpressionDef: repeated
+  // (more than one copy), all copies resolved, and agreeing on (dataType, nullable) so a single ref
+  // can stand in. Two deliberate exclusions leave a parameter inline, and this is the single source
+  // of truth both shareTaggedParameters and hasUnsupportedNondeterministicInput consult:
+  //  - an aggregating option shares nothing: `With` forbids a common expression ref inside a
+  //    same-scope AggregateExpression and RewriteWithExpression asserts on it rather than skewing a
+  //    value, so a transpiled grouped-agg UDF keeps every input inline;
+  //  - copies that are unresolved or disagree on type: the tags say which copies are one parameter
+  //    (we do not require structural equality -- analysis reseeds each `expr("rand()")` copy
+  //    independently, and demanding equality would skip the very case sharing exists for), but a
+  //    ref carries one dataType/nullability, so when the copies disagree none can stand in.
+  private def sharedIndices(option: Expression): Set[Int] = {
+    if (option.exists(_.isInstanceOf[AggregateExpression])) {
+      Set.empty
+    } else {
+      tagsOf(option).groupBy(_.index).collect {
+        case (index, ps) if ps.length > 1 && ps.forall(_.child.resolved) &&
+            ps.map(p => (p.child.dataType, p.child.nullable)).distinct.length == 1 => index
+      }.toSet
+    }
+  }
+
+  // Children of `e` that may be skipped at runtime, so a nondeterministic argument spliced into one
+  // is not guaranteed one evaluation per row. `ConditionalExpression` (If / CaseWhen / Coalesce /
+  // NaNvl) names its always-run children via `alwaysEvaluatedInputs`; every other child it holds is
+  // a branch. `And` / `Or` are not `ConditionalExpression`s but short-circuit their right operand,
+  // and the transpiler lowers Python `and` / `or` to them, so treat that operand as a branch too.
+  // Identity (`eq`) is deliberate: `alwaysEvaluatedInputs` returns the very child instances, and it
+  // beats `semanticEquals`, which would wrongly clear the flag for `If(c, x, x)`. The one hole -- a
+  // single instance reused in both an always-run and a branch position -- is not reachable from the
+  // built-in transpiler, which builds each option's subtrees fresh.
+  private[sql] def conditionallyEvaluatedChildren(e: Expression): Seq[Expression] = e match {
+    case c: ConditionalExpression =>
+      c.children.filterNot(child => c.alwaysEvaluatedInputs.exists(_.eq(child)))
+    case And(_, right) => Seq(right)
+    case Or(_, right) => Seq(right)
+    case _ => Nil
   }
 }
 
