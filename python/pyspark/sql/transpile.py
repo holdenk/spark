@@ -77,6 +77,7 @@ from pyspark.cloudpickle.cloudpickle import (
     _should_pickle_by_reference,
 )
 from pyspark.errors import UnsupportedOperationException
+from pyspark.util import JVM_LONG_MAX, JVM_LONG_MIN
 from pyspark.sql.column import Column
 from pyspark.sql.types import (
     BinaryType,
@@ -186,68 +187,33 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
 # base-type semantics, and ``bool`` is only safe here because it is listed.
 _BAKEABLE_TYPES = (int, float, str, bool, bytes)
 
-# A captured int must fit LongType; see the guard in ``_ScopeNormalizer._bake``.
-_LONG_MIN = -(2**63)
-_LONG_MAX = 2**63 - 1
-
 # Inlining a local binding duplicates its expression at every use site, so a
 # chain like ``b = a + a; c = b + b; ...`` doubles in size per link (a depth-10
 # chain reaches ~8k nodes). Cap the normalized body and fall back above it.
 _MAX_NORMALIZED_NODES = 1000
 
-# Discarded statements (a function with no ``return``) are lowered away, so any
-# error their evaluation would have raised in Python disappears with them. Only
-# allow node types whose evaluation cannot raise, which keeps the existing
-# documented "arithmetic on NULL yields NULL rather than TypeError" divergence
-# as the only difference. `%` (ZeroDivisionError) and comparisons (TypeError on
-# None) are deliberately absent.
-_DISCARDABLE_NODES = (
-    ast.Expr,
-    ast.Name,
-    ast.Load,
-    ast.Constant,
-    ast.BinOp,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.UnaryOp,
-    ast.UAdd,
-    ast.USub,
-    ast.BoolOp,
-    ast.And,
-    ast.Or,
-)
+# Two paths remove a value from the plan before the per-input-category checks in
+# ``_category`` ever see it: an inlined binding that is never read, and the
+# discarded trailing expression of a function with no ``return``. Whatever the
+# removed value would have raised in Python disappears with it, and because the
+# categories a UDF is lowered for are decided later, per combo, the removal
+# cannot consult them. So the exempt set is only the nodes that cannot raise for
+# ANY category. `+`/`-`/`*` do not qualify: they cannot raise on a numeric column
+# (Python does not raise on overflow, so ANSI's overflow is a divergence in the
+# safe direction) but Python raises TypeError across categories -- `a + "x"` on a
+# numeric column, or `a + 1` on a string one -- and the variant that would have
+# been rejected is already gone. `%` (ZeroDivisionError) and comparisons
+# (TypeError on None) are likewise absent.
+_REMOVED_VALUE_SAFE_NODES = (ast.Constant, ast.Name, ast.Load)
 
 
-def _may_raise(node: ast.AST) -> bool:
-    """Whether evaluating ``node`` could raise, per ``_DISCARDABLE_NODES``.
+def _removed_value_may_raise(node: ast.AST) -> bool:
+    """Whether removing ``node`` from the plan could hide an error Python raises.
 
     Conservative: any node type not on the allow-list counts as raising, so new
-    syntax is unsafe-by-default rather than silently discardable.
-
-    Only sound for a DISCARDED expression, and only because the allow-listed
-    operators there are same-category (`x + x`). It is deliberately not reused
-    for bindings -- see ``_binding_may_raise`` for why the same allow-list is too
-    generous once the value can be dropped before the per-category checks run.
+    syntax is unsafe-by-default rather than silently droppable.
     """
-    return not all(isinstance(inner, _DISCARDABLE_NODES) for inner in ast.walk(node))
-
-
-# A binding that is inlined away is never lowered, so the per-input-category
-# checks in ``_category`` never run on it. That makes ``_DISCARDABLE_NODES`` too
-# generous to reuse here: it treats `+`/`-`/`*` as unable to raise, which holds
-# for a numeric column (Python does not raise on overflow, so ANSI's overflow is
-# a divergence in the safe direction) but NOT across categories -- Python raises
-# TypeError for `a + "x"` on a numeric column, and a dropped binding never
-# reaches the check that would have rejected that variant. Which categories a UDF
-# is lowered for is decided later, per combo, so the only values exempt from the
-# read obligation are the ones no operator touches.
-_BINDING_SAFE_NODES = (ast.Constant, ast.Name, ast.Load)
-
-
-def _binding_may_raise(node: ast.AST) -> bool:
-    """Whether an assignment's value must be read unconditionally to stay sound."""
-    return not all(isinstance(inner, _BINDING_SAFE_NODES) for inner in ast.walk(node))
+    return not all(isinstance(inner, _REMOVED_VALUE_SAFE_NODES) for inner in ast.walk(node))
 
 
 # Constructs that evaluate their children exactly where they appear, so a read
@@ -743,7 +709,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
             if (
                 isinstance(value, int)
                 and not isinstance(value, bool)
-                and not _LONG_MIN <= value <= _LONG_MAX
+                and not JVM_LONG_MIN <= value <= JVM_LONG_MAX
             ):
                 raise UnsupportedOperationException(
                     f"{description} holds {value}, which is outside the range of "
@@ -873,7 +839,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
                     # must still fall back, because Python evaluates `x % 0`.
                     self._raiser_group.pop(name, None)
                     self._env[name] = inlined
-                if _binding_may_raise(inlined):
+                if _removed_value_may_raise(inlined):
                     self._pending_groups[self._next_group] = ", ".join(map(repr, names))
                     for name in names:
                         self._raiser_group[name] = self._next_group
@@ -888,9 +854,12 @@ class _ScopeNormalizer(ast.NodeTransformer):
                 # A trailing bare expression discards its value, so the function
                 # returns None. Only lower it away when evaluating it could not
                 # have raised: dropping e.g. `x % 0` would turn Python's
-                # ZeroDivisionError into a NULL. The caller has already warned
-                # that this function returns None either way.
-                if _may_raise(stmt):
+                # ZeroDivisionError into a NULL, and dropping `x + "abc"` would
+                # turn a TypeError into one. The check runs on the expression
+                # rather than the ``ast.Expr`` wrapper, which is a statement and
+                # so never on the allow-list. The caller has already warned that
+                # this function returns None either way.
+                if _removed_value_may_raise(stmt.value):
                     raise UnsupportedOperationException(
                         "this function returns None but its final expression "
                         "could raise when evaluated, so discarding it would "
@@ -1871,17 +1840,25 @@ def _analyze_func(
             "transpiler cannot tell which parameters the call site supplies"
         ]
     hidden = len(params) - visible
-    if hidden != _receiver_count_from_binding(func):
+    expected_hidden = _receiver_count_from_binding(func)
+    if hidden != expected_hidden:
         # The parsed source's arity disagrees with how the object is actually
         # bound, so the difference is NOT a receiver -- either a lying
         # ``__signature__`` or (more likely) ``inspect.getsource`` handed us a
         # different function than the one being called. Treating the extra
         # parameter as a receiver would shift every column by one.
+        #
+        # The message has to name ``expected_hidden``: the two counts it is
+        # derived from can be equal (an instance-dict ``__call__`` shadow makes
+        # ``getsource`` report the shadow's arity, so declared == visible while
+        # the binding still hides a receiver), and reporting only those two reads
+        # as "1 but 1, which does not match".
         return None, [
-            f"the UDF's source declares {len(params)} parameter(s) but the "
-            f"callable accepts {visible} at the call site, which does not match "
-            "how it is bound; the transpiler cannot map parameters onto columns "
-            "reliably, so it falls back to interpreted Python"
+            f"the UDF's source declares {len(params)} parameter(s) and the "
+            f"callable accepts {visible} at the call site, so {hidden} are "
+            f"hidden, but how it is bound hides {expected_hidden}; the "
+            "transpiler cannot map parameters onto columns reliably, so it "
+            "falls back to interpreted Python"
         ]
     # The caller matches user-supplied kwargs against these, and the user does
     # not name the receiver at the call site.

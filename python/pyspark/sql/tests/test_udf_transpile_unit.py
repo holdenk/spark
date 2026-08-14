@@ -2649,7 +2649,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         pudf, warned = self._fallback_warnings(f, LongType())
         self.assertEqual([], pudf.transpiled, "a source/binding arity mismatch must not transpile")
         self.assertTrue(warned, "expected a fallback warning")
-        self.assertIn("does not match how it is bound", str(warned[0].message))
+        self.assertIn("how it is bound hides", str(warned[0].message))
         with self.sql_conf(_TRANSPILE_ON):
             df = self.spark.createDataFrame([(3,)], "a long")
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 4)
@@ -2899,7 +2899,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # binding that is never read -- or is read only inside a ternary branch,
         # an `if`/`elif` branch, or after a short-circuit -- loses Python's eager
         # evaluation of it. When that value can raise, dropping or deferring it
-        # turns an exception into a wrong answer. See ``_binding_may_raise``:
+        # turns an exception into a wrong answer. See ``_removed_value_may_raise``:
         # only a constant or a bare name is exempt, because a dropped binding is
         # never lowered and so never reaches the per-category checks that would
         # have rejected e.g. `a + "x"` on a numeric column.
@@ -3146,7 +3146,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         import warnings as _warnings
 
         def bare_expression(x):
-            x + x
+            # A bare name evaluates to the column and cannot raise for any input
+            # category, so discarding it is exact. An OPERATOR here would not be
+            # -- see the cross-category cases below.
+            x
 
         def just_pass(x):
             pass
@@ -3196,12 +3199,68 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             with self.assertRaises(Exception):
                 df.select(pudf("a")).collect()
 
+        # `%` is only the obvious case. `+`/`-`/`*` and unary `-` cannot raise on
+        # a numeric column but ARE a TypeError across categories, and the discard
+        # happens before the per-combo check that would have dropped the
+        # mismatched variant -- so these returned NULL where Python raises.
+        # Same trap as the unread binding below, on the sibling path.
+        def discards_cross_category_add(x):
+            x + "abc"
+
+        def discards_none_add(x):
+            x + None
+
+        def discards_numeric_on_string(x):
+            x + 1
+
+        def discards_unary_minus(x):
+            -x
+
+        def discards_mult(x):
+            x * x
+
+        def discards_short_circuit(x):
+            x and (x + "a")
+
+        for label, func in [
+            ("cross-category add", discards_cross_category_add),
+            ("add None", discards_none_add),
+            ("numeric op, string column", discards_numeric_on_string),
+            ("unary minus", discards_unary_minus),
+            ("mult", discards_mult),
+            ("short circuit", discards_short_circuit),
+        ]:
+            with self.subTest(case=label):
+                with self.sql_conf(_TRANSPILE_ON):
+                    with _warnings.catch_warnings(record=True) as caught:
+                        _warnings.simplefilter("always")
+                        pudf = UserDefinedFunction(func, LongType())
+                    self.assertEqual(
+                        [],
+                        pudf.transpiled,
+                        f"{label}: an operator on a discarded expression must fall back",
+                    )
+                    self.assertTrue(
+                        [w for w in caught if "no return statement" in str(w.message)],
+                        f"{label}: expected a no-return warning even though it fell back",
+                    )
+
+        # And end to end: `x + 1` on a string column is a TypeError in Python, so
+        # the query must fail rather than quietly produce NULL. Distinct locals,
+        # so this cannot disturb the ``discards_a_raise`` assertions above.
+        self.assertRaises(TypeError, discards_numeric_on_string, "7")
+        with self.sql_conf(_TRANSPILE_ON):
+            str_df = self.spark.createDataFrame([("7",)], "a string")
+            cross_pudf = UserDefinedFunction(discards_numeric_on_string, LongType())
+            with self.assertRaises(Exception):
+                str_df.select(cross_pudf("a")).collect()
+
         # An unread BINDING is the same trap one step removed. `x + 1` cannot
         # raise on a numeric column, but it is a TypeError in Python on a string
         # one -- and because the binding is inlined away it never reaches the
         # per-category check that drops the string variant, so transpiling it
         # returned NULL for `a string` where Python raises. See
-        # ``_binding_may_raise``.
+        # ``_removed_value_may_raise``.
         def trailing_assignment(x):
             y = x + 1  # noqa: F841
 

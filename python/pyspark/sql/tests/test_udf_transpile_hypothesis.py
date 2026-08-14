@@ -54,9 +54,10 @@ To run locally::
 
 Set ``RUN_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test example count
 (default 1000). Each generated example runs two full Spark jobs (a
-transpiled-vs-interpreted differential), so CI caps this at 50 via
-``build_and_test.yml`` to stay under ``PYSPARK_TEST_TIMEOUT``; the explicit
-``@example`` edge seeds always run on top of the generated ones regardless.
+transpiled-vs-interpreted differential), so CI caps this at 20 via
+``build_and_test.yml`` to stay under ``PYSPARK_TEST_TIMEOUT`` -- which covers
+this whole module, not one test; the explicit ``@example`` edge seeds always
+run on top of the generated ones regardless.
 """
 
 import os
@@ -74,7 +75,7 @@ from pyspark.sql.types import (
 from pyspark.sql.udf import UserDefinedFunction
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import have_package
-from pyspark.util import is_remote_only
+from pyspark.util import JVM_LONG_MAX, JVM_LONG_MIN, is_remote_only
 
 
 # Sentinel value used by ``_run`` to mark "this side raised". A unique
@@ -123,11 +124,13 @@ if _have_hypothesis:
     )
 
     # Full 64-bit signed range -- used by comparison and equality tests where
-    # no arithmetic can overflow.
-    _LONG_BOUND = 2**63 - 1
-    _long_strategy = st.one_of(
-        st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND)
-    )
+    # no arithmetic can overflow. The range is asymmetric, so the minimum is
+    # JVM_LONG_MIN rather than -JVM_LONG_MAX: LongType's true floor is exactly
+    # the boundary ``_ScopeNormalizer._bake``'s range gate is written against,
+    # and none of these UDFs negates its input, so drawing it is safe here.
+    _LONG_BOUND = JVM_LONG_MAX
+    _LONG_FLOOR = JVM_LONG_MIN
+    _long_strategy = st.one_of(st.none(), st.integers(min_value=_LONG_FLOOR, max_value=_LONG_BOUND))
 
     # Narrower range for arithmetic tests (+4, -2, *3, +7, x+y).  Python's
     # arithmetic never overflows, but Spark's ANSI mode raises on LongType
@@ -156,7 +159,21 @@ if _have_hypothesis:
     # value -- e.g. NULL, zero, the type's max -- deterministic across
     # runs. These are the values we always want to try, before random
     # generation kicks in.
-    _LONG_EDGES = (None, 0, 1, -1, 7, -7, _INT32_MAX, _INT32_MIN, _LONG_BOUND, -_LONG_BOUND)
+    _LONG_EDGES = (
+        None,
+        0,
+        1,
+        -1,
+        7,
+        -7,
+        _INT32_MAX,
+        _INT32_MIN,
+        _LONG_BOUND,
+        -_LONG_BOUND,
+        # Seeded explicitly as well as generated: negating it overflows, so it is
+        # the value most likely to expose an off-by-one in a range guard.
+        _LONG_FLOOR,
+    )
     _LONG_ARITH_EDGES = (None, 0, 1, -1, 7, -7, _LONG_ARITH_BOUND, -_LONG_ARITH_BOUND)
     # Bool space is exhaustive (only three values) so the @example
     # decorators here serve more as documentation of the NULL handling
@@ -529,9 +546,9 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 interpreted_value = _SENTINEL_RAISED
                 interpreted_error = e
 
-        # If the transpiled path raises an exception we also need the interpreted path to raise one,
-        # however if the Python code (that in the interpreted path) raises an exception, the transpiled
-        # path may return a valid value.
+        # If the transpiled path raises an exception we also need the interpreted
+        # path to raise one, however if the Python code (that in the interpreted
+        # path) raises an exception, the transpiled path may return a valid value.
         if transpiled_error is not None:
             self.assertIsNotNone(
                 interpreted_error,

@@ -609,8 +609,11 @@ class UserDefinedFunction:
             # reads ``self.func``; attaching expressions lowered from a different
             # function than the one pickled would be a silent wrong answer. The
             # profiler call sites pass a wrapper and must pass
-            # ``include_transpiled=False``, which this pins.
-            assert func is self.func, "cannot transpile a func other than self.func"
+            # ``include_transpiled=False``, which this pins. Raised rather than
+            # asserted because ``python -O`` strips asserts, and the whole point
+            # of the check is that the failure it guards is silent.
+            if func is not self.func:
+                raise ValueError("cannot transpile a func other than self.func")
             transpiled, input_categories = self._build_transpiled_options(spark)
         else:
             transpiled, input_categories = [], []
