@@ -688,8 +688,12 @@ jobs:
       RUN_HYPOTHESIS: ${{ fromJson(needs.precondition.outputs.required).transpile }}
       # Each generated example runs two full Spark jobs (transpiled vs. interpreted
       # differential), so the local default of 1000 blows past PYSPARK_TEST_TIMEOUT.
-      # Cap CI fuzz volume; the explicit @example edge seeds still always run.
-      RUN_HYPOTHESIS_MAX_EXAMPLES: 50
+      # PYSPARK_TEST_TIMEOUT covers the whole module, not one test, and every test in
+      # it shares that budget: at 50 examples a single test cost 14-34s on a runner and
+      # the module was killed 27 tests in. At 20 the whole module is ~180s locally and
+      # roughly 250-300s on a runner, so each test added spends ~10s of the headroom.
+      # The explicit @example edge seeds always run regardless of this cap.
+      RUN_HYPOTHESIS_MAX_EXAMPLES: 20
     steps:
     - name: Checkout Spark repository
       uses: actions/checkout@v6
