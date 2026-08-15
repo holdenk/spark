@@ -391,33 +391,18 @@ def _make_captured_compare(threshold):
     return captured_compare
 
 
-def _make_captured_in_branches(low, high):
-    def captured_in_branches(x):
-        # Captured values in both arms, so the branch-category check compares
-        # two baked constants.
-        if x is None:
-            return low
-        else:
-            return high
-
-    return captured_in_branches
-
-
 plus_captured_four = _make_plus_captured(4)
 captured_compare_zero = _make_captured_compare(0)
-captured_branches = _make_captured_in_branches(-1, 1)
 
 
+# The remaining assignment shapes (multi-target, annotated, augmented, longer
+# chains) are covered by ``test_udf_transpile_assignment_forms`` in
+# test_udf_transpile_unit.py; each generated example here runs two full Spark
+# jobs, so only the shapes with a distinct arithmetic profile are fuzzed.
 def assign_then_double(x):
     # Local binding used twice, so inlining duplicates the expression.
     b = x + 4
     return b + b
-
-
-def assign_reuses_binding(x):
-    # Three uses of one binding; the lowered form must still equal ``b``.
-    b = x + 1
-    return b + b - b
 
 
 def assign_rebinds_parameter(x):
@@ -426,20 +411,6 @@ def assign_rebinds_parameter(x):
     x = x + 1
     x = x * 2
     return x
-
-
-def assign_chain_of_three(x):
-    a = x + 1
-    b = a + 2
-    c = b + 3
-    return c
-
-
-def assign_augmented(x):
-    total = x
-    total += 5
-    total *= 2
-    return total
 
 
 def _make_assign_mixes_capture(offset):
@@ -603,14 +574,6 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             )
 
         @_hyp_settings
-        @given(value=_long_strategy)
-        @_seed_examples(_LONG_EDGES)
-        def test_captured_branches_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(captured_branches, LongType(), df, "a")
-            self.assertEqual(transpiled, interpreted, f"captured_branches mismatch on {value!r}")
-
-        @_hyp_settings
         @given(value=_long_arith_strategy)
         @_seed_examples(_LONG_ARITH_EDGES)
         def test_assign_then_double_matches_python(self, value):
@@ -621,42 +584,12 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_hyp_settings
         @given(value=_long_arith_strategy)
         @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_reuses_binding_matches_python(self, value):
-            # Inlining duplicates `b`, so both copies must overflow (or not)
-            # exactly as Python's single evaluation does.
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_reuses_binding, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"assign_reuses_binding mismatch on {value!r}"
-            )
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
         def test_assign_rebinds_parameter_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(assign_rebinds_parameter, LongType(), df, "a")
             self.assertEqual(
                 transpiled, interpreted, f"assign_rebinds_parameter mismatch on {value!r}"
             )
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_chain_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_chain_of_three, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"assign_chain_of_three mismatch on {value!r}"
-            )
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_augmented_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_augmented, LongType(), df, "a")
-            self.assertEqual(transpiled, interpreted, f"assign_augmented mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_arith_strategy)

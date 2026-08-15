@@ -47,17 +47,32 @@ wrote with the literal spelled out.
 Baking a value is only sound when the interpreted path would have seen that
 same value, which means matching ``cloudpickle`` exactly: a captured name is
 resolved only when ``cloudpickle`` would snapshot it BY VALUE.
-
 :func:`_capture_scope` therefore reads ``cloudpickle``'s own helpers rather than
 re-deriving the rule -- private, but vendored, so they move only on a deliberate
 upgrade. ``dumps``/``loads`` will not do: ``loads`` returns a by-reference
 function unchanged, hiding the divergence that must fall back.
 
+Two consequences worth knowing as a user:
+
+* A UDF written as a top-level ``def`` in an importable module is pickled by
+  reference, so the executor re-imports the module and re-reads its globals;
+  such a UDF falls back rather than baking the driver's values. Writing it as
+  a lambda, or registering the module with
+  ``cloudpickle.register_pickle_by_value``, makes it eligible.
+* Only ``None`` and the basic scalars (``int``, ``float``, ``str``, ``bool``,
+  ``bytes``) are bakeable, and an ``int`` has to fit a 64-bit integer since
+  Python's are unbounded. Anything else falls back.
+
+Because a local binding is inlined at its read sites rather than evaluated where
+it appears, a binding whose value could raise has to be read unconditionally
+(the test of an ``if`` or a ternary counts); one that is never read, or is read
+only inside a branch or after a short-circuit, falls back rather than discard or
+defer an error Python raises eagerly.
+
 Capture timing: captured values are read when the UDF's ``judf`` is created, the
 same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
 snapshot agree even if a captured global is rebound in between. The two reads are
-adjacent rather than atomic; see ``_create_judf`` in ``udf.py`` for the residual
-window and why closing it is not worth the coupling.
+adjacent rather than atomic; see ``_create_judf`` in ``udf.py``.
 """
 
 import ast
@@ -195,25 +210,15 @@ _MAX_NORMALIZED_NODES = 1000
 # Two paths remove a value from the plan before the per-input-category checks in
 # ``_category`` ever see it: an inlined binding that is never read, and the
 # discarded trailing expression of a function with no ``return``. Whatever the
-# removed value would have raised in Python disappears with it, and because the
-# categories a UDF is lowered for are decided later, per combo, the removal
-# cannot consult them. So the exempt set is only the nodes that cannot raise for
-# ANY category. `+`/`-`/`*` do not qualify: they cannot raise on a numeric column
-# (Python does not raise on overflow, so ANSI's overflow is a divergence in the
-# safe direction) but Python raises TypeError across categories -- `a + "x"` on a
-# numeric column, or `a + 1` on a string one -- and the variant that would have
-# been rejected is already gone. `%` (ZeroDivisionError) and comparisons
-# (TypeError on None) are likewise absent.
-_REMOVED_VALUE_SAFE_NODES = (ast.Constant, ast.Name, ast.Load)
-
-
-def _removed_value_may_raise(node: ast.AST) -> bool:
-    """Whether removing ``node`` from the plan could hide an error Python raises.
-
-    Conservative: any node type not on the allow-list counts as raising, so new
-    syntax is unsafe-by-default rather than silently droppable.
-    """
-    return not all(isinstance(inner, _REMOVED_VALUE_SAFE_NODES) for inner in ast.walk(node))
+# removed value would have raised in Python disappears with it, and the removal
+# cannot consult the categories (they are decided later, per combo), so the
+# exempt set is only the nodes that cannot raise for ANY category. `+`/`-`/`*`
+# do not qualify: they are a TypeError across categories (`a + "x"` on a numeric
+# column, `a + 1` on a string one) and the variant that would have been rejected
+# is already gone. `%` (ZeroDivisionError) and comparisons (TypeError on None)
+# are likewise absent. A bare ``ast.Name`` is exempt too, but conditionally, so
+# ``_ScopeNormalizer._may_raise_if_removed`` handles it rather than this tuple.
+_REMOVED_VALUE_SAFE_NODES = (ast.Constant, ast.Load)
 
 
 # Constructs that evaluate their children exactly where they appear, so a read
@@ -388,12 +393,11 @@ class _CapturedScope:
     def lookup_name(self, name: str) -> Any:
         if name in self._local_names:
             # The compiler put this name in ``co_varnames``, so it is assigned
-            # somewhere in the body and is therefore local for the WHOLE body.
-            # Reading it before that assignment raises UnboundLocalError in
-            # Python, so resolving it from an enclosing scope here would return
-            # a value where the UDF actually fails. This catches only
-            # ``co_varnames``: a body-local that a nested scope closes over moves
-            # to ``co_cellvars`` instead, and refuses below as unresolvable.
+            # somewhere in the body and is therefore local for the WHOLE body:
+            # reading it before that assignment raises UnboundLocalError, and
+            # resolving it from an enclosing scope would return a value where the
+            # UDF actually fails. A body-local that a nested scope closes over
+            # lands in ``co_cellvars`` instead and refuses below as unresolvable.
             raise UnsupportedOperationException(
                 f"{name!r} is a local variable that is read before it is "
                 "assigned; Python raises UnboundLocalError here, so the "
@@ -604,6 +608,25 @@ class _ScopeNormalizer(ast.NodeTransformer):
         self._pending_groups: Dict[int, str] = {}
         self._next_group = 0
 
+    def _may_raise_if_removed(self, node: ast.AST) -> bool:
+        """Whether removing ``node`` from the plan could hide an error Python raises.
+
+        Conservative: any node type not on ``_REMOVED_VALUE_SAFE_NODES`` counts as
+        raising, so new syntax is unsafe-by-default rather than silently droppable.
+        A bare ``ast.Name`` is only safe for a parameter or a local binding -- any
+        other name is resolved from the enclosing scope, where an unbound one
+        raises NameError / UnboundLocalError (``def f(x): undefined_name`` would
+        otherwise lower to NULL). A binding's own value is covered by the
+        obligation ``_note_use`` tracks.
+        """
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Name):
+                if inner.id not in self._params and inner.id not in self._env:
+                    return True
+            elif not isinstance(inner, _REMOVED_VALUE_SAFE_NODES):
+                return True
+        return False
+
     def _note_use(self, name: str) -> None:
         """Record a read of ``name``, discharging its group when unconditional."""
         group = self._raiser_group.get(name)
@@ -638,13 +661,10 @@ class _ScopeNormalizer(ast.NodeTransformer):
 
     def visit(self, node: ast.AST) -> Any:
         # Default-deny: the visitors below know exactly which of their children
-        # are conditional, but every OTHER construct is treated as deferring. A
-        # comprehension over an empty iterable, an uncalled lambda
-        # body, a loop body, a `try` that swallows -- each can skip evaluating a
-        # read, and enumerating them would make this guard depend on that list
-        # staying complete. The lowering rejects all of them today, so this only
-        # ever adds conservatism; without it the guard would be sound only by
-        # accident of the other allow-list.
+        # are conditional; every OTHER construct (a comprehension, a lambda body,
+        # a loop, a `try`) is treated as deferring, so the guard does not depend
+        # on that list staying complete. The lowering rejects all of them today,
+        # so this only ever adds conservatism.
         if isinstance(node, _EVALUATED_WHERE_IT_APPEARS):
             return super().visit(node)
         with self._deferred():
@@ -652,11 +672,10 @@ class _ScopeNormalizer(ast.NodeTransformer):
 
     def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
         # `body if test else orelse`: only ``test`` is certain to be evaluated.
-        # This and the two visitors below re-implement the child walk to bracket
-        # it with a depth change. No visitor in this class ever returns ``None``
-        # or a list -- the ``NodeTransformer`` idioms for removing or splicing
-        # nodes -- so replacing ``generic_visit`` cannot drop a child here, which
-        # is also what makes the ``cast`` calls safe.
+        # This and the three visitors below re-implement the child walk to
+        # bracket it with a depth change. No visitor in this class ever returns
+        # ``None`` or a list (the ``NodeTransformer`` idioms for removing or
+        # splicing nodes), which is what makes the ``cast`` calls safe.
         node.test = cast(ast.expr, self.visit(node.test))
         with self._deferred():
             node.body = cast(ast.expr, self.visit(node.body))
@@ -675,9 +694,8 @@ class _ScopeNormalizer(ast.NodeTransformer):
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
         # A chained comparison short-circuits: `a < b < c` never evaluates `c`
         # when `a < b` is false, so only ``left`` and the FIRST comparator are
-        # certain. The lowering refuses chains outright, so omitting this would
-        # not be observable today -- but that is exactly the accidental
-        # soundness the ``visit`` override above exists to avoid.
+        # certain. The lowering refuses chains outright, so this is currently
+        # only about not being sound by accident.
         node.left = cast(ast.expr, self.visit(node.left))
         comparators = [cast(ast.expr, self.visit(node.comparators[0]))]
         with self._deferred():
@@ -687,10 +705,8 @@ class _ScopeNormalizer(ast.NodeTransformer):
 
     def visit_If(self, node: ast.If) -> ast.AST:
         # A trailing `if` / `elif` / `else` lowers to a CASE, so a read inside a
-        # branch is no more certain than one in a ternary branch. Without this
-        # the generic walk would visit the branches at depth 0 and treat such a
-        # read as unconditional. `elif` nests another ``ast.If`` in ``orelse``,
-        # which just compounds the depth.
+        # branch is no more certain than one in a ternary branch (`elif` nests
+        # another ``ast.If`` in ``orelse``, which just compounds the depth).
         node.test = cast(ast.expr, self.visit(node.test))
         with self._deferred():
             node.body = [cast(ast.stmt, self.visit(s)) for s in node.body]
@@ -839,7 +855,7 @@ class _ScopeNormalizer(ast.NodeTransformer):
                     # must still fall back, because Python evaluates `x % 0`.
                     self._raiser_group.pop(name, None)
                     self._env[name] = inlined
-                if _removed_value_may_raise(inlined):
+                if self._may_raise_if_removed(inlined):
                     self._pending_groups[self._next_group] = ", ".join(map(repr, names))
                     for name in names:
                         self._raiser_group[name] = self._next_group
@@ -853,13 +869,11 @@ class _ScopeNormalizer(ast.NodeTransformer):
             if isinstance(stmt, ast.Expr) and is_last:
                 # A trailing bare expression discards its value, so the function
                 # returns None. Only lower it away when evaluating it could not
-                # have raised: dropping e.g. `x % 0` would turn Python's
-                # ZeroDivisionError into a NULL, and dropping `x + "abc"` would
-                # turn a TypeError into one. The check runs on the expression
-                # rather than the ``ast.Expr`` wrapper, which is a statement and
-                # so never on the allow-list. The caller has already warned that
-                # this function returns None either way.
-                if _removed_value_may_raise(stmt.value):
+                # have raised: dropping `x % 0` would turn Python's
+                # ZeroDivisionError into a NULL, and dropping `x + "abc"` a
+                # TypeError. Checked on the expression rather than the ``ast.Expr``
+                # wrapper, which is a statement and so never exempt.
+                if self._may_raise_if_removed(stmt.value):
                     raise UnsupportedOperationException(
                         "this function returns None but its final expression "
                         "could raise when evaluated, so discarding it would "
@@ -1824,14 +1838,11 @@ def _analyze_func(
             "positional-only arguments are not supported by the transpiler"
         ]
     params = _get_parameter_list(function_ast)
-    # Which leading declared parameters are the implicit receiver? Derive it from
-    # the BINDING rather than the parameter's NAME: ``self`` and ``cls`` are only
-    # conventions, so a name test both misses ``def __call__(this, x)`` and a
-    # ``cls``-named classmethod, and misfires on a plain function that happens to
-    # call its first argument ``self``. ``inspect.signature`` already reports the
-    # call-site view, so the difference IS the receiver: a bound method, a bound
-    # classmethod and a callable instance each hide one declared parameter, while
-    # a plain function, a lambda and a ``staticmethod`` hide none.
+    # Is the leading declared parameter an implicit receiver? Derive that from the
+    # BINDING, not the parameter's NAME -- ``self``/``cls`` are conventions, so a
+    # name test misses ``def __call__(this, x)`` and misfires on a plain function
+    # whose first argument happens to be called ``self``. ``inspect.signature``
+    # reports the call-site view, so the difference IS the receiver.
     try:
         visible = len(inspect.signature(func).parameters)
     except (TypeError, ValueError) as e:
@@ -1846,13 +1857,10 @@ def _analyze_func(
         # bound, so the difference is NOT a receiver -- either a lying
         # ``__signature__`` or (more likely) ``inspect.getsource`` handed us a
         # different function than the one being called. Treating the extra
-        # parameter as a receiver would shift every column by one.
-        #
-        # The message has to name ``expected_hidden``: the two counts it is
-        # derived from can be equal (an instance-dict ``__call__`` shadow makes
-        # ``getsource`` report the shadow's arity, so declared == visible while
-        # the binding still hides a receiver), and reporting only those two reads
-        # as "1 but 1, which does not match".
+        # parameter as a receiver would shift every column by one. The message
+        # names ``expected_hidden`` because declared and visible can be equal
+        # while the binding still hides a receiver, and reporting only those two
+        # would read as "1 but 1, which does not match".
         return None, [
             f"the UDF's source declares {len(params)} parameter(s) and the "
             f"callable accepts {visible} at the call site, so {hidden} are "
@@ -1864,12 +1872,11 @@ def _analyze_func(
     # not name the receiver at the call site.
     public_params = params[hidden:]
     receiver = params[0] if hidden else None
-    # Warned here rather than while lowering, because this depends only on the
-    # AST: ``_build_transpiled`` runs again for every ``judf`` and every read of
-    # the ``transpiled`` property, so warning there repeats one message for the
-    # life of the UDF. Warned even though transpilation may still fail below --
-    # a trailing expression that could raise (`def f(x): x % 0`) falls back, but
-    # the user still wants to know the function never returns a value.
+    # Warned here rather than while lowering: this depends only on the AST, and
+    # ``_build_transpiled`` runs again for every ``judf`` and every read of the
+    # ``transpiled`` property, so warning there would repeat for the UDF's life.
+    # Warned even when transpilation goes on to fail -- the user still wants to
+    # know the function never returns a value.
     if _returns_only_none_implicitly(function_ast.body):
         warnings.warn(
             f"UDF {func} has no return statement, so it always returns None "

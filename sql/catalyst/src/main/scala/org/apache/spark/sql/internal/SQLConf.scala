@@ -622,23 +622,12 @@ object SQLConf {
         "(you can precast to decimal to avoid), type coercion on comparison, and implicit " +
         "returns. A UDF that reads a free variable (a closure cell, a module global, or an " +
         "attribute of a callable instance) may have that value baked into the plan as a " +
-        "literal. The value is read when the UDF is first used, which is also when the " +
-        "interpreted path pickles the function, so the two agree in practice; rebinding the " +
-        "name after that point changes neither. A value is only baked when cloudpickle would " +
-        "have captured it by value and its type and range are supported: None or one of the " +
-        "basic scalars (int, float, str, bool, bytes), with an int having to fit a 64-bit " +
-        "integer since Python's are unbounded. Anything else -- a list, a decimal, an " +
-        "oversized int -- falls back to interpreted Python rather than being baked. In " +
-        "particular a UDF defined as a top-level function in an importable module keeps " +
-        "reading its globals on the executor and falls back instead; writing it as a lambda " +
-        "or registering the module with cloudpickle.register_pickle_by_value makes it " +
-        "eligible. " +
-        "A local assignment is inlined at its read sites rather than evaluated where it " +
-        "appears, so a binding whose value could raise (for example `%`, a comparison, or " +
-        "arithmetic that would be a TypeError on the bound column's type) has to be read " +
-        "unconditionally. Reading it in the test of an `if` or a ternary counts; one that " +
-        "is never read, or is read only inside a branch or after a short-circuit, falls " +
-        "back instead of discarding or deferring an error Python raises eagerly. " +
+        "literal, read at the same moment the interpreted path pickles the function, so " +
+        "rebinding the name afterwards changes neither. Baking is limited to values " +
+        "cloudpickle would capture by value, and a UDF whose free variables, local " +
+        "assignments or return type fall outside what the transpiler supports falls back to " +
+        "interpreted Python; see the pyspark.sql.transpile module documentation for the " +
+        "exact rules. " +
         "This initial version only works with non-Connect Spark; Spark Connect " +
         "support is to follow. This is an *experimental* feature."
     )

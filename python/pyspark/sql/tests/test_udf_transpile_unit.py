@@ -2730,7 +2730,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             return d
 
         def uses_capture(a):
-            b = a + 1
+            # A binding whose value depends on a captured global (this function is
+            # a local, so cloudpickle snapshots its globals and they are bakeable),
+            # then duplicated by inlining.
+            b = a + _CAPTURED_INT
             return b * 2
 
         def shadows_global(a):
@@ -2758,7 +2761,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("annotated", annotated, L, "a long", [(3,)], [4]),
             ("reassigned", reassigned, L, "a long", [(3,)], [5]),
             ("chain of three", chain_of_three, L, "a long", [(1,)], [7]),
-            ("uses capture", uses_capture, L, "a long", [(1,)], [4]),
+            ("uses capture", uses_capture, L, "a long", [(1,)], [(1 + _CAPTURED_INT) * 2]),
             ("shadows global", shadows_global, L, "a long", [(1,)], [101]),
             ("string repeat", string_repeat, S, "a long", [(3,)], ["ababab"]),
             ("boolean binding", boolean_binding, B, "a long", [(1,), (-1,)], [True, False]),
@@ -2899,10 +2902,11 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # binding that is never read -- or is read only inside a ternary branch,
         # an `if`/`elif` branch, or after a short-circuit -- loses Python's eager
         # evaluation of it. When that value can raise, dropping or deferring it
-        # turns an exception into a wrong answer. See ``_removed_value_may_raise``:
-        # only a constant or a bare name is exempt, because a dropped binding is
-        # never lowered and so never reaches the per-category checks that would
-        # have rejected e.g. `a + "x"` on a numeric column.
+        # turns an exception into a wrong answer. See ``_may_raise_if_removed``:
+        # only a constant, or a name that is a parameter or a local binding, is
+        # exempt -- a dropped binding is never lowered and so never reaches the
+        # per-category checks that would have rejected e.g. `a + "x"` on a
+        # numeric column.
         def unread_raiser(a):
             b = a % 0  # noqa: F841
             return 5
@@ -3124,11 +3128,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertTrue(warned)
         self.assertIn("nodes", str(warned[0].message))
         # The budget must be enforced per BINDING, not only on the finished body:
-        # 20 doubling assignments reach ~8.4M nodes, which took ~147s and ~3.6GB
-        # at UDF construction before falling back anyway. The message naming the
-        # binding is the observable proof it was caught early -- a regression
-        # here hangs the driver rather than returning a wrong answer, so it would
-        # otherwise be easy to miss.
+        # 20 doubling assignments reach ~8.4M nodes (~147s and ~3.6GB) before
+        # falling back anyway, so a regression here hangs the driver rather than
+        # returning a wrong answer. The message naming the binding is the
+        # observable proof it was caught early.
         self.assertIn(
             "the binding of",
             str(warned[0].message),
@@ -3203,32 +3206,26 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # a numeric column but ARE a TypeError across categories, and the discard
         # happens before the per-combo check that would have dropped the
         # mismatched variant -- so these returned NULL where Python raises.
-        # Same trap as the unread binding below, on the sibling path.
-        def discards_cross_category_add(x):
-            x + "abc"
-
-        def discards_none_add(x):
-            x + None
-
+        # Same trap as the unread binding below, on the sibling path. A bare name
+        # that is neither a parameter nor a local binding is the third shape: it
+        # is resolved from the enclosing scope, and an unbound one raises.
         def discards_numeric_on_string(x):
             x + 1
 
         def discards_unary_minus(x):
             -x
 
-        def discards_mult(x):
-            x * x
-
         def discards_short_circuit(x):
             x and (x + "a")
 
+        def discards_undefined_name(x):
+            _not_defined_anywhere  # noqa: F821
+
         for label, func in [
-            ("cross-category add", discards_cross_category_add),
-            ("add None", discards_none_add),
             ("numeric op, string column", discards_numeric_on_string),
             ("unary minus", discards_unary_minus),
-            ("mult", discards_mult),
             ("short circuit", discards_short_circuit),
+            ("undefined bare name", discards_undefined_name),
         ]:
             with self.subTest(case=label):
                 with self.sql_conf(_TRANSPILE_ON):
@@ -3255,12 +3252,21 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             with self.assertRaises(Exception):
                 str_df.select(cross_pudf("a")).collect()
 
+        # Likewise the unbound bare name: Python raises NameError, so the query
+        # must raise rather than return the NULL a dropped read would produce.
+        self.assertRaises(NameError, discards_undefined_name, 1)
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            name_pudf = UserDefinedFunction(discards_undefined_name, LongType())
+            with self.assertRaises(Exception):
+                df.select(name_pudf("a")).collect()
+
         # An unread BINDING is the same trap one step removed. `x + 1` cannot
         # raise on a numeric column, but it is a TypeError in Python on a string
         # one -- and because the binding is inlined away it never reaches the
         # per-category check that drops the string variant, so transpiling it
         # returned NULL for `a string` where Python raises. See
-        # ``_removed_value_may_raise``.
+        # ``_may_raise_if_removed``.
         def trailing_assignment(x):
             y = x + 1  # noqa: F841
 
