@@ -596,7 +596,7 @@ class UserDefinedFunction:
             # (which pass a wrapper) also pass ``include_transpiled=False``.
             # Raised rather than asserted because ``python -O`` strips asserts.
             if func is not self.func:
-                raise ValueError("cannot transpile a func other than self.func")
+                raise PySparkRuntimeError("cannot transpile a func other than self.func")
             transpiled, input_categories = self._build_transpiled_options(spark)
         else:
             transpiled, input_categories = [], []

@@ -614,8 +614,8 @@ class _ScopeNormalizer(ast.NodeTransformer):
         Conservative: any node type not on ``_REMOVED_VALUE_SAFE_NODES`` counts as
         raising, so new syntax is unsafe-by-default rather than silently droppable.
         A bare ``ast.Name`` is only safe for a parameter or a local binding -- any
-        other name is resolved from the enclosing scope, where an unbound one
-        raises NameError / UnboundLocalError (``def f(x): undefined_name`` would
+        other name is resolved from the enclosing scope, and an unbound one is a
+        NameError / UnboundLocalError there (``def f(x): undefined_name`` would
         otherwise lower to NULL). A binding's own value is covered by the
         obligation ``_note_use`` tracks.
         """
