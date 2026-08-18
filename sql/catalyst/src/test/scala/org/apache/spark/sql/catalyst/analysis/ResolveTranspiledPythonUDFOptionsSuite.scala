@@ -85,6 +85,33 @@ class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
     assert(pruned.transpiledOptions.isEmpty)
   }
 
+  test("integral is narrower than numeric: keeps a LONG count, drops a DOUBLE one") {
+    // A string repeat (`s * n`) needs a whole count -- Python raises TypeError for a
+    // fractional one while `repeat` would truncate it -- so the transpiler declares
+    // "integral" for that argument rather than "numeric". A DOUBLE column must lose the
+    // option here and fall back to the Python UDF.
+    Seq(($"n".long, true), ($"n".double, false)).foreach { case (n, kept) =>
+      val s = $"s".string
+      val repeatOpt = Concat(Seq(s, s))
+      val node = TranspiledPythonUDF("udf", pyUDF(Seq(s, n)), List(repeatOpt),
+        List(List("string", "integral")))
+      val pruned = prune(node, LocalRelation(s, n))
+      assert(pruned.transpiledOptions == (if (kept) List(repeatOpt) else Nil),
+        s"integral against ${n.dataType.simpleString}")
+    }
+  }
+
+  test("integral does not match a DECIMAL column") {
+    // DecimalType is excluded from "numeric" already (Python sees decimal.Decimal); an
+    // integral-valued decimal must not sneak in through the narrower category either.
+    val s = $"s".string
+    val n = $"n".decimal(10, 0)
+    val repeatOpt = Concat(Seq(s, s))
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(s, n)), List(repeatOpt),
+      List(List("string", "integral")))
+    assert(prune(node, LocalRelation(s, n)).transpiledOptions.isEmpty)
+  }
+
   test("leaves options untouched when categories are empty (no restriction)") {
     val a = $"a".long
     val onlyOpt = Add(a, Literal(1L))

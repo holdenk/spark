@@ -61,7 +61,14 @@ Two consequences worth knowing as a user:
   ``cloudpickle.register_pickle_by_value``, makes it eligible.
 * Only ``None`` and the basic scalars (``int``, ``float``, ``str``, ``bool``,
   ``bytes``) are bakeable, and an ``int`` has to fit a 64-bit integer since
-  Python's are unbounded. Anything else falls back.
+  Python's are unbounded. Anything else falls back. Two values of a bakeable
+  type are refused as well: NaN, whose ordering and equality differ from
+  Python's, and a ``str`` that is not UTF-8 encodable (a lone surrogate), which
+  py4j cannot carry.
+* ``str * n`` needs a whole ``n`` -- ``"ab" * 2.5`` is a Python ``TypeError``
+  while Spark's ``repeat`` would truncate -- so a fractional literal refuses,
+  and a column count is declared ``"integral"`` rather than ``"numeric"`` so a
+  DOUBLE column is pruned on the JVM side.
 
 Because a local binding is inlined at its read sites rather than evaluated where
 it appears, a binding whose value could raise has to be read unconditionally
@@ -83,6 +90,7 @@ import types
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, cast
 import inspect
 import itertools
+import math
 import textwrap
 import warnings
 from pyspark.cloudpickle.cloudpickle import (
@@ -143,6 +151,16 @@ class AbstractTranspiler(object):
     ) -> Optional[Column]:
         pass
 
+    def _declared_categories(self, combo: dict, n_params: int) -> List[str]:
+        """The input categories the option just lowered expects, per public param.
+
+        The JVM keeps an option only when every entry matches the bound column's
+        type (see ``ResolveTranspiledPythonUDFOptions``). Defaults to the variant's
+        own assumption; a backend whose lowering needs something narrower than the
+        variant assumed overrides this.
+        """
+        return [combo.get(i, "numeric") for i in range(n_params)]
+
 
 def _is_definitely_basic_type(node: ast.AST) -> bool:
     """
@@ -165,6 +183,31 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return True
         case _:
             return False
+
+
+def _is_definitely_integral(node: ast.AST) -> bool:
+    """Return True when ``node`` is statically guaranteed to be a whole number.
+
+    Gates the string-repeat lowering: Python's ``str * n`` requires an integral
+    ``n`` (``"ab" * 2.5`` and even ``"ab" * 2.0`` are a TypeError), while Spark's
+    ``repeat`` takes any numeric and would happily truncate.
+
+    Only a literal or baked ``int`` qualifies. A parameter cannot, even one
+    annotated ``int``: annotations do not constrain the bound column, and the
+    ``"numeric"`` category the JVM matches on (see
+    ``ResolveTranspiledPythonUDFOptions``) covers DOUBLE as well as LONG, so
+    nothing would stop a fractional column reaching a variant admitted here.
+    Distinguishing them needs a narrower category than this PR carries, so a
+    column-backed count falls back to interpreted Python instead.
+    """
+    # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool
+    # is categorised "bool" and never reaches the repeat arm, so exclude it here
+    # rather than imply support the lowering does not have.
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    )
 
 
 def _is_definitely_boolean(node: ast.AST) -> bool:
@@ -206,6 +249,9 @@ _BAKEABLE_TYPES = (int, float, str, bool, bytes)
 # chain like ``b = a + a; c = b + b; ...`` doubles in size per link (a depth-10
 # chain reaches ~8k nodes). Cap the normalized body and fall back above it.
 _MAX_NORMALIZED_NODES = 1000
+
+# Nesting depth cap, enforced alongside the node budget; see _check_node_depth.
+_MAX_AST_DEPTH = 100
 
 # Two paths remove a value from the plan before the per-input-category checks in
 # ``_category`` ever see it: an inlined binding that is never read, and the
@@ -261,6 +307,33 @@ def _check_node_budget(node: ast.AST, what: str) -> None:
             f"{what}, over the {_MAX_NORMALIZED_NODES} limit; falling back to "
             "interpreted Python rather than emitting a plan this large"
         )
+
+
+def _check_node_depth(node: ast.AST, what: str) -> None:
+    """Refuse a tree nested deeper than ``_MAX_AST_DEPTH``.
+
+    Separate from ``_check_node_budget`` because depth, not size, is what
+    recurses: ``copy.deepcopy``, ``ast.unparse`` and the lowering itself all
+    descend one frame or more per level, and a chain like ``- - - ... a`` is deep
+    while staying small (300 operators is 301 nodes, comfortably inside the node
+    budget, and blows the stack). Measured on this interpreter, ``deepcopy``
+    survives depth 204 and fails at 254 from an otherwise-empty stack; the cap is
+    well below that because the real call stack is already deep by this point.
+    Without this the user sees "maximum recursion depth exceeded" raised from a
+    frame with no headroom, instead of a message naming the cause.
+    """
+    # Iterative on purpose: measuring depth by recursion would hit the very limit
+    # it is here to guard.
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_AST_DEPTH:
+            raise UnsupportedOperationException(
+                f"{what} nests more than {_MAX_AST_DEPTH} levels deep, which "
+                "risks exhausting the Python stack while it is rewritten; "
+                "falling back to interpreted Python"
+            )
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
 
 
 def _is_docstring(stmt: ast.stmt) -> bool:
@@ -733,6 +806,30 @@ class _ScopeNormalizer(ast.NodeTransformer):
                     "LongType is not, so the transpiler falls back to interpreted "
                     "Python"
                 )
+            # NaN compares false against everything in Python, but Spark orders it
+            # above every other double and treats it as equal to itself, so a baked
+            # NaN silently flips `a < nan` and `a == nan`. A NaN COLUMN value can
+            # only be documented (the type says nothing about it), but a captured
+            # one is known right here, so refuse it.
+            if isinstance(value, float) and math.isnan(value):
+                raise UnsupportedOperationException(
+                    f"{description} holds NaN, which Python compares as false "
+                    "against everything while Spark orders it above all other "
+                    "doubles and equal to itself, so the transpiler falls back to "
+                    "interpreted Python"
+                )
+            # A lone surrogate is a legal Python str but not encodable, and py4j
+            # encodes every command as UTF-8 -- baking it would raise inside the
+            # socket write and drop the gateway connection rather than fall back.
+            if isinstance(value, str):
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise UnsupportedOperationException(
+                        f"{description} holds a string that is not UTF-8 "
+                        "encodable, which cannot be sent to the JVM, so the "
+                        "transpiler falls back to interpreted Python"
+                    )
             return ast.Constant(value=value)
         raise UnsupportedOperationException(
             f"{description} holds a {type(value).__name__}, which has no column "
@@ -921,9 +1018,19 @@ def _normalize_function(
     # construction and again when its judf is created). Normalizing the original
     # would compound: `a = a + 1; return a * 2` would become `(a + 1) * 2`, then
     # `((a + 1) + 1) * 2` on the next build. Work on a copy.
+    # Depth-check the SOURCE before copying it. ``deepcopy`` recurses once per
+    # AST level, as does the lowering after it, so a deeply nested body
+    # (`a + a + ...`, a couple of hundred terms) exhausts the stack inside the
+    # copy below and surfaces as "maximum recursion depth exceeded" from a frame
+    # with no headroom left, rather than a message saying what happened. The node
+    # budget cannot stand in for this: depth, not size, is what recurses.
+    _check_node_depth(function_ast, "the function body as written")
     source = copy.deepcopy(function_ast)
     statement = normalizer.normalize_body(source.body)
     _check_node_budget(statement, "the function body")
+    # Inlining deepens as well as widens (`b = -a; c = -b; ...` collapses into one
+    # nested chain), and the node budget above does not bound depth.
+    _check_node_depth(statement, "the inlined function body")
     # Replace the copy's body rather than constructing a fresh ``ast.FunctionDef``.
     # Every other field (notably ``type_params``, which exists only on 3.12+)
     # carries over untouched, so this needs no per-version handling -- and it
@@ -937,10 +1044,6 @@ class CatalystTranspiler(AbstractTranspiler):
 
     variety = "catalyst"
 
-    # TODO (SPARK-55218): handle implicit-None return bodies like
-    # ``def f(x): x + x`` -- no return statement means return None;
-    # we should lower to lit(None) and optionally warn since it's
-    # likely a mistake.
     def _convert_branch(self, params: List[str], statements: List[ast.stmt], slot: str) -> Column:
         """Lower a single-statement if-body / if-else block.
 
@@ -1232,6 +1335,36 @@ class CatalystTranspiler(AbstractTranspiler):
                 # `_convert_chunk`; treat as numeric for category purposes.
                 return "numeric"
 
+    def _require_integral_repeat_count(self, params: List[str], node: ast.AST) -> None:
+        """Constrain a string-repeat count to a whole number, or refuse the variant.
+
+        A literal or baked ``int`` settles it here. A bare parameter cannot --
+        its ``"numeric"`` category covers DOUBLE as well as LONG -- so record it
+        and let ``_declared_categories`` narrow this option to ``"integral"``,
+        which the JVM prunes against the bound column type. Only the label
+        changes, so the option matrix does not grow.
+
+        Anything else (`s * (k + 1)`, a float literal) refuses: deciding whether
+        a compound expression stays integral needs an analysis this does not have.
+        """
+        if _is_definitely_integral(node):
+            return
+        if isinstance(node, ast.Name) and node.id in params:
+            self._integral_params.add(params.index(node.id))
+            return
+        raise UnsupportedOperationException(
+            "the count in a string repeat (`s * n`) is not statically a whole "
+            "number; Python raises TypeError for a fractional count while "
+            "Spark's `repeat` would truncate it, so this falls back to "
+            "interpreted Python"
+        )
+
+    def _declared_categories(self, combo: dict, n_params: int) -> List[str]:
+        categories = super()._declared_categories(combo, n_params)
+        for index in self._integral_params:
+            categories[index] = "integral"
+        return categories
+
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
         match body:
             case None:
@@ -1435,9 +1568,14 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Mult():
                         if lc == "numeric" and rc == "numeric":
                             return left_col.__mul__(right_col)
+                        # Repeat needs a whole count: Python raises TypeError for
+                        # a fractional one, so lowering it would return a value
+                        # where Python raises. See ``_is_definitely_integral``.
                         if lc == "string" and rc == "numeric":
+                            self._require_integral_repeat_count(params, right)
                             return repeat(left_col, right_col.cast("int"))
                         if lc == "numeric" and rc == "string":
+                            self._require_integral_repeat_count(params, left)
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
                         if lc == rc == "numeric":
@@ -1511,6 +1649,10 @@ class CatalystTranspiler(AbstractTranspiler):
         # Per-variant input-type assumption ({public_param_index -> category}),
         # read by ``_category`` to choose str vs numeric operators.
         self._param_categories = param_categories or {}
+        # Params this variant needs narrowed from "numeric" to "integral"; filled
+        # by the lowering below and read back by ``_declared_categories``. Reset
+        # per variant, since it describes the option about to be produced.
+        self._integral_params: Set[int] = set()
         function_body = function_ast.body
         if len(function_body) != 1:
             raise UnsupportedOperationException(
@@ -1940,7 +2082,7 @@ def _build_transpiled(
                 if transpiled_column is not None:
                     transpiled.append(transpiled_column)
                     input_categories.append(
-                        [combo.get(i, "numeric") for i in range(len(analysis.public_params))]
+                        transpiler._declared_categories(combo, len(analysis.public_params))
                     )
             except Exception as e:
                 errors.append(str(e))

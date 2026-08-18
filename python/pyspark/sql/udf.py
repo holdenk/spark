@@ -146,6 +146,25 @@ def _create_py_udf(
     return _create_udf(f, returnType, eval_type)
 
 
+def _transpile_conf_is_true(
+    session: Optional["SparkSession"], key: str, default: Optional[str] = None
+) -> bool:
+    """Read a boolean conf from ``session``, treating a missing session as off.
+
+    Conf values are compared case-insensitively: `SET conf=True` stores the
+    literal "True", which a bare `== "true"` would read as disabled. When
+    ``default`` is given it is passed through to ``RuntimeConfig.get`` so nothing
+    here depends on the JVM having the (experimental) conf registered -- e.g. a
+    newer Python client against an older driver. Pass no default for
+    ``spark.sql.ansi.enabled``: its registered default is dynamic
+    (environment-driven) and must be respected when the key is unset.
+    """
+    if session is None:
+        return False
+    value = session.conf.get(key) if default is None else session.conf.get(key, default)
+    return value is not None and value.lower() == "true"
+
+
 class UserDefinedFunction:
     """
     User defined function in Python
@@ -228,27 +247,14 @@ class UserDefinedFunction:
         # Catalyst expression would let the optimizer fold/reorder/duplicate it,
         # discarding the nondeterminism barrier. (asNondeterministic() also clears
         # any options set here, for the udf(f).asNondeterministic() ordering.)
-        # Conf values are compared case-insensitively: `SET conf=True` stores
-        # the literal "True", which would otherwise silently disable
-        # transpilation (or mis-trigger the ANSI warning below).
         #
         # Each conf read is a JVM roundtrip, so keep the default construction
         # path cheap: the experimental gate is only read for deterministic
         # batched UDFs (the only shape we transpile), and the ANSI conf is only
-        # read once the gate is known to be on. When ``default`` is given it is
-        # passed through to ``RuntimeConfig.get`` so construction never depends
-        # on the JVM having the (experimental) conf registered -- e.g. a newer
-        # Python client against an older driver. No default is passed for
-        # ``spark.sql.ansi.enabled``: its registered default is dynamic
-        # (environment-driven) and must be respected when the key is unset.
+        # read once the gate is known to be on. See ``_transpile_conf_is_true``
+        # for how the values are compared.
         def _conf_is_true(key: str, default: Optional[str] = None) -> bool:
-            if session is None:
-                return False
-            if default is None:
-                value = session.conf.get(key)
-            else:
-                value = session.conf.get(key, default)
-            return value is not None and value.lower() == "true"
+            return _transpile_conf_is_true(session, key, default)
 
         try:
             transpile_enabled = (
@@ -294,8 +300,10 @@ class UserDefinedFunction:
                         self._transpile_analysis = analysis
                         # Only meaningful once something actually lowered: set
                         # alongside the analysis so the two cannot disagree about
-                        # whether this UDF transpiles.
-                        self._transpiled_param_names = analysis.public_params
+                        # whether this UDF transpiles. Copied rather than aliased
+                        # -- ``asNondeterministic`` empties this field while the
+                        # analysis keeps its own list.
+                        self._transpiled_param_names = list(analysis.public_params)
                 if self._transpile_analysis is None:
                     detail = f": {errors}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
@@ -321,11 +329,21 @@ class UserDefinedFunction:
         the one whose confs are consulted while lowering; ``_create_judf`` passes
         the very session it builds the JVM UDF with. ``None`` yields no options.
 
+        Both gates are re-read here, not just at construction: a conf is session
+        state and can be flipped afterwards, and lowering anyway would attach
+        options the JVM has to discard, logging a warning per query. No ANSI
+        warning is emitted -- construction already issued one, and this runs on
+        every read of ``transpiled`` and every ``judf`` build.
+
         Deliberately not cached: captured free variables are baked in as
         literals, so the lowering is only valid for the values current at the
         moment it runs. See ``_create_judf`` for why that moment is the right one.
         """
         if self._transpile_analysis is None or session is None:
+            return [], []
+        if not _transpile_conf_is_true(
+            session, "spark.sql.experimental.optimizer.transpilePyUDFs", "false"
+        ) or not _transpile_conf_is_true(session, "spark.sql.ansi.enabled"):
             return [], []
         from pyspark.sql.transpile import _build_transpiled
 
@@ -357,8 +375,9 @@ class UserDefinedFunction:
         interpreted Python.
 
         Prefers the ACTIVE session, the same one ``_create_judf`` will build the
-        JVM UDF against, so what this reports matches what gets planned. Unlike
-        ``_create_judf`` it will not create a session just to answer.
+        JVM UDF against, and re-reads that session's transpile and ANSI confs, so
+        what this reports matches what gets planned. Unlike ``_create_judf`` it
+        will not create a session just to answer.
         """
         from pyspark.sql import SparkSession
 

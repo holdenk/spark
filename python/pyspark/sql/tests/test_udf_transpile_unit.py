@@ -1883,12 +1883,114 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(10,)], "a long")
                     self.assertIsNone(df.select(pudf("a")).collect()[0][0], label)
-        # A captured bool subclasses int but is only ever 0/1, so it stays
-        # eligible for the type check rather than tripping the range guard.
-        pudf, _ = self._fallback_warnings(_make_adder(True), L)
+        # A captured bool subclasses int but is only ever 0/1, so it must not trip
+        # the range guard above. It still does not transpile: `_bake` accepts the
+        # value, then `_category` calls it "bool" and the Add lowering takes only
+        # string/string or numeric/numeric, so the variant is dropped. Assert both
+        # halves -- the value alone would pass whether or not the bool gate works,
+        # since the interpreted path produces 11 either way.
+        pudf, warned = self._fallback_warnings(_make_adder(True), L)
+        self.assertEqual([], pudf.transpiled, "a captured bool has no Add lowering")
+        self.assertNotIn(
+            "outside the range of a 64-bit integer",
+            " ".join(str(w.message) for w in warned),
+            "a captured bool must not trip the int range guard",
+        )
         with self.sql_conf(_TRANSPILE_ON):
             df = self.spark.createDataFrame([(10,)], "a long")
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 11)
+
+    def test_udf_transpile_captured_nan_falls_back(self):
+        # NaN compares false against everything in Python, but Spark orders it
+        # above every other double and treats it as equal to itself, so baking a
+        # captured NaN silently flips `a < nan` and `a == nan`. A NaN COLUMN value
+        # can only be documented -- the column type says nothing about it -- but a
+        # captured one is known while lowering, so it must refuse there.
+        nan = float("nan")
+
+        def lt_nan(a):
+            return a < nan
+
+        def eq_nan(a):
+            return a == nan
+
+        for label, func, expected in [("<", lt_nan, False), ("==", eq_nan, False)]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, BooleanType())
+                self.assertEqual([], pudf.transpiled, f"captured NaN ({label}) must not be baked")
+                self.assertIn(
+                    "holds NaN",
+                    " ".join(str(w.message) for w in warned),
+                    f"{label}: expected the explicit NaN guard",
+                )
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(5,)], "a long")
+                    self.assertEqual(expected, df.select(pudf("a")).collect()[0][0], label)
+                self.assertEqual(expected, func(5), f"{label}: bad test expectation")
+
+    def test_udf_transpile_captured_unencodable_str_falls_back(self):
+        # A lone surrogate is a legal Python str but not UTF-8 encodable, and py4j
+        # encodes every command as UTF-8. Baking it raised inside the socket write
+        # and dropped the gateway connection -- the fallback still happened, but
+        # only after four nested py4j tracebacks -- so refuse it while lowering.
+        surrogate = "\ud800"
+
+        def concat_surrogate(s):
+            return s + surrogate
+
+        pudf, warned = self._fallback_warnings(concat_surrogate, StringType())
+        self.assertEqual([], pudf.transpiled, "an unencodable capture must not be baked")
+        self.assertIn(
+            "not UTF-8 encodable",
+            " ".join(str(w.message) for w in warned),
+            "expected the encodability guard, not a py4j network error",
+        )
+
+    def test_udf_transpile_deeply_nested_body_reports_depth(self):
+        # Depth, not size, is what recurses: `copy.deepcopy`, `ast.unparse` and
+        # the lowering each descend per AST level. A long unary chain is deep
+        # while staying well inside the node budget, and it used to surface as
+        # "maximum recursion depth exceeded" raised from a frame with no headroom
+        # rather than a message naming the cause.
+        #
+        # Written to a real file and imported: the transpiler reads the function's
+        # source with ``inspect.getsource``, which cannot see an ``exec``'d string
+        # -- that would fall back with "Error extracting function body", passing
+        # this test for entirely the wrong reason.
+        import importlib
+        import os
+        import sys
+        import tempfile
+
+        terms = 300
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "deep_udf_probe.py"), "w") as handle:
+                handle.write("def deep_add(a):\n    return " + " + ".join(["a"] * terms) + "\n")
+                handle.write("\n\ndef deep_unary(a):\n    return " + "-" * terms + "a\n")
+                handle.write("\n\ndef shallow_add(a):\n    return " + " + ".join(["a"] * 20) + "\n")
+            sys.path.insert(0, tmpdir)
+            try:
+                probe = importlib.import_module("deep_udf_probe")
+                for label, func in [
+                    ("add chain", probe.deep_add),
+                    ("unary chain", probe.deep_unary),
+                ]:
+                    with self.subTest(case=label):
+                        pudf, warned = self._fallback_warnings(func, LongType())
+                        self.assertEqual([], pudf.transpiled, f"{label} must fall back")
+                        messages = " ".join(str(w.message) for w in warned)
+                        self.assertIn("levels deep", messages, f"{label}: expected the depth guard")
+                        self.assertNotIn("recursion", messages, f"{label}: leaked a RecursionError")
+                # Control: a shallow chain of the same shape still transpiles, so
+                # the guard is about depth rather than about generated source.
+                with self.sql_conf(_TRANSPILE_ON):
+                    control = UserDefinedFunction(probe.shallow_add, LongType())
+                    self.assertTrue(control.transpiled, "a shallow chain must still lower")
+                    df = self.spark.createDataFrame([(2,)], "a long")
+                    self.assertEqual(40, df.select(control("a")).collect()[0][0])
+            finally:
+                sys.path.remove(tmpdir)
+                sys.modules.pop("deep_udf_probe", None)
 
     def test_udf_transpile_repeated_lowering_is_idempotent(self):
         # A UDF is lowered more than once: at construction, on every
@@ -2062,6 +2164,80 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         for i, (func, rt, schema, rows, expected) in enumerate(cases):
             with self.subTest(case=i):
                 self.assertEqual(self._vals(func, rt, schema, rows), expected, f"case {i}")
+
+    def test_udf_transpile_string_repeat_requires_a_whole_count(self):
+        # `str * n` is only defined in Python for an integral `n`: `"ab" * 2.5`
+        # and even `"ab" * 2.0` are a TypeError. Spark's `repeat` takes any
+        # numeric and would truncate, so lowering a fractional count returned
+        # 'abab' where Python raises -- a wrong answer, not a fallback.
+        #
+        # A whole count is established one of two ways. A literal or captured
+        # `int` settles it in the transpiler. A COLUMN cannot: the "numeric"
+        # category the JVM matches on covers DOUBLE as well as LONG, so that
+        # option declares the narrower "integral" for the count and the JVM
+        # prunes it for a fractional column (see
+        # ResolveTranspiledPythonUDFOptions). The whole-count cases in
+        # ``test_udf_transpile_string_operands`` are the other half of this: they
+        # go through ``_vals``, which asserts the option really was kept.
+        S = StringType()
+        fraction = 2.5
+        whole_float = 2.0
+
+        def captured_fraction(s):
+            return s * fraction
+
+        def captured_whole_float(s):
+            return s * whole_float
+
+        def mul(s, k):
+            return s * k
+
+        for label, func in [
+            ("captured 2.5", captured_fraction),
+            # 2.0 is a whole number but still a float, and Python raises for it.
+            ("captured 2.0", captured_whole_float),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, S)
+                self.assertEqual([], pudf.transpiled, f"{label} must not be lowered")
+                self.assertIn(
+                    "not statically a whole number",
+                    " ".join(str(w.message) for w in warned),
+                    f"{label}: expected the repeat-count guard",
+                )
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([("ab",)], "s string")
+                    with self.assertRaises(Exception):
+                        df.select(pudf("s")).collect()
+                self.assertRaises(TypeError, func, "ab")
+
+        # A column count: same function and same option list, kept or pruned
+        # purely on the bound type. Asserted on the PLAN, not just the value: a
+        # fallback produces 'ababab' too, so `assertTrue(pudf.transpiled)` alone
+        # would pass even if the JVM did not know the "integral" category and
+        # dropped the option.
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(mul, S)
+            self.assertTrue(pudf.transpiled, "a column count still lowers")
+            long_df = self.spark.createDataFrame([("ab", 3)], "s string, k long")
+            lowered = long_df.select(pudf("s", "k"))
+            self.assertEqual("ababab", lowered.collect()[0][0])
+            self.assertEqual(
+                0,
+                self._eval_python_count(lowered),
+                "a LONG count must satisfy the integral category and stay lowered",
+            )
+            # The DOUBLE column drops the option, so Python runs and raises.
+            double_df = self.spark.createDataFrame([("ab", 2.5)], "s string, k double")
+            fell_back = double_df.select(pudf("s", "k"))
+            self.assertEqual(
+                1,
+                self._eval_python_count(fell_back),
+                "a DOUBLE count must be pruned back to the Python UDF",
+            )
+            with self.assertRaises(Exception):
+                fell_back.collect()
+        self.assertRaises(TypeError, mul, "ab", 2.5)
 
     def test_udf_transpile_string_operands_fall_back(self):
         # Operand/type combos with no valid string lowering for the bound column
@@ -3090,6 +3266,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             )
 
             other = self.spark.newSession()
+            # Both gates are set explicitly on the new session: the lowering
+            # re-reads them, and a fresh session need not inherit this one's
+            # overrides -- without this the assertion below would hold because
+            # transpilation was off, not because ``pyTranspilers`` was empty.
+            for key, value in _TRANSPILE_ON.items():
+                other.conf.set(key, str(value).lower())
             other.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "")
             self.assertEqual(
                 [],
@@ -3098,6 +3280,33 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             )
             # The other session's conf must not have leaked into this one.
             self.assertNotEqual([], pudf._build_transpiled_options(self.spark)[0])
+
+    def test_udf_transpile_lazy_path_rechecks_the_confs(self):
+        # A conf is session state and can be flipped after the UDF is built. The
+        # constructor's gates therefore cannot be the only ones: ``transpiled``
+        # kept reporting options after transpilation was turned off, and
+        # ``_create_judf`` kept attaching them, which makes ConvertToCatalyst log
+        # "is disabled but we still got TranspiledPythonUDFs in our plan" on every
+        # query.
+        def plus_one(a):
+            return a + 1
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(plus_one, LongType())
+            self.assertNotEqual([], pudf.transpiled, "sanity: this UDF transpiles")
+            for key in (
+                "spark.sql.experimental.optimizer.transpilePyUDFs",
+                "spark.sql.ansi.enabled",
+            ):
+                with self.subTest(conf=key):
+                    with self.sql_conf({key: False}):
+                        self.assertEqual(
+                            [], pudf.transpiled, f"{key}=false must stop the lazy lowering"
+                        )
+                        df = self.spark.createDataFrame([(10,)], "a long")
+                        self.assertEqual(11, df.select(pudf("a")).collect()[0][0])
+                    # Restored with the conf, since nothing is cached.
+                    self.assertNotEqual([], pudf.transpiled, f"{key}=true lowers again")
 
     def test_udf_transpile_assignment_node_budget(self):
         # Inlining duplicates a binding at each use, so a doubling chain grows

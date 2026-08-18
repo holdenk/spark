@@ -458,6 +458,18 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         transpilation-related warning may fire. Without these checks both
         runs could silently fall back to interpreted Python and the
         differential assertion would succeed for the wrong reason.
+
+        A one-sided raise fails in either direction, with one carve-out: Spark
+        arithmetic propagates NULL where the Python UDF receives ``None`` and
+        raises ``TypeError``, which is a documented value-level divergence (see
+        the BinOp notes in ``transpile.py``). Every strategy here draws ``None``,
+        so that shape is recognised structurally -- a NULL result from a row with
+        a NULL in a bound column -- rather than waved through per test.
+
+        Nothing broader is tolerated. Copying the transpiled value onto the
+        interpreted side unconditionally, as this used to, made the whole suite
+        blind to "transpiled returned a value where Python raised" -- which is
+        what `"ab" * 2.5` -> 'abab' was, and what the dropped-binding NULLs were.
         """
         func_name = getattr(func, "__name__", repr(func))
         kwargs = kwargs or {}
@@ -517,15 +529,25 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 interpreted_value = _SENTINEL_RAISED
                 interpreted_error = e
 
-        # If the transpiled path raises an exception we also need the interpreted
-        # path to raise one, however if the Python code (that in the interpreted
-        # path) raises an exception, the transpiled path may return a valid value.
+        # A one-sided raise is a divergence in EITHER direction, so both fail here.
         if transpiled_error is not None:
             self.assertIsNotNone(
                 interpreted_error,
                 f"{func_name!r}: transpiled raised {transpiled_error!r} but interpreted did not",
             )
         elif interpreted_error is not None:
+            # Only the NULL-propagation carve-out above. The input row is read
+            # here rather than up front so the common path pays nothing for it.
+            bound_columns = list(udf_arg_columns) + list(kwargs.values())
+            input_row = df.first()
+            null_input = any(input_row[column] is None for column in bound_columns)
+            self.assertTrue(
+                transpiled_value is None and null_input,
+                f"{func_name!r}: interpreted Python raised {interpreted_error!r} while the "
+                f"transpiled plan returned {transpiled_value!r} for input {input_row!r}. A "
+                "transpiled UDF must not produce a value where Python raises; only NULL out of "
+                "a NULL input is an accepted divergence.",
+            )
             interpreted_value = transpiled_value
 
         return transpiled_value, interpreted_value
