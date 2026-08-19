@@ -77,11 +77,17 @@ def _create_udf(
     evalType: int,
     name: Optional[str] = None,
     deterministic: bool = True,
+    bufferSchema: Optional[StructType] = None,
 ) -> "UserDefinedFunctionLike":
     """Create a regular(non-Arrow-optimized) Python UDF."""
     # Set the name of the UserDefinedFunction object to be the name of function f
     udf_obj = UserDefinedFunction(
-        f, returnType=returnType, name=name, evalType=evalType, deterministic=deterministic
+        f,
+        returnType=returnType,
+        name=name,
+        evalType=evalType,
+        deterministic=deterministic,
+        bufferSchema=bufferSchema,
     )
     return udf_obj._wrapped()
 
@@ -185,6 +191,7 @@ class UserDefinedFunction:
         name: Optional[str] = None,
         evalType: int = PythonEvalType.SQL_BATCHED_UDF,
         deterministic: bool = True,
+        bufferSchema: Optional[StructType] = None,
     ):
         if not callable(func):
             raise PySparkTypeError(
@@ -226,13 +233,22 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
+        # Schema of the intermediate aggregation buffer, set only for an incremental Python
+        # aggregator (see :class:`pyspark.sql.aggregator.Aggregator`); ``None`` otherwise. It is a
+        # first-class field so it survives reconstruction paths such as ``_wrapped()``,
+        # ``asNondeterministic()`` and ``spark.udf.register``, and is threaded to the JVM in
+        # ``_create_judf`` so ``PythonAggregate`` can plan the two-stage aggregation.
+        self.bufferSchema = bufferSchema
         # Transpilation state. ``_transpile_analysis`` holds everything that does
         # not depend on captured values; the captures are read only when the
         # ``judf`` is built, which is also where ``_create_judf`` cloudpickles the
         # function -- so the baked literals and the snapshot agree exactly. See
         # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means no
         # transpilation, whether it was never possible or has been turned off
-        # (``asNondeterministic()``).
+        # (``asNondeterministic()``). The lowered options and their input
+        # categories are no longer stored: ``transpiled`` is a property that
+        # re-lowers, because a baked capture is only valid for the values current
+        # when it ran.
         self._transpile_analysis: Optional["_TranspileAnalysis"] = None
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
@@ -619,6 +635,15 @@ class UserDefinedFunction:
             transpiled, input_categories = self._build_transpiled_options(spark)
         else:
             transpiled, input_categories = [], []
+        # Incremental Python aggregators additionally carry the intermediate buffer schema, which
+        # the JVM needs at planning time to build the two-stage aggregation (see PythonAggregate).
+        # Everyone else passes ``None`` here, which Py4J maps to the JVM ``null`` the ``bufferType``
+        # parameter already defaults to.
+        jbuf = (
+            spark._jsparkSession.parseDataType(self.bufferSchema.json())
+            if self.bufferSchema is not None
+            else None
+        )
         judf = getattr(sc._jvm, "org.apache.spark.sql.execution.python.UserDefinedPythonFunction")(
             self._name,
             wrapped_func,
@@ -627,6 +652,7 @@ class UserDefinedFunction:
             self.deterministic,
             map(_to_java_column_opt, transpiled),
             input_categories,
+            jbuf,
         )
         return judf
 
@@ -673,6 +699,19 @@ class UserDefinedFunction:
         memory_profiler_enabled = sc._conf.get("spark.python.profile.memory", "false") == "true"
 
         if profiler_enabled or memory_profiler_enabled:
+            # Profiling is not supported for incremental Python aggregators. Their ``self.func`` is
+            # an ``Aggregator`` object, not a plain function: the profiler wrappers below would
+            # replace it with a function the worker cannot drive (it has no ``zero``/``reduce``/
+            # ``bufferSchema``), and the memory profiler's ``inspect.getsourcelines(f.__code__)``
+            # fails on the driver because an ``Aggregator`` instance has no ``__code__``.
+            if self.evalType == PythonEvalType.SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF:
+                warnings.warn(
+                    "Profiling incremental Python aggregators is not supported.",
+                    UserWarning,
+                )
+                judf = self._judf
+                return Column(judf.apply(_to_seq(sc, jcols)))
+
             # Disable profiling Pandas UDFs with iterators as input/output.
             if self.evalType in [
                 PythonEvalType.SQL_SCALAR_PANDAS_ITER_UDF,
@@ -780,6 +819,7 @@ class UserDefinedFunction:
         wrapper.returnType = self.returnType  # type: ignore[attr-defined]
         wrapper.evalType = self.evalType  # type: ignore[attr-defined]
         wrapper.deterministic = self.deterministic  # type: ignore[attr-defined]
+        wrapper.bufferSchema = self.bufferSchema  # type: ignore[attr-defined]
         wrapper.asNondeterministic = functools.wraps(  # type: ignore[attr-defined]
             self.asNondeterministic
         )(lambda: self.asNondeterministic()._wrapped())
@@ -942,6 +982,7 @@ class UDFRegistration:
                 PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF,
                 PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF,
                 PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF,
+                PythonEvalType.SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF,
             ]:
                 raise PySparkTypeError(
                     errorClass="INVALID_UDF_EVAL_TYPE",
@@ -950,7 +991,8 @@ class UDFRegistration:
                         "SQL_SCALAR_PANDAS_UDF, SQL_SCALAR_ARROW_UDF, "
                         "SQL_SCALAR_PANDAS_ITER_UDF, SQL_SCALAR_ARROW_ITER_UDF, "
                         "SQL_GROUPED_AGG_PANDAS_UDF, SQL_GROUPED_AGG_ARROW_UDF, "
-                        "SQL_GROUPED_AGG_PANDAS_ITER_UDF or SQL_GROUPED_AGG_ARROW_ITER_UDF"
+                        "SQL_GROUPED_AGG_PANDAS_ITER_UDF, SQL_GROUPED_AGG_ARROW_ITER_UDF "
+                        "or SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF"
                     },
                 )
             source_udf = _create_udf(
@@ -959,6 +1001,8 @@ class UDFRegistration:
                 name=name,
                 evalType=f.evalType,
                 deterministic=f.deterministic,
+                # Preserve the incremental aggregator's buffer schema (None for other UDFs).
+                bufferSchema=getattr(f, "bufferSchema", None),
             )
             register_udf = source_udf._unwrapped  # type: ignore[attr-defined]
             return_udf = register_udf
