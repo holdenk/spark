@@ -315,12 +315,15 @@ def _check_node_depth(node: ast.AST, what: str) -> None:
     Separate from ``_check_node_budget`` because depth, not size, is what
     recurses: ``copy.deepcopy``, ``ast.unparse`` and the lowering itself all
     descend one frame or more per level, and a chain like ``- - - ... a`` is deep
-    while staying small (300 operators is 301 nodes, comfortably inside the node
-    budget, and blows the stack). Measured on this interpreter, ``deepcopy``
-    survives depth 204 and fails at 254 from an otherwise-empty stack; the cap is
-    well below that because the real call stack is already deep by this point.
-    Without this the user sees "maximum recursion depth exceeded" raised from a
-    frame with no headroom, instead of a message naming the cause.
+    while staying cheap by node count. Measured on this interpreter, at the
+    default recursion limit: a unary chain costs two nodes per operator, so the
+    node budget does not bite until 499 operators, while ``deepcopy`` of such a
+    chain survives 246 and raises RecursionError at 247 from an otherwise-empty
+    stack. The node budget alone would therefore admit roughly twice the depth
+    that can actually be copied. This cap sits well below even 246, because the
+    real call stack is already deep by the time we get here. Without it the user
+    sees "maximum recursion depth exceeded" raised from a frame with no headroom,
+    instead of a message naming the cause.
     """
     # Iterative on purpose: measuring depth by recursion would hit the very limit
     # it is here to guard.
