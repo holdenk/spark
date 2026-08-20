@@ -624,6 +624,21 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     executorsToDecommission.toImmutableArraySeq
   }
 
+  override def decommissionExecutorsIfIdle(
+      executorsAndDecomInfo: Array[(String, ExecutorDecommissionInfo)],
+      adjustTargetNumExecutors: Boolean): Seq[String] = withLock {
+    val idleExecutors = executorsAndDecomInfo.distinctBy(_._1).filter { case (executorId, _) =>
+      isExecutorActive(executorId) && !scheduler.isExecutorBusy(executorId)
+    }
+    if (idleExecutors.isEmpty) {
+      Seq.empty
+    } else {
+      // Keep both locks until the existing path marks these executors pending decommission.
+      // Use virtual dispatch so cluster-manager overrides receive only the filtered IDs.
+      decommissionExecutors(idleExecutors, adjustTargetNumExecutors, triggeredByExecutor = false)
+    }
+  }
+
   override def start(): Unit = {
     setupTokenManager()
     setupUserCredentialManager()
@@ -794,6 +809,11 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     execDataOption.map(_.resourceProfileId).getOrElse(ResourceProfile.UNKNOWN_RESOURCE_PROFILE_ID)
   }
 
+  // this function is for testing only
+  private[spark] def getRequestedTotalExecutors(): Map[ResourceProfile, Int] = synchronized {
+    requestedTotalExecutorsPerResourceProfile.toMap
+  }
+
   /**
    * Request an additional number of executors from the cluster manager. This is
    * requesting against the default ResourceProfile, we will need an API change to
@@ -812,9 +832,13 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     val response = synchronized {
       val defaultProf = scheduler.sc.resourceProfileManager.defaultResourceProfile
       val numExisting = requestedTotalExecutorsPerResourceProfile.getOrElse(defaultProf, 0)
-      requestedTotalExecutorsPerResourceProfile(defaultProf) = numExisting + numAdditionalExecutors
+      // Saturate instead of overflowing when the current requirement is already huge (e.g.
+      // Int.MaxValue after an unbounded `requestTotalExecutors`).
+      val newTotal =
+        math.min(numExisting.toLong + numAdditionalExecutors, Int.MaxValue.toLong).toInt
+      requestedTotalExecutorsPerResourceProfile(defaultProf) = newTotal
       // Account for executors pending to be added or removed
-      updateExecRequestTime(defaultProf.id, numAdditionalExecutors)
+      updateExecRequestTime(defaultProf.id, newTotal - numExisting)
       doRequestTotalExecutors(requestedTotalExecutorsPerResourceProfile.toMap)
     }
 
