@@ -35,14 +35,26 @@ keeps the option matrix small; prefer doing so. To bound plan growth,
 functions with more than three untyped parameters only emit the
 all-numeric and all-string variants.
 
-Free variables, local assignments and captured values
------------------------------------------------------
+Free variables and literal assignments
+--------------------------------------
 A name that is not a parameter (``lambda a: a + b``) is resolved from the
-function's scope and baked into the plan as a literal, and a local binding
-(``def f(a): b = a + 1; return b * 2``) is inlined at its use sites. Both are
-handled by :func:`_normalize_function` before any lowering happens, so the
-result reaching the lowering code is indistinguishable from a UDF the user
-wrote with the literal spelled out.
+function's scope and baked into the plan as a literal. A local assignment is
+supported only when it **binds a literal** -- one written in the body
+(``def f(a): b = 5; return a + b``) or captured from the enclosing scope
+(``b = k``). Anything the assignment would have to compute (``b = a + 1``,
+``b += 1``, or even aliasing a column with ``b = a``) falls back to interpreted
+Python.
+
+That restriction is what keeps this simple. Substituting a literal at a name's
+read sites cannot duplicate work, cannot grow the tree, and cannot move an error:
+a literal has no evaluation to move. Were an arbitrary expression allowed, an
+assignment read only inside an ``if`` branch -- or never read at all -- would
+discard or defer an error Python raises eagerly, and inlining a chain like
+``b = a + a; c = b + b`` would double the plan per link.
+
+Both kinds of rewrite are done by :func:`_normalize_function` before any lowering
+happens, so what reaches the lowering code is indistinguishable from a UDF the
+user wrote with the literal spelled out.
 
 Baking a value is only sound when the interpreted path would have seen that
 same value, which means matching ``cloudpickle`` exactly: a captured name is
@@ -52,7 +64,7 @@ re-deriving the rule -- private, but vendored, so they move only on a deliberate
 upgrade. ``dumps``/``loads`` will not do: ``loads`` returns a by-reference
 function unchanged, hiding the divergence that must fall back.
 
-Two consequences worth knowing as a user:
+Consequences worth knowing as a user:
 
 * A UDF written as a top-level ``def`` in an importable module is pickled by
   reference, so the executor re-imports the module and re-reads its globals;
@@ -65,16 +77,10 @@ Two consequences worth knowing as a user:
   type are refused as well: NaN, whose ordering and equality differ from
   Python's, and a ``str`` that is not UTF-8 encodable (a lone surrogate), which
   py4j cannot carry.
-* ``str * n`` needs a whole ``n`` -- ``"ab" * 2.5`` is a Python ``TypeError``
-  while Spark's ``repeat`` would truncate -- so a fractional literal refuses,
-  and a column count is declared ``"integral"`` rather than ``"numeric"`` so a
-  DOUBLE column is pruned on the JVM side.
-
-Because a local binding is inlined at its read sites rather than evaluated where
-it appears, a binding whose value could raise has to be read unconditionally
-(the test of an ``if`` or a ternary counts); one that is never read, or is read
-only inside a branch or after a short-circuit, falls back rather than discard or
-defer an error Python raises eagerly.
+* Only closure cells and module globals are read. ``self.<attr>`` on a callable
+  instance is not captured -- resolving it faithfully means reproducing Python's
+  descriptor and MRO lookup and cloudpickle's instance-state rules, which is left
+  to a follow-up.
 
 Capture timing: captured values are read when the UDF's ``judf`` is created, the
 same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
@@ -83,11 +89,9 @@ adjacent rather than atomic; see ``_create_judf`` in ``udf.py``.
 """
 
 import ast
-import contextlib
 import copy
-import copyreg
 import types
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 import inspect
 import itertools
 import math
@@ -151,16 +155,6 @@ class AbstractTranspiler(object):
     ) -> Optional[Column]:
         pass
 
-    def _declared_categories(self, combo: dict, n_params: int) -> List[str]:
-        """The input categories the option just lowered expects, per public param.
-
-        The JVM keeps an option only when every entry matches the bound column's
-        type (see ``ResolveTranspiledPythonUDFOptions``). Defaults to the variant's
-        own assumption; a backend whose lowering needs something narrower than the
-        variant assumed overrides this.
-        """
-        return [combo.get(i, "numeric") for i in range(n_params)]
-
 
 def _is_definitely_basic_type(node: ast.AST) -> bool:
     """
@@ -185,28 +179,31 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return False
 
 
-def _is_definitely_integral(node: ast.AST) -> bool:
-    """Return True when ``node`` is statically guaranteed to be a whole number.
+def _refuse_fractional_repeat_count(node: ast.AST) -> None:
+    """Refuse a string repeat (``s * n``) whose count is a fractional literal.
 
-    Gates the string-repeat lowering: Python's ``str * n`` requires an integral
-    ``n`` (``"ab" * 2.5`` and even ``"ab" * 2.0`` are a TypeError), while Spark's
-    ``repeat`` takes any numeric and would happily truncate.
+    Python's ``str * n`` needs a whole ``n`` -- both ``"ab" * 2.5`` and ``"ab" *
+    2.0`` are a TypeError -- while Spark's ``repeat`` takes any numeric and would
+    truncate, returning a value where Python raises.
 
-    Only a literal or baked ``int`` qualifies. A parameter cannot, even one
-    annotated ``int``: annotations do not constrain the bound column, and the
-    ``"numeric"`` category the JVM matches on (see
-    ``ResolveTranspiledPythonUDFOptions``) covers DOUBLE as well as LONG, so
-    nothing would stop a fractional column reaching a variant admitted here.
-    Distinguishing them needs a narrower category than this PR carries, so a
-    column-backed count falls back to interpreted Python instead.
+    Only literal counts are checked, which is exactly the case capturing
+    introduces: before this module could resolve free variables, ``n`` in
+    ``lambda s: s * n`` could only be a column or a literal already in the body,
+    and a captured ``n = 2.5`` now bakes to a literal here. A column-backed count
+    keeps the pre-existing behavior -- constraining that needs a narrower input
+    category than "numeric" on the JVM side, which is left to a follow-up.
     """
-    # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool
-    # is categorised "bool" and never reaches the repeat arm, so exclude it here
+    if not isinstance(node, ast.Constant):
+        return
+    # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool is
+    # categorised "bool" and never reaches the repeat arm, so refuse it here
     # rather than imply support the lowering does not have.
-    return (
-        isinstance(node, ast.Constant)
-        and isinstance(node.value, int)
-        and not isinstance(node.value, bool)
+    if isinstance(node.value, int) and not isinstance(node.value, bool):
+        return
+    raise UnsupportedOperationException(
+        "the count in a string repeat (`s * n`) is not a whole number; Python "
+        "raises TypeError for a fractional count while Spark's `repeat` would "
+        "truncate it, so this falls back to interpreted Python"
     )
 
 
@@ -245,98 +242,35 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
 # base-type semantics, and ``bool`` is only safe here because it is listed.
 _BAKEABLE_TYPES = (int, float, str, bool, bytes)
 
-# Inlining a local binding duplicates its expression at every use site, so a
-# chain like ``b = a + a; c = b + b; ...`` doubles in size per link (a depth-10
-# chain reaches ~8k nodes). Cap the normalized body and fall back above it.
-_MAX_NORMALIZED_NODES = 1000
 
-# Nesting depth cap, enforced alongside the node budget; see _check_node_depth.
-_MAX_AST_DEPTH = 100
+def _as_literal(node: ast.AST) -> Optional[ast.Constant]:
+    """The constant ``node`` already is, or ``None`` when it is not one.
 
-# Two paths remove a value from the plan before the per-input-category checks in
-# ``_category`` ever see it: an inlined binding that is never read, and the
-# discarded trailing expression of a function with no ``return``. Whatever the
-# removed value would have raised in Python disappears with it, and the removal
-# cannot consult the categories (they are decided later, per combo), so the
-# exempt set is only the nodes that cannot raise for ANY category. `+`/`-`/`*`
-# do not qualify: they are a TypeError across categories (`a + "x"` on a numeric
-# column, `a + 1` on a string one) and the variant that would have been rejected
-# is already gone. `%` (ZeroDivisionError) and comparisons (TypeError on None)
-# are likewise absent. A bare ``ast.Name`` is exempt too, but conditionally, so
-# ``_ScopeNormalizer._may_raise_if_removed`` handles it rather than this tuple.
-_REMOVED_VALUE_SAFE_NODES = (ast.Constant, ast.Load)
+    This is the single place the "assignments bind literals" rule is enforced. It
+    runs on an ALREADY-VISITED expression, so a captured name has become an
+    ``ast.Constant`` by the time it arrives; what reaches here as something else is
+    genuinely computed (``a + 1``, a call, a comparison) or is a column reference,
+    and either way this transpiler will not evaluate it.
 
-
-# Constructs that evaluate their children exactly where they appear, so a read
-# inside one is as certain as the construct itself. Everything else -- a
-# comprehension, a lambda body, a loop, a `try` -- may skip or defer evaluation,
-# and ``_ScopeNormalizer.visit`` treats it as such. The conditional CHILDREN of
-# the entries that have them are handled by their own visitors.
-_EVALUATED_WHERE_IT_APPEARS = (
-    ast.Return,
-    ast.Expr,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Compare,
-    ast.Name,
-    ast.Constant,
-    ast.Attribute,
-    ast.Load,
-    ast.IfExp,
-    ast.BoolOp,
-    ast.If,
-    ast.operator,
-    ast.unaryop,
-    ast.boolop,
-    ast.cmpop,
-)
-
-
-def _check_node_budget(node: ast.AST, what: str) -> None:
-    """Refuse a tree that has grown past ``_MAX_NORMALIZED_NODES``.
-
-    Applied per local binding as it is inlined, not just to the finished body:
-    inlining doubles a binding's size per link in ``z1 = z0 + z0; z2 = z1 + z1;
-    ...``, so 20 such assignments reach ~8.4M nodes -- minutes and gigabytes
-    spent at UDF construction before falling back anyway.
+    The one concession is a unary ``-``/``+`` on a numeric constant: Python parses
+    ``-5`` as ``UnaryOp(USub, Constant(5))``, never ``Constant(-5)``, so without
+    folding it a negative literal would be refused as "computed" -- a confusing
+    answer for something spelled exactly like a literal. Folding is exact for
+    ``int`` and ``float`` and is not applied to anything else (``-"ab"`` is a
+    Python TypeError, and ``-True`` would silently become ``-1``).
     """
-    size = sum(1 for _ in ast.walk(node))
-    if size > _MAX_NORMALIZED_NODES:
-        raise UnsupportedOperationException(
-            f"inlining local assignments produced {size} expression nodes in "
-            f"{what}, over the {_MAX_NORMALIZED_NODES} limit; falling back to "
-            "interpreted Python rather than emitting a plan this large"
-        )
-
-
-def _check_node_depth(node: ast.AST, what: str) -> None:
-    """Refuse a tree nested deeper than ``_MAX_AST_DEPTH``.
-
-    Separate from ``_check_node_budget`` because depth, not size, is what
-    recurses: ``copy.deepcopy``, ``ast.unparse`` and the lowering itself all
-    descend one frame or more per level, and a chain like ``- - - ... a`` is deep
-    while staying cheap by node count. Measured on this interpreter, at the
-    default recursion limit: a unary chain costs two nodes per operator, so the
-    node budget does not bite until 499 operators, while ``deepcopy`` of such a
-    chain survives 246 and raises RecursionError at 247 from an otherwise-empty
-    stack. The node budget alone would therefore admit roughly twice the depth
-    that can actually be copied. This cap sits well below even 246, because the
-    real call stack is already deep by the time we get here. Without it the user
-    sees "maximum recursion depth exceeded" raised from a frame with no headroom,
-    instead of a message naming the cause.
-    """
-    # Iterative on purpose: measuring depth by recursion would hit the very limit
-    # it is here to guard.
-    stack = [(node, 1)]
-    while stack:
-        current, depth = stack.pop()
-        if depth > _MAX_AST_DEPTH:
-            raise UnsupportedOperationException(
-                f"{what} nests more than {_MAX_AST_DEPTH} levels deep, which "
-                "risks exhausting the Python stack while it is rewritten; "
-                "falling back to interpreted Python"
-            )
-        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
+    if isinstance(node, ast.Constant):
+        return node
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = node.operand
+        if (
+            isinstance(operand, ast.Constant)
+            and isinstance(operand.value, (int, float))
+            and not isinstance(operand.value, bool)
+        ):
+            value = -operand.value if isinstance(node.op, ast.USub) else +operand.value
+            return ast.Constant(value=value)
+    return None
 
 
 def _is_docstring(stmt: ast.stmt) -> bool:
@@ -401,50 +335,6 @@ def _pickled_by_value(obj: Any) -> bool:
     return not _should_pickle_by_reference(obj)
 
 
-# Only default pickling ships ``vars(instance)`` verbatim. ``reducer_override``
-# declines ordinary instances, so they go through ``__reduce_ex__`` -- and any of
-# these hooks can rewrite or drop the dict on the way.
-_PICKLE_STATE_HOOKS = ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__")
-
-
-def _instance_dict_is_shipped(receiver: Any) -> bool:
-    """Whether ``vars(receiver)`` is what the executor will actually receive."""
-    cls = type(receiver)
-    if cls in copyreg.dispatch_table:
-        return False
-    return all(
-        getattr(cls, hook, None) is getattr(object, hook, None) for hook in _PICKLE_STATE_HOOKS
-    )
-
-
-def _is_data_descriptor(value: Any) -> bool:
-    """Whether ``value`` outranks an instance / class ``__dict__`` entry."""
-    vtype = type(value)
-    return hasattr(vtype, "__set__") or hasattr(vtype, "__delete__")
-
-
-def _receiver_count_from_binding(func: Callable) -> int:
-    """How many leading parameters the call protocol hides, per the OBJECT.
-
-    ``inspect.signature`` reports the call-site view, but only of the object --
-    it says nothing about whether the source we parsed is really that object's
-    body. When ``inspect.getsource`` picks up the wrong function (two lambdas on
-    one line) the arity difference is not a receiver at all, so the signature
-    figure is cross-checked against this one rather than trusted alone.
-    """
-    if inspect.ismethod(func):
-        # Bound method or bound classmethod: ``__self__`` supplies the first.
-        return 1
-    if isinstance(func, types.FunctionType):
-        # Plain function, lambda, or a ``staticmethod`` reached off an instance:
-        # a receiver is impossible, whatever the declared parameters look like.
-        return 0
-    # Callable instance: a plain function in the class dict binds the receiver, a
-    # ``staticmethod`` does not. Read it statically so the descriptor is not run.
-    call = inspect.getattr_static(type(func), "__call__", None)
-    return 1 if isinstance(call, types.FunctionType) else 0
-
-
 class _CapturedScope:
     """The values a UDF body may safely read from its enclosing scope.
 
@@ -458,13 +348,11 @@ class _CapturedScope:
         local_names: Set[str],
         cells: Dict[str, Any],
         global_values: Optional[Dict[str, Any]],
-        instance: Optional[Any],
     ) -> None:
         self._local_names = local_names
         self._cells = cells
         # ``None`` == pickled by reference, so no global is readable.
         self._global_values = global_values
-        self._instance = instance
 
     def lookup_name(self, name: str) -> Any:
         if name in self._local_names:
@@ -501,111 +389,6 @@ class _CapturedScope:
             f"name {name!r} is not a parameter and could not be resolved from the UDF's scope"
         )
 
-    def lookup_self_attr(self, attr: str) -> Any:
-        """Resolve ``self.<attr>`` on a callable instance / bound method."""
-        if self._instance is None:
-            raise UnsupportedOperationException(
-                "attribute access on `self` is only supported for callable "
-                "instances and bound methods"
-            )
-        receiver = self._instance
-        # Reading the dicts below only tracks real attribute access while the
-        # default lookup is in force; a custom ``__getattribute__`` can return
-        # anything. ``__getattr__`` needs no guard: it only fires when lookup
-        # fails, and a lookup that finds nothing here already refuses.
-        if type(receiver).__getattribute__ not in (
-            object.__getattribute__,
-            type.__getattribute__,
-        ):
-            raise UnsupportedOperationException(
-                f"{type(receiver).__name__} overrides `__getattribute__`, so "
-                f"`self.{attr}` need not be the value stored on the instance or "
-                "class; falling back to interpreted Python"
-            )
-        if isinstance(receiver, type):
-            # A bound classmethod's receiver IS the class, so there is no
-            # instance ``__dict__`` to snapshot: every attribute comes from the
-            # MRO and has to clear the per-class gate below.
-            instance_dict: Dict[str, Any] = {}
-            mro = receiver.__mro__
-            # ``type.__getattribute__`` consults the METACLASS for a data
-            # descriptor before the class's own ``__dict__``, so one found there
-            # outranks everything ``mro`` holds.
-            metaclass: Any = type(receiver)
-            meta = next((m for m in metaclass.__mro__ if attr in m.__dict__), None)
-            if meta is not None and _is_data_descriptor(meta.__dict__[attr]):
-                raise UnsupportedOperationException(
-                    f"`self.{attr}` resolves to a data descriptor on the metaclass "
-                    f"{meta.__name__}, which outranks the class attribute and is "
-                    "computed per process; falling back to interpreted Python"
-                )
-        else:
-            try:
-                instance_dict = vars(receiver)
-            except TypeError:
-                # ``__slots__`` classes have no instance ``__dict__``.
-                instance_dict = {}
-            mro = type(receiver).__mro__
-        # Any non-default pickling hook can rewrite or INJECT state, so it makes
-        # the whole instance untrustworthy -- not just the attributes the driver
-        # happens to hold. A ``__setstate__`` that sets an attribute absent here
-        # would otherwise be answered from the class, silently.
-        if not _instance_dict_is_shipped(receiver):
-            raise UnsupportedOperationException(
-                f"{type(receiver).__name__} customizes pickling, so the executor "
-                f"may reconstruct it with a different `{attr}`; falling back to "
-                "interpreted Python"
-            )
-        # Resolve against the MRO before the instance ``__dict__``: a data
-        # descriptor outranks it in Python's real lookup, so an instance hit
-        # cannot be trusted until we know what the MRO holds.
-        owner = next((klass for klass in mro if attr in klass.__dict__), None)
-        if owner is None:
-            # Nothing in the MRO, so the instance dict is the whole story.
-            if attr in instance_dict:
-                return instance_dict[attr]
-            raise UnsupportedOperationException(
-                f"`self.{attr}` could not be resolved to a value cloudpickle "
-                "would capture by value; falling back to interpreted Python"
-            )
-        value = owner.__dict__[attr]
-        # Read the class ``__dict__`` rather than ``getattr`` so a descriptor
-        # (property, method, classmethod) is never invoked: its result is computed
-        # per process, not snapshotted. Refused even when the instance ``__dict__``
-        # also holds the name -- only a data descriptor would actually win there,
-        # and telling the two apart is not worth it for a collision this rare.
-        if hasattr(type(value), "__get__"):
-            raise UnsupportedOperationException(
-                f"`self.{attr}` resolves to a descriptor "
-                f"({type(value).__name__}), whose value is not "
-                "captured by cloudpickle; falling back to "
-                "interpreted Python"
-            )
-        if attr in instance_dict:
-            return instance_dict[attr]
-        # Two gates, because a class travels only if BOTH hold. The receiver's own
-        # class first: when that is by reference the executor re-imports it and
-        # rebuilds its whole hierarchy, so a by-value base is never shipped and
-        # its attribute is whatever re-import produces.
-        receiver_class = receiver if isinstance(receiver, type) else type(receiver)
-        if not _pickled_by_value(receiver_class):
-            raise UnsupportedOperationException(
-                f"`{attr}` is reached through {receiver_class.__name__}, which "
-                "cloudpickle pickles by reference, so the executor re-imports it "
-                "and rebuilds its bases; falling back to interpreted Python"
-            )
-        # Then the defining class on its OWN mode: cloudpickle ships only a
-        # by-value class's own ``__dict__`` and pickles each base separately, so a
-        # by-value subclass can inherit from a by-reference base.
-        if not _pickled_by_value(owner):
-            raise UnsupportedOperationException(
-                f"`self.{attr}` is defined on {owner.__name__}, which "
-                "cloudpickle pickles by reference, so the executor "
-                "re-imports that class and reads whatever the attribute "
-                "holds there; falling back to interpreted Python"
-            )
-        return value
-
 
 def _capture_scope(func: Callable) -> _CapturedScope:
     """Build the capture table for ``func``, gated on cloudpickle's behaviour."""
@@ -619,18 +402,12 @@ def _capture_scope(func: Callable) -> _CapturedScope:
     # executor would receive.
     cells = dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
 
-    if inspect.ismethod(func):
-        instance: Optional[Any] = func.__self__
-    elif isinstance(func, types.FunctionType):
-        instance = None
-    else:
-        instance = func
-
     # Globals follow the function that CARRIES the code: ``_method_reduce``
     # reduces a bound method to its ``__func__``, so gating on the instance's
     # class would bake globals for a method inherited from a by-reference base.
     globals_travel = _pickled_by_value(fn)
-    if globals_travel and instance is not None and not inspect.ismethod(func):
+    is_callable_instance = not isinstance(func, types.FunctionType) and not inspect.ismethod(func)
+    if globals_travel and is_callable_instance:
         # A callable instance reaches its code through ``type(func).__call__``,
         # which cloudpickle ships only when BOTH the class owning ``__call__`` and
         # the receiver's own class are by value. A by-reference class anywhere on
@@ -654,140 +431,27 @@ def _capture_scope(func: Callable) -> _CapturedScope:
         local_names=set(code.co_varnames),
         cells=cells,
         global_values=global_values,
-        instance=instance,
     )
 
 
-class _ScopeNormalizer(ast.NodeTransformer):
-    """Rewrite captured names into constants and inline local bindings.
+class _LiteralNormalizer(ast.NodeTransformer):
+    """Rewrite captured names into constants and substitute literal-valued locals.
 
     After this runs, the only ``ast.Name`` nodes left are UDF parameters, so the
     lowering code in :class:`CatalystTranspiler` needs no knowledge of scopes.
+
+    Every binding in ``_env`` is an ``ast.Constant``, which is what keeps this a
+    plain substitution: a literal has no evaluation to duplicate, defer, or
+    discard, so unlike inlining an arbitrary expression there is nothing to track
+    about where -- or whether -- the name is read.
     """
 
     def __init__(self, params: List[str], scope: _CapturedScope, self_param: Optional[str]) -> None:
         self._params = set(params)
         self._scope = scope
         self._self_param = self_param
-        # name -> already-normalized expression it is bound to
-        self._env: Dict[str, ast.expr] = {}
-        # Inlining moves an assignment's right-hand side to its USE sites, so a
-        # binding that is never read, or is read only inside a ternary branch or
-        # after a short-circuit, loses Python's eager evaluation of it. That is
-        # only safe when evaluating it could not have raised, so a binding whose
-        # value may raise owes an unconditional read; see _note_use.
-        self._cond_depth = 0
-        # A single assignment can bind several names (`a = b = x % 2`), and any
-        # one of them being read unconditionally evaluates the shared value, so
-        # the obligation belongs to the assignment (a group), not to each name.
-        self._raiser_group: Dict[str, int] = {}
-        self._pending_groups: Dict[int, str] = {}
-        self._next_group = 0
-
-    def _may_raise_if_removed(self, node: ast.AST) -> bool:
-        """Whether removing ``node`` from the plan could hide an error Python raises.
-
-        Conservative: any node type not on ``_REMOVED_VALUE_SAFE_NODES`` counts as
-        raising, so new syntax is unsafe-by-default rather than silently droppable.
-        A bare ``ast.Name`` is only safe for a parameter or a local binding -- any
-        other name is resolved from the enclosing scope, and an unbound one is a
-        NameError / UnboundLocalError there (``def f(x): undefined_name`` would
-        otherwise lower to NULL). A binding's own value is covered by the
-        obligation ``_note_use`` tracks.
-        """
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Name):
-                if inner.id not in self._params and inner.id not in self._env:
-                    return True
-            elif not isinstance(inner, _REMOVED_VALUE_SAFE_NODES):
-                return True
-        return False
-
-    def _note_use(self, name: str) -> None:
-        """Record a read of ``name``, discharging its group when unconditional."""
-        group = self._raiser_group.get(name)
-        if group is None or self._cond_depth:
-            # A conditional read cannot stand in for Python's eager evaluation:
-            # the branch may not be taken, and then nothing evaluates the value.
-            return
-        # Reached whenever this value is evaluated, so Python would have raised
-        # here too. When the read is inside another binding's right-hand side
-        # that binding inherits the obligation -- splicing this tree in carries
-        # the raising node along, so normalize_body registers it as a raiser too.
-        self._pending_groups.pop(group, None)
-
-    def check_deferred_raisers(self) -> None:
-        """Refuse a body that dropped or made conditional a raising assignment."""
-        if self._pending_groups:
-            what = ", ".join(sorted(self._pending_groups.values()))
-            raise UnsupportedOperationException(
-                f"the assignment to {what} may raise but its value is never read "
-                "unconditionally, so inlining it would discard or defer an error "
-                "Python raises eagerly; falling back to interpreted Python"
-            )
-
-    @contextlib.contextmanager
-    def _deferred(self) -> Iterator[None]:
-        """Mark reads inside this block as not-certainly-evaluated."""
-        self._cond_depth += 1
-        try:
-            yield
-        finally:
-            self._cond_depth -= 1
-
-    def visit(self, node: ast.AST) -> Any:
-        # Default-deny: the visitors below know exactly which of their children
-        # are conditional; every OTHER construct (a comprehension, a lambda body,
-        # a loop, a `try`) is treated as deferring, so the guard does not depend
-        # on that list staying complete. The lowering rejects all of them today,
-        # so this only ever adds conservatism.
-        if isinstance(node, _EVALUATED_WHERE_IT_APPEARS):
-            return super().visit(node)
-        with self._deferred():
-            return super().visit(node)
-
-    def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
-        # `body if test else orelse`: only ``test`` is certain to be evaluated.
-        # This and the three visitors below re-implement the child walk to
-        # bracket it with a depth change. No visitor in this class ever returns
-        # ``None`` or a list (the ``NodeTransformer`` idioms for removing or
-        # splicing nodes), which is what makes the ``cast`` calls safe.
-        node.test = cast(ast.expr, self.visit(node.test))
-        with self._deferred():
-            node.body = cast(ast.expr, self.visit(node.body))
-            node.orelse = cast(ast.expr, self.visit(node.orelse))
-        return node
-
-    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
-        # `a and b` / `a or b` short-circuit, so only the first operand is
-        # certain to be evaluated.
-        values = [cast(ast.expr, self.visit(node.values[0]))]
-        with self._deferred():
-            values.extend(cast(ast.expr, self.visit(v)) for v in node.values[1:])
-        node.values = values
-        return node
-
-    def visit_Compare(self, node: ast.Compare) -> ast.AST:
-        # A chained comparison short-circuits: `a < b < c` never evaluates `c`
-        # when `a < b` is false, so only ``left`` and the FIRST comparator are
-        # certain. The lowering refuses chains outright, so this is currently
-        # only about not being sound by accident.
-        node.left = cast(ast.expr, self.visit(node.left))
-        comparators = [cast(ast.expr, self.visit(node.comparators[0]))]
-        with self._deferred():
-            comparators.extend(cast(ast.expr, self.visit(c)) for c in node.comparators[1:])
-        node.comparators = comparators
-        return node
-
-    def visit_If(self, node: ast.If) -> ast.AST:
-        # A trailing `if` / `elif` / `else` lowers to a CASE, so a read inside a
-        # branch is no more certain than one in a ternary branch (`elif` nests
-        # another ``ast.If`` in ``orelse``, which just compounds the depth).
-        node.test = cast(ast.expr, self.visit(node.test))
-        with self._deferred():
-            node.body = [cast(ast.stmt, self.visit(s)) for s in node.body]
-            node.orelse = [cast(ast.stmt, self.visit(s)) for s in node.orelse]
-        return node
+        # name -> the literal it is bound to, as of the statement being visited
+        self._env: Dict[str, ast.Constant] = {}
 
     @staticmethod
     def _bake(description: str, value: Any) -> ast.expr:
@@ -844,11 +508,11 @@ class _ScopeNormalizer(ast.NodeTransformer):
         if not isinstance(node.ctx, ast.Load):
             return node
         # The local binding table is consulted BEFORE the parameter list: a
-        # parameter is an ordinary local and may be rebound, in which case every
-        # later read must see the new expression. Checking parameters first would
-        # turn `def f(a): a = a + 1; return a * 2` into `a * 2`.
+        # parameter is an ordinary local and may be rebound to a literal, in which
+        # case every later read must see that literal rather than the column.
+        # Checking parameters first would turn `def f(a): a = 5; return a * 2`
+        # into `a * 2`.
         if node.id in self._env:
-            self._note_use(node.id)
             # Each use gets its own copy so the tree stays free of shared nodes.
             return copy.deepcopy(self._env[node.id])
         if node.id == self._self_param:
@@ -865,37 +529,19 @@ class _ScopeNormalizer(ast.NodeTransformer):
             return node
         return self._bake(f"captured name {node.id!r}", self._scope.lookup_name(node.id))
 
-    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        if (
-            isinstance(node.ctx, ast.Load)
-            and self._self_param is not None
-            and isinstance(node.value, ast.Name)
-            and node.value.id == self._self_param
-            # A rebound receiver is no longer the receiver.
-            and node.value.id not in self._env
-        ):
-            return self._bake(
-                f"`{self._self_param}.{node.attr}`",
-                self._scope.lookup_self_attr(node.attr),
-            )
-        return self.generic_visit(node)
+    def _assignment_targets(self, stmt: ast.stmt) -> Tuple[List[str], ast.expr]:
+        """The names ``stmt`` binds and the expression it binds them to.
 
-    def _desugar_assignment(self, stmt: ast.stmt) -> Tuple[List[str], ast.expr]:
-        """Reduce the three assignment forms to (target names, value)."""
+        ``ast.AugAssign`` (``b += 1``) is refused outright rather than desugared to
+        ``b = b + 1``: the result is an arithmetic expression, which this
+        transpiler does not evaluate. See ``_as_literal``.
+        """
         if isinstance(stmt, ast.AugAssign):
-            if not isinstance(stmt.target, ast.Name):
-                raise UnsupportedOperationException(
-                    f"augmented assignment to {type(stmt.target).__name__} is "
-                    "not supported by the transpiler"
-                )
-            # `b += e` is `b = b + e`; the read of `b` resolves against the env
-            # as it stands before this statement.
-            value: ast.expr = ast.BinOp(
-                left=ast.Name(id=stmt.target.id, ctx=ast.Load()),
-                op=stmt.op,
-                right=stmt.value,
+            raise UnsupportedOperationException(
+                "augmented assignment (`b += ...`) computes a value rather than "
+                "binding a literal, which the transpiler does not support; "
+                "falling back to interpreted Python"
             )
-            return [stmt.target.id], value
         if isinstance(stmt, ast.AnnAssign):
             if stmt.value is None:
                 raise UnsupportedOperationException(
@@ -920,18 +566,12 @@ class _ScopeNormalizer(ast.NodeTransformer):
         return names, stmt.value
 
     def normalize_body(self, body: List[ast.stmt]) -> ast.stmt:
-        """Collapse ``body`` to one statement, refusing unsound assignments.
+        """Collapse ``body`` to a single statement, refusing what cannot be bound.
 
-        The deferred-raise check runs here rather than in the caller: this method
-        has several exits, and a guard the caller has to remember to invoke is one
-        refactor away from being silently dropped.
+        Assignments are consumed here: each binds its name(s) to a literal in
+        ``_env``, and later reads of those names substitute it (see
+        ``visit_Name``). Only the final statement survives as the returned one.
         """
-        statement = self._normalize_body(body)
-        self.check_deferred_raisers()
-        return statement
-
-    def _normalize_body(self, body: List[ast.stmt]) -> ast.stmt:
-        """Collapse ``body`` to one statement."""
         # Python treats a leading string expression as the docstring: it binds
         # nothing and cannot raise, so drop it and normalize what follows. Only
         # the first statement is a docstring, and only when something follows it
@@ -942,25 +582,25 @@ class _ScopeNormalizer(ast.NodeTransformer):
         for index, stmt in enumerate(body):
             is_last = index == len(body) - 1
             if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                names, value = self._desugar_assignment(stmt)
-                # Inline against the env as of this point, then bind. Binding
-                # after visiting is what makes `b = b + 1` mean the old `b`.
-                inlined = self.visit(ast.fix_missing_locations(value))
-                # Bound here rather than only at the end: see _check_node_budget.
-                _check_node_budget(inlined, f"the binding of {names[0]!r}")
+                names, value = self._assignment_targets(stmt)
+                # Resolve against the env as it stands BEFORE this statement, then
+                # bind. Visiting first is what makes `b = 1` then `b = b` legal
+                # while keeping each binding's value the one in scope at the time.
+                resolved = self.visit(ast.fix_missing_locations(value))
+                literal = _as_literal(resolved)
+                if literal is None:
+                    raise UnsupportedOperationException(
+                        f"the assignment to {', '.join(map(repr, names))} does not "
+                        "bind a literal; the transpiler only supports assignments "
+                        "whose value is a constant or a captured scalar, not one it "
+                        "would have to compute, so this falls back to interpreted "
+                        "Python"
+                    )
                 for name in names:
-                    # Drop any obligation the OLD binding of this name carried:
-                    # once rebound, reads resolve to the new value and can no
-                    # longer evaluate the old one. `a = x % 0; a = 5; return a`
-                    # must still fall back, because Python evaluates `x % 0`.
-                    self._raiser_group.pop(name, None)
-                    self._env[name] = inlined
-                if self._may_raise_if_removed(inlined):
-                    self._pending_groups[self._next_group] = ", ".join(map(repr, names))
-                    for name in names:
-                        self._raiser_group[name] = self._next_group
-                    self._next_group += 1
+                    self._env[name] = literal
                 if is_last:
+                    # An assignment evaluates nothing beyond a literal and yields
+                    # no value, so a body ending in one returns None.
                     return ast.Return(value=None)
                 continue
             if isinstance(stmt, ast.Pass) and is_last:
@@ -968,12 +608,15 @@ class _ScopeNormalizer(ast.NodeTransformer):
                 return ast.Return(value=None)
             if isinstance(stmt, ast.Expr) and is_last:
                 # A trailing bare expression discards its value, so the function
-                # returns None. Only lower it away when evaluating it could not
-                # have raised: dropping `x % 0` would turn Python's
-                # ZeroDivisionError into a NULL, and dropping `x + "abc"` a
-                # TypeError. Checked on the expression rather than the ``ast.Expr``
-                # wrapper, which is a statement and so never exempt.
-                if self._may_raise_if_removed(stmt.value):
+                # returns None. Only drop it when evaluating it could not have
+                # raised: discarding `x % 0` would turn Python's ZeroDivisionError
+                # into a NULL, and `x + "abc"` a TypeError. After visiting, a
+                # literal or a bare column read is all that is safe to discard.
+                discarded = self.visit(ast.fix_missing_locations(stmt.value))
+                safe = _as_literal(discarded) is not None or (
+                    isinstance(discarded, ast.Name) and discarded.id in self._params
+                )
+                if not safe:
                     raise UnsupportedOperationException(
                         "this function returns None but its final expression "
                         "could raise when evaluated, so discarding it would "
@@ -995,11 +638,10 @@ def _normalize_function(
     params: List[str],
     receiver: Optional[str],
 ) -> ast.FunctionDef:
-    """Resolve scope and inline assignments, yielding a one-statement body.
+    """Resolve scope and literal assignments, yielding a one-statement body.
 
     ``receiver`` is the name of the implicit first parameter, or ``None`` when the
-    call site supplies every parameter. It is determined from the binding by
-    :func:`_analyze_func`, not from the name.
+    call site supplies every parameter.
 
     Raises :class:`UnsupportedOperationException` when anything cannot be
     resolved soundly, which the caller turns into a fallback.
@@ -1015,25 +657,19 @@ def _normalize_function(
                 "function and are not supported by the transpiler"
             )
     scope = _capture_scope(func)
-    normalizer = _ScopeNormalizer(params, scope, receiver)
+    normalizer = _LiteralNormalizer(params, scope, receiver)
     # ``ast.NodeTransformer`` rewrites in place, and the caller holds onto
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
     # construction and again when its judf is created). Normalizing the original
-    # would compound: `a = a + 1; return a * 2` would become `(a + 1) * 2`, then
-    # `((a + 1) + 1) * 2` on the next build. Work on a copy.
-    # Depth-check the SOURCE before copying it. ``deepcopy`` recurses once per
-    # AST level, as does the lowering after it, so a deeply nested body
-    # (`a + a + ...`, a couple of hundred terms) exhausts the stack inside the
-    # copy below and surfaces as "maximum recursion depth exceeded" from a frame
-    # with no headroom left, rather than a message saying what happened. The node
-    # budget cannot stand in for this: depth, not size, is what recurses.
-    _check_node_depth(function_ast, "the function body as written")
+    # would let a rebound capture leak between builds, so work on a copy.
+    #
+    # No depth or size guard is needed. Substituting literals cannot grow the tree,
+    # and a body nested deeply enough to exhaust the stack in ``deepcopy`` raises
+    # RecursionError, which ``_build_transpiled``'s ``except Exception`` turns into
+    # an ordinary fallback -- the same way an over-deep body behaves without any of
+    # this rewriting.
     source = copy.deepcopy(function_ast)
     statement = normalizer.normalize_body(source.body)
-    _check_node_budget(statement, "the function body")
-    # Inlining deepens as well as widens (`b = -a; c = -b; ...` collapses into one
-    # nested chain), and the node budget above does not bound depth.
-    _check_node_depth(statement, "the inlined function body")
     # Replace the copy's body rather than constructing a fresh ``ast.FunctionDef``.
     # Every other field (notably ``type_params``, which exists only on 3.12+)
     # carries over untouched, so this needs no per-version handling -- and it
@@ -1338,36 +974,6 @@ class CatalystTranspiler(AbstractTranspiler):
                 # `_convert_chunk`; treat as numeric for category purposes.
                 return "numeric"
 
-    def _require_integral_repeat_count(self, params: List[str], node: ast.AST) -> None:
-        """Constrain a string-repeat count to a whole number, or refuse the variant.
-
-        A literal or baked ``int`` settles it here. A bare parameter cannot --
-        its ``"numeric"`` category covers DOUBLE as well as LONG -- so record it
-        and let ``_declared_categories`` narrow this option to ``"integral"``,
-        which the JVM prunes against the bound column type. Only the label
-        changes, so the option matrix does not grow.
-
-        Anything else (`s * (k + 1)`, a float literal) refuses: deciding whether
-        a compound expression stays integral needs an analysis this does not have.
-        """
-        if _is_definitely_integral(node):
-            return
-        if isinstance(node, ast.Name) and node.id in params:
-            self._integral_params.add(params.index(node.id))
-            return
-        raise UnsupportedOperationException(
-            "the count in a string repeat (`s * n`) is not statically a whole "
-            "number; Python raises TypeError for a fractional count while "
-            "Spark's `repeat` would truncate it, so this falls back to "
-            "interpreted Python"
-        )
-
-    def _declared_categories(self, combo: dict, n_params: int) -> List[str]:
-        categories = super()._declared_categories(combo, n_params)
-        for index in self._integral_params:
-            categories[index] = "integral"
-        return categories
-
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
         match body:
             case None:
@@ -1573,12 +1179,13 @@ class CatalystTranspiler(AbstractTranspiler):
                             return left_col.__mul__(right_col)
                         # Repeat needs a whole count: Python raises TypeError for
                         # a fractional one, so lowering it would return a value
-                        # where Python raises. See ``_is_definitely_integral``.
+                        # where Python raises. See
+                        # ``_refuse_fractional_repeat_count``.
                         if lc == "string" and rc == "numeric":
-                            self._require_integral_repeat_count(params, right)
+                            _refuse_fractional_repeat_count(right)
                             return repeat(left_col, right_col.cast("int"))
                         if lc == "numeric" and rc == "string":
-                            self._require_integral_repeat_count(params, left)
+                            _refuse_fractional_repeat_count(left)
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
                         if lc == rc == "numeric":
@@ -1652,10 +1259,6 @@ class CatalystTranspiler(AbstractTranspiler):
         # Per-variant input-type assumption ({public_param_index -> category}),
         # read by ``_category`` to choose str vs numeric operators.
         self._param_categories = param_categories or {}
-        # Params this variant needs narrowed from "numeric" to "integral"; filled
-        # by the lowering below and read back by ``_declared_categories``. Reset
-        # per variant, since it describes the option about to be produced.
-        self._integral_params: Set[int] = set()
         function_body = function_ast.body
         if len(function_body) != 1:
             raise UnsupportedOperationException(
@@ -1983,40 +1586,27 @@ def _analyze_func(
             "positional-only arguments are not supported by the transpiler"
         ]
     params = _get_parameter_list(function_ast)
-    # Is the leading declared parameter an implicit receiver? Derive that from the
-    # BINDING, not the parameter's NAME -- ``self``/``cls`` are conventions, so a
-    # name test misses ``def __call__(this, x)`` and misfires on a plain function
-    # whose first argument happens to be called ``self``. ``inspect.signature``
-    # reports the call-site view, so the difference IS the receiver.
-    try:
-        visible = len(inspect.signature(func).parameters)
-    except (TypeError, ValueError) as e:
+    # The transpiler strips a leading ``self`` on the assumption that the source
+    # came from a bound ``__call__`` / method whose receiver is not supplied at the
+    # call site. A PLAIN function whose first parameter happens to be named
+    # ``self`` breaks that assumption: every argument IS supplied at the call site,
+    # and stripping would misnumber the ``_udf_param_N`` placeholders. Refuse and
+    # fall back rather than guess.
+    #
+    # This is a name test, so it does not recognise a receiver called anything else
+    # (``def __call__(this, x)``); such a UDF misnumbers its columns exactly as it
+    # does without this change. Deriving the receiver from the binding instead is a
+    # separate fix, kept out of this change to hold its scope down.
+    has_receiver = bool(params) and params[0] == "self"
+    if has_receiver and inspect.isfunction(func):
         return None, [
-            f"could not determine the UDF's call signature ({e}), so the "
-            "transpiler cannot tell which parameters the call site supplies"
-        ]
-    hidden = len(params) - visible
-    expected_hidden = _receiver_count_from_binding(func)
-    if hidden != expected_hidden:
-        # The parsed source's arity disagrees with how the object is actually
-        # bound, so the difference is NOT a receiver -- either a lying
-        # ``__signature__`` or (more likely) ``inspect.getsource`` handed us a
-        # different function than the one being called. Treating the extra
-        # parameter as a receiver would shift every column by one. The message
-        # names ``expected_hidden`` because declared and visible can be equal
-        # while the binding still hides a receiver, and reporting only those two
-        # would read as "1 but 1, which does not match".
-        return None, [
-            f"the UDF's source declares {len(params)} parameter(s) and the "
-            f"callable accepts {visible} at the call site, so {hidden} are "
-            f"hidden, but how it is bound hides {expected_hidden}; the "
-            "transpiler cannot map parameters onto columns reliably, so it "
-            "falls back to interpreted Python"
+            "plain function with first parameter named 'self' is ambiguous to "
+            "the transpiler's self-stripping; falling back to interpreted Python"
         ]
     # The caller matches user-supplied kwargs against these, and the user does
     # not name the receiver at the call site.
-    public_params = params[hidden:]
-    receiver = params[0] if hidden else None
+    public_params = params[1:] if has_receiver else list(params)
+    receiver = params[0] if has_receiver else None
     # Warned here rather than while lowering: this depends only on the AST, and
     # ``_build_transpiled`` runs again for every ``judf`` and every read of the
     # ``transpiled`` property, so warning there would repeat for the UDF's life.
@@ -2054,9 +1644,9 @@ def _build_transpiled(
     """
     errors: List[str] = []
     try:
-        # Resolve free variables and inline local assignments once, up front:
-        # the result is value-dependent but category-independent, so it is
-        # shared by every input-type variant below.
+        # Resolve free variables and literal assignments once, up front: the
+        # result is value-dependent but category-independent, so it is shared by
+        # every input-type variant below.
         normalized = _normalize_function(
             func, analysis.function_ast, analysis.params, analysis.receiver
         )
@@ -2085,7 +1675,7 @@ def _build_transpiled(
                 if transpiled_column is not None:
                     transpiled.append(transpiled_column)
                     input_categories.append(
-                        transpiler._declared_categories(combo, len(analysis.public_params))
+                        [combo.get(i, "numeric") for i in range(len(analysis.public_params))]
                     )
             except Exception as e:
                 errors.append(str(e))

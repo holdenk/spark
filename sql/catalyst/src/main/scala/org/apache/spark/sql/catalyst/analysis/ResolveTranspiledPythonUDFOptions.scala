@@ -21,8 +21,7 @@ import org.apache.spark.sql.catalyst.expressions.TranspiledPythonUDF
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.TRANSPILED_PYTHON_UDF
-import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalType, IntegralType,
-  NumericType, StringType}
+import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalType, NumericType, StringType}
 
 /**
  * Prunes the per-input-type options carried by a [[TranspiledPythonUDF]] down to those whose
@@ -65,12 +64,8 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   }
 
   // True when each declared category matches the corresponding argument type:
-  // "numeric" -> NumericType, "integral" -> IntegralType, "string" -> StringType,
-  // "bool" -> BooleanType, "binary" -> BinaryType. "integral" is the narrower
-  // numeric: a string repeat (`s * n`) needs a whole count, since Python raises
-  // TypeError for a fractional one while `repeat` would truncate it, so the
-  // transpiler tags that option's count "integral" and a DOUBLE column prunes it
-  // here. "string" matches only StringType (not BinaryType): a
+  // "numeric" -> NumericType, "string" -> StringType, "bool" -> BooleanType,
+  // "binary" -> BinaryType. "string" matches only StringType (not BinaryType): a
   // bytes/BinaryType column is tagged "binary" instead, so the string lowerings
   // (e.g. `repeat`) never see it. Empty categories means "no restriction", so the
   // option is kept.
@@ -92,7 +87,6 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
     } else {
       categories.zip(argTypes).forall {
         case ("numeric", dt) => dt.isInstanceOf[NumericType] && !dt.isInstanceOf[DecimalType]
-        case ("integral", dt) => dt.isInstanceOf[IntegralType]
         case ("string", st: StringType) => st.isUTF8BinaryCollation
         case ("bool", dt) => dt.isInstanceOf[BooleanType]
         case ("binary", dt) => dt.isInstanceOf[BinaryType]

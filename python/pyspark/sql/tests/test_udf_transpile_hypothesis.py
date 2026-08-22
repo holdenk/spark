@@ -399,31 +399,20 @@ captured_compare_zero = _make_captured_compare(0)
 # chains) are covered by ``test_udf_transpile_assignment_forms`` in
 # test_udf_transpile_unit.py; each generated example here runs two full Spark
 # jobs, so only the shapes with a distinct arithmetic profile are fuzzed.
-def assign_then_double(x):
-    # Local binding used twice, so inlining duplicates the expression.
-    b = x + 4
-    return b + b
+def _make_assign_literals(offset):
+    def binds_literals(x):
+        # One binding written as a literal and one taking its value from a
+        # captured constant. Both are substituted at their read sites, which is
+        # the whole of the assignment support -- a computed right-hand side falls
+        # back instead.
+        b = 4
+        k = offset
+        return x + b + k
+
+    return binds_literals
 
 
-def assign_rebinds_parameter(x):
-    # Rebinding a parameter: every later read must see the new expression.
-    # Getting the resolution order wrong yields a wrong answer, not a fallback.
-    x = x + 1
-    x = x * 2
-    return x
-
-
-def _make_assign_mixes_capture(offset):
-    def mixes(x):
-        # A local binding whose value depends on a captured constant, so the
-        # capture is baked and then duplicated by inlining.
-        scaled = x + offset
-        return scaled + scaled
-
-    return mixes
-
-
-assign_capture_and_binding = _make_assign_mixes_capture(3)
+assign_literals = _make_assign_literals(3)
 
 
 # ----------------------------------------------------------------------------
@@ -598,30 +587,10 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         @_hyp_settings
         @given(value=_long_arith_strategy)
         @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_then_double_matches_python(self, value):
+        def test_assign_literals_matches_python(self, value):
             df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_then_double, LongType(), df, "a")
-            self.assertEqual(transpiled, interpreted, f"assign_then_double mismatch on {value!r}")
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_rebinds_parameter_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_rebinds_parameter, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"assign_rebinds_parameter mismatch on {value!r}"
-            )
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_capture_and_binding_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_capture_and_binding, LongType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"assign_capture_and_binding mismatch on {value!r}"
-            )
+            transpiled, interpreted = self._run(assign_literals, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"assign_literals mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_arith_strategy)
