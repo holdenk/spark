@@ -54,9 +54,10 @@ To run locally::
 
 Set ``RUN_HYPOTHESIS_MAX_EXAMPLES`` to override the per-test example count
 (default 1000). Each generated example runs two full Spark jobs (a
-transpiled-vs-interpreted differential), so CI caps this at 50 via
-``build_and_test.yml`` to stay under ``PYSPARK_TEST_TIMEOUT``; the explicit
-``@example`` edge seeds always run on top of the generated ones regardless.
+transpiled-vs-interpreted differential), so CI caps this at 20 via
+``build_and_test.yml`` to stay under ``PYSPARK_TEST_TIMEOUT`` -- which covers
+this whole module, not one test; the explicit ``@example`` edge seeds always
+run on top of the generated ones regardless.
 """
 
 import os
@@ -74,7 +75,7 @@ from pyspark.sql.types import (
 from pyspark.sql.udf import UserDefinedFunction
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import have_package
-from pyspark.util import is_remote_only
+from pyspark.util import JVM_LONG_MAX, JVM_LONG_MIN, is_remote_only
 
 
 # Sentinel value used by ``_run`` to mark "this side raised". A unique
@@ -123,11 +124,13 @@ if _have_hypothesis:
     )
 
     # Full 64-bit signed range -- used by comparison and equality tests where
-    # no arithmetic can overflow.
-    _LONG_BOUND = 2**63 - 1
-    _long_strategy = st.one_of(
-        st.none(), st.integers(min_value=-_LONG_BOUND, max_value=_LONG_BOUND)
-    )
+    # no arithmetic can overflow. The range is asymmetric, so the minimum is
+    # JVM_LONG_MIN rather than -JVM_LONG_MAX: LongType's true floor is exactly
+    # the boundary ``_ScopeNormalizer._bake``'s range gate is written against,
+    # and none of these UDFs negates its input, so drawing it is safe here.
+    _LONG_BOUND = JVM_LONG_MAX
+    _LONG_FLOOR = JVM_LONG_MIN
+    _long_strategy = st.one_of(st.none(), st.integers(min_value=_LONG_FLOOR, max_value=_LONG_BOUND))
 
     # Narrower range for arithmetic tests (+4, -2, *3, +7, x+y).  Python's
     # arithmetic never overflows, but Spark's ANSI mode raises on LongType
@@ -156,7 +159,21 @@ if _have_hypothesis:
     # value -- e.g. NULL, zero, the type's max -- deterministic across
     # runs. These are the values we always want to try, before random
     # generation kicks in.
-    _LONG_EDGES = (None, 0, 1, -1, 7, -7, _INT32_MAX, _INT32_MIN, _LONG_BOUND, -_LONG_BOUND)
+    _LONG_EDGES = (
+        None,
+        0,
+        1,
+        -1,
+        7,
+        -7,
+        _INT32_MAX,
+        _INT32_MIN,
+        _LONG_BOUND,
+        -_LONG_BOUND,
+        # Seeded explicitly as well as generated: negating it overflows, so it is
+        # the value most likely to expose an off-by-one in a range guard.
+        _LONG_FLOOR,
+    )
     _LONG_ARITH_EDGES = (None, 0, 1, -1, 7, -7, _LONG_ARITH_BOUND, -_LONG_ARITH_BOUND)
     # Bool space is exhaustive (only three values) so the @example
     # decorators here serve more as documentation of the NULL handling
@@ -350,6 +367,54 @@ def neq_pair(x, y):
 lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 
 
+# Scope capture and local assignment (SPARK-55207).
+
+
+def _make_plus_captured(offset):
+    def plus_captured(x):
+        # Bakes a captured int into an arithmetic lowering.
+        return x + offset
+
+    return plus_captured
+
+
+def _make_captured_compare(threshold):
+    def captured_compare(x):
+        # A captured value on the right of an ordering comparison. The explicit
+        # else keeps this a single terminal ``if`` statement, and the guard keeps
+        # NULL away from ``>`` (which the transpiler lowers with a raise).
+        if x is None:
+            return False
+        else:
+            return x > threshold
+
+    return captured_compare
+
+
+plus_captured_four = _make_plus_captured(4)
+captured_compare_zero = _make_captured_compare(0)
+
+
+# The remaining assignment shapes (multi-target, annotated, augmented, longer
+# chains) are covered by ``test_udf_transpile_assignment_forms`` in
+# test_udf_transpile_unit.py; each generated example here runs two full Spark
+# jobs, so only the shapes with a distinct arithmetic profile are fuzzed.
+def _make_assign_literals(offset):
+    def binds_literals(x):
+        # One binding written as a literal and one taking its value from a
+        # captured constant. Both are substituted at their read sites, which is
+        # the whole of the assignment support -- a computed right-hand side falls
+        # back instead.
+        b = 4
+        k = offset
+        return x + b + k
+
+    return binds_literals
+
+
+assign_literals = _make_assign_literals(3)
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -382,6 +447,18 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         transpilation-related warning may fire. Without these checks both
         runs could silently fall back to interpreted Python and the
         differential assertion would succeed for the wrong reason.
+
+        A one-sided raise fails in either direction, with one carve-out: Spark
+        arithmetic propagates NULL where the Python UDF receives ``None`` and
+        raises ``TypeError``, which is a documented value-level divergence (see
+        the BinOp notes in ``transpile.py``). Every strategy here draws ``None``,
+        so that shape is recognised structurally -- a NULL result from a row with
+        a NULL in a bound column -- rather than waved through per test.
+
+        Nothing broader is tolerated. Copying the transpiled value onto the
+        interpreted side unconditionally, as this used to, made the whole suite
+        blind to "transpiled returned a value where Python raised" -- which is
+        what `"ab" * 2.5` -> 'abab' was, and what the dropped-binding NULLs were.
         """
         func_name = getattr(func, "__name__", repr(func))
         kwargs = kwargs or {}
@@ -441,15 +518,25 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 interpreted_value = _SENTINEL_RAISED
                 interpreted_error = e
 
-        # If the transpiled path raises an exception we also need the interpreted path to raise one,
-        # however if the Python code (that in the interpreted path) raises an exception, the transpiled
-        # path may return a valid value.
+        # A one-sided raise is a divergence in EITHER direction, so both fail here.
         if transpiled_error is not None:
             self.assertIsNotNone(
                 interpreted_error,
                 f"{func_name!r}: transpiled raised {transpiled_error!r} but interpreted did not",
             )
         elif interpreted_error is not None:
+            # Only the NULL-propagation carve-out above. The input row is read
+            # here rather than up front so the common path pays nothing for it.
+            bound_columns = list(udf_arg_columns) + list(kwargs.values())
+            input_row = df.first()
+            null_input = any(input_row[column] is None for column in bound_columns)
+            self.assertTrue(
+                transpiled_value is None and null_input,
+                f"{func_name!r}: interpreted Python raised {interpreted_error!r} while the "
+                f"transpiled plan returned {transpiled_value!r} for input {input_row!r}. A "
+                "transpiled UDF must not produce a value where Python raises; only NULL out of "
+                "a NULL input is an accepted divergence.",
+            )
             interpreted_value = transpiled_value
 
         return transpiled_value, interpreted_value
@@ -476,6 +563,34 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four, LongType(), df, "a")
             self.assertEqual(transpiled, interpreted, f"plus_four mismatch on {value!r}")
+
+        # -- scope capture and local assignment (SPARK-55207) ----------------
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_captured_offset_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(plus_captured_four, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"plus_captured_four mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
+        def test_captured_compare_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(captured_compare_zero, BooleanType(), df, "a")
+            self.assertEqual(
+                transpiled, interpreted, f"captured_compare_zero mismatch on {value!r}"
+            )
+
+        @_hyp_settings
+        @given(value=_long_arith_strategy)
+        @_seed_examples(_LONG_ARITH_EDGES)
+        def test_assign_literals_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(assign_literals, LongType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"assign_literals mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_arith_strategy)

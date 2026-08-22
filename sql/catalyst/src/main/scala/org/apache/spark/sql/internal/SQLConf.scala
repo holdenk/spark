@@ -620,7 +620,15 @@ object SQLConf {
         "UDF construction. Transpiled UDFS attempt to match the Python functionality but " +
         "may not be 100% equivalent. Some known differences include: overflows from input types " +
         "(you can precast to decimal to avoid), type coercion on comparison, and implicit " +
-        "returns. This initial version only works with non-Connect Spark; Spark Connect " +
+        "returns. A UDF that reads a free variable (a closure cell or a module global) " +
+        "may have that value baked into the plan as a literal, read at the same moment " +
+        "the interpreted path pickles the function, so rebinding the name afterwards " +
+        "changes neither. Baking is limited to values cloudpickle would capture by " +
+        "value, and a local assignment is only supported when it binds a literal. A " +
+        "UDF whose free variables, assignments or return type fall outside what the " +
+        "transpiler supports falls back to interpreted Python; see the " +
+        "pyspark.sql.transpile module documentation for the exact rules. " +
+        "This initial version only works with non-Connect Spark; Spark Connect " +
         "support is to follow. This is an *experimental* feature."
     )
     .version("4.3.0")
