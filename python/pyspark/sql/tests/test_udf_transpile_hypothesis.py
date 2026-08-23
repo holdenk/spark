@@ -433,7 +433,7 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         "ANSI mode",
     )
 
-    # (func name, return type) pairs whose lowering ``_run`` has already
+    # (function object, return type) pairs whose lowering ``_run`` has already
     # asserted on; see the note there.
     _transpile_checked: set = set()
 
@@ -446,11 +446,12 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         (e.g. ``kwargs={"y": "b", "x": "a"}`` to bind UDF parameter ``y``
         to column ``b`` and ``x`` to column ``a``). Use either, or both.
 
-        Asserts the transpiled code path was actually exercised:
-        ``transpiled`` must be non-empty after construction, and no
-        transpilation-related warning may fire. Without these checks both
-        runs could silently fall back to interpreted Python and the
-        differential assertion would succeed for the wrong reason.
+        Asserts the transpiled code path was actually exercised: ``transpiled``
+        must be non-empty after construction -- checked once per (function,
+        return type), see the note below -- and no transpilation-related warning
+        may fire, on every example. Without these checks both runs could silently
+        fall back to interpreted Python and the differential assertion would
+        succeed for the wrong reason.
 
         A one-sided raise fails in either direction, with one carve-out: Spark
         arithmetic propagates NULL where the Python UDF receives ``None`` and
@@ -482,8 +483,12 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 # node. Every function this suite passes in is module-level and
                 # captures nothing hypothesis generates -- only the DataFrame rows
                 # vary per example -- so the answer is fixed per (func, return
-                # type) and checking it once is enough.
-                check_key = (func_name, return_type.simpleString())
+                # type) and checking it once is enough. Keyed on the function
+                # OBJECT, not its name -- the factory closures in this file
+                # (``_make_plus_captured`` and friends) give every instance the
+                # same ``__name__``, so two of them would collide and the second
+                # one's check would be skipped silently.
+                check_key = (func, return_type.simpleString())
                 if check_key not in self._transpile_checked:
                     self.assertTrue(
                         transpiled_udf.transpiled,

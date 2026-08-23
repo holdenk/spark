@@ -280,6 +280,14 @@ def _is_docstring(stmt: ast.stmt) -> bool:
     )
 
 
+# Node types that open a new binding scope. Split so each user takes exactly the
+# set it needs, rather than two hand-maintained lists drifting apart: a
+# ``return``/``yield`` search only has to stop at function-ish bodies, while a
+# name-substituting rewrite has to stop at comprehensions too.
+_FUNCTION_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
 def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
     """Every node under ``body`` that belongs to the enclosing function itself.
 
@@ -287,12 +295,18 @@ def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
     or ``yield`` inside one of them belongs to that scope, not to ours:
     ``ast.walk`` would descend and report ``def f(x):\\n def g(): return 1``
     as having a return.
+
+    Comprehensions are NOT skipped even though they open a scope: a ``return``
+    cannot appear in one and a ``yield`` in one is a syntax error, so descending
+    is harmless here. ``_LiteralNormalizer`` does have to skip them -- it cares
+    about name bindings, not returns -- which is why it uses the wider
+    ``_COMPREHENSION_NODES`` on top of these.
     """
     stack: List[ast.AST] = list(body)
     while stack:
         node = stack.pop()
         yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+        if not isinstance(node, _FUNCTION_SCOPE_NODES):
             stack.extend(ast.iter_child_nodes(node))
 
 
@@ -513,6 +527,11 @@ class _LiteralNormalizer(ast.NodeTransformer):
         """
         return node
 
+    # One alias per node type in ``_FUNCTION_SCOPE_NODES + _COMPREHENSION_NODES``.
+    # Spelled out rather than registered in a loop, because ``ast.NodeVisitor``
+    # dispatches on attribute name and a generated one is invisible to readers and
+    # to grep; ``test_udf_transpile_normalizer_skips_every_scope_node`` fails if
+    # this list and those tuples drift apart.
     visit_Lambda = _visit_nested_scope
     visit_FunctionDef = _visit_nested_scope
     visit_AsyncFunctionDef = _visit_nested_scope
@@ -985,6 +1004,15 @@ class CatalystTranspiler(AbstractTranspiler):
                 return "numeric"
 
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
+        """Lower one expression / statement to a Column.
+
+        Adding an arm for a node that OPENS A SCOPE (``Lambda``, ``FunctionDef``,
+        a comprehension) requires teaching ``_LiteralNormalizer`` to rename or
+        refuse first: it deliberately does not descend into those, so their inner
+        names still refer to their own bindings, and lowering one today would
+        turn ``b = 5; return [b for b in [a]]`` into ``[5 for b in [a]]``. See
+        ``_LiteralNormalizer._visit_nested_scope``.
+        """
         match body:
             case None:
                 # Special case literal None, the implicit return None
@@ -1329,11 +1357,13 @@ CatalystTranspiler.register()
 
 def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     """Get the transpilers we should try."""
-    # Defaulted, so a newer Python client against a driver that does not know this
-    # conf yields "no transpilers" rather than an error.
-    configured_transpilers = session.conf.get(
-        "spark.sql.experimental.optimizer.pyTranspilers", "catalyst"
-    )
+    # Deliberately no client-side default: ``RuntimeConfig.get`` returns the
+    # default INSTEAD of the driver's registered one, so passing "catalyst" here
+    # would shadow ``SQLConf.PYTHON_UDF_TRANSPILERS`` and keep transpiling even
+    # for a driver that set it to "". A driver too old to know the conf raises,
+    # which ``_build_transpiled`` turns into an ordinary fallback. Same reasoning
+    # as ``_transpile_conf_is_true`` in ``udf.py``.
+    configured_transpilers = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers")
     if not configured_transpilers:
         return []
     transpiler_names = configured_transpilers.split(",")
@@ -1445,6 +1475,15 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
     class variables are likewise unsupported.
     """
     if not hasattr(body, "body") or not body.body:
+        return None
+
+    # ``inspect.getsource`` returns whole LINES, so two functions sharing a line
+    # (``add1 = lambda x: x + 1; sub1 = lambda x: x - 1``) both yield source with
+    # two statements in it, and taking the first would lower add1's body for
+    # sub1 -- a silent wrong answer, since the two are indistinguishable by
+    # signature. There is no way to tell from the text which statement the caller
+    # meant, so refuse.
+    if len(body.body) > 1:
         return None
 
     stmt = body.body[0]
@@ -1653,6 +1692,20 @@ def _analyze_func(
     )
 
 
+def _can_transpile(
+    session: "SparkSession", func: Callable[..., Any], analysis: _TranspileAnalysis
+) -> Tuple[bool, List[str]]:
+    """Whether ``func`` lowers at all right now, and the refusals if it does not.
+
+    For validating a UDF where it is defined. Returns a bool rather than the
+    expressions so a truncated option list cannot be mistaken for the full set
+    and end up in a plan -- lowering every variant just to discard it costs a py4j
+    roundtrip per node.
+    """
+    options, errors, _ = _build_transpiled(session, func, analysis, first_only=True)
+    return bool(options), errors
+
+
 def _build_transpiled(
     session: "SparkSession",
     func: Callable[..., Any],
@@ -1665,9 +1718,10 @@ def _build_transpiled(
     into the returned expressions, and they must be the same values
     ``_wrap_function``'s ``cloudpickle`` snapshot sees.
 
-    ``first_only`` stops at the first option produced, for callers that only ask
-    "does this lower at all?" -- every lowered node is a py4j roundtrip, and a
-    result truncated this way must never reach a plan.
+    ``first_only`` stops at the first option produced and so returns a TRUNCATED
+    option list, which must never reach a plan. Callers asking only "does this
+    lower at all?" should go through :func:`_can_transpile`, which returns a bool
+    and cannot be mistaken for the full set.
     """
     errors: List[str] = []
     try:

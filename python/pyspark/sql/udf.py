@@ -245,7 +245,9 @@ class UserDefinedFunction:
         # function -- so the baked literals and the snapshot agree exactly. See
         # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means this
         # UDF is not a candidate at all -- an unsupported signature or return type,
-        # or ``asNondeterministic()``. It is NOT cleared when a lowering refuses:
+        # ``asNondeterministic()``, or a JVM that could not answer the conf reads
+        # below (the ``except`` at the end of this method). It is NOT cleared when
+        # a lowering refuses:
         # that can depend on the captured values, which are re-read every time, so
         # the same UDF may lower later. The options and their input categories are
         # not stored either; ``transpiled`` re-lowers, because a baked capture is
@@ -302,13 +304,14 @@ class UserDefinedFunction:
                 transpile_enabled = False
             if transpile_enabled and session:
                 # Import only if needed, also avoid circular import loops.
-                from pyspark.sql.transpile import _analyze_func, _build_transpiled
+                from pyspark.sql.transpile import _analyze_func, _can_transpile
 
                 # ``self.returnType`` parses (and caches) the declared return
                 # type; the transpiler needs the parsed form to decide whether
                 # the final Cast to it can resolve at all. The parse is reused
                 # later by ``_create_judf``, so this adds no extra JVM work.
                 analysis, errors = _analyze_func(func, self.returnType)
+                lowers = False
                 if analysis is not None:
                     self._transpile_analysis = analysis
                     # Copied rather than aliased -- ``asNondeterministic`` empties
@@ -322,14 +325,10 @@ class UserDefinedFunction:
                     # the analysis: it may be value-dependent (an unbakeable
                     # capture, say), and the values are re-read per lowering, so
                     # the same UDF can transpile later.
-                    options, build_errors, _ = _build_transpiled(
-                        session, func, analysis, first_only=True
-                    )
+                    lowers, build_errors = _can_transpile(session, func, analysis)
                     errors = errors + build_errors
-                    self._transpile_validated = bool(options)
-                else:
-                    options = []
-                if not options:
+                    self._transpile_validated = lowers
+                if not lowers:
                     detail = f": {errors}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
         except Exception as e:
@@ -376,9 +375,7 @@ class UserDefinedFunction:
             options, errors, input_categories = _build_transpiled(
                 session, self.func, self._transpile_analysis
             )
-            if options:
-                self._transpile_validated = True
-            elif errors and self._transpile_validated:
+            if not options and errors and self._transpile_validated:
                 # A lowering has succeeded before, so a refusal now means the
                 # captured values changed since (a cell rebound to something
                 # unbakeable, say). Warn rather than fall back mutely: every other
@@ -388,6 +385,12 @@ class UserDefinedFunction:
                 # instead of on every judf build and ``transpiled`` read. No errors
                 # means no transpiler was configured for THIS session, which is a
                 # deliberate setting rather than something to warn about.
+                #
+                # Read-only on purpose: this method runs for every ``transpiled``
+                # access, and latching the flag here would let an introspection
+                # call -- or a call passing a session other than the active one --
+                # change the warning behavior for the UDF's lifetime. Only
+                # construction and ``_create_judf`` set it.
                 warnings.warn(f"Unable to transpile UDF {self.func}: {errors}")
             return options, input_categories
         except Exception as e:
@@ -649,9 +652,14 @@ class UserDefinedFunction:
             if func is not self.func:
                 raise PySparkRuntimeError(
                     errorClass="CANNOT_TRANSPILE_MISMATCHED_FUNCTION",
-                    messageParameters={"func": str(func)},
+                    messageParameters={"func": getattr(func, "__qualname__", repr(func))},
                 )
             transpiled, input_categories = self._build_transpiled_options(spark)
+            if transpiled:
+                # This is the lowering that reaches a plan, so it is the one worth
+                # remembering: a later refusal then means the captured values
+                # changed rather than a body that never lowered.
+                self._transpile_validated = True
         else:
             transpiled, input_categories = [], []
         # Incremental Python aggregators additionally carry the intermediate buffer schema, which
@@ -688,9 +696,16 @@ class UserDefinedFunction:
         # tree (and into nested function calls like ``isnotnull``, which
         # rejects named arguments). Resolve kwargs to positional here
         # using the parameter list captured at transpilation time so the
-        # rewritten expression sees plain column refs in declared order. Tested
-        # against the stored parameter list (set only when this UDF transpiles)
-        # rather than ``self.transpiled``, which re-lowers on every access.
+        # rewritten expression sees plain column refs in declared order.
+        #
+        # Tested against the stored parameter list rather than ``self.transpiled``,
+        # which re-lowers on every access. That list is set for every transpile
+        # CANDIDATE, not only for UDFs that currently lower, which is deliberate:
+        # whether a lowering succeeds depends on captured values read at ``judf``
+        # build time, so it is not knowable here, and this rewrite is safe either
+        # way -- resolving a kwarg to its declared position is what the JVM's own
+        # named-argument binding does. Erring the other way would splice
+        # ``NamedArgumentExpression`` into a rewritten tree and fail the query.
         if kwargs and self._transpiled_param_names:
             params = self._transpiled_param_names
             ordered: list = list(args)
@@ -862,6 +877,7 @@ class UserDefinedFunction:
         # always runs as interpreted Python.
         self._transpile_analysis = None
         self._transpiled_param_names = []
+        self._transpile_validated = False
         return self
 
 
