@@ -126,7 +126,7 @@ if _have_hypothesis:
     # Full 64-bit signed range -- used by comparison and equality tests where
     # no arithmetic can overflow. The range is asymmetric, so the minimum is
     # JVM_LONG_MIN rather than -JVM_LONG_MAX: LongType's true floor is exactly
-    # the boundary ``_ScopeNormalizer._bake``'s range gate is written against,
+    # the boundary ``_LiteralNormalizer._bake``'s range gate is written against,
     # and none of these UDFs negates its input, so drawing it is safe here.
     _LONG_BOUND = JVM_LONG_MAX
     _LONG_FLOOR = JVM_LONG_MIN
@@ -433,6 +433,10 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         "ANSI mode",
     )
 
+    # (func name, return type) pairs whose lowering ``_run`` has already
+    # asserted on; see the note there.
+    _transpile_checked: set = set()
+
     def _run(self, func, return_type, df, *udf_arg_columns, kwargs=None):
         """Run ``func`` as a UDF with transpilation on and off, return both rows.
 
@@ -474,12 +478,20 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             warnings.simplefilter("always")
             with self.sql_conf(transpile_on_conf):
                 transpiled_udf = UserDefinedFunction(func, return_type)
-                self.assertTrue(
-                    transpiled_udf.transpiled,
-                    f"transpilation produced no Catalyst expression for "
-                    f"{func_name!r} -- the differential comparison would be "
-                    "meaningless without it",
-                )
+                # Reading ``transpiled`` re-lowers, which is a py4j roundtrip per
+                # node. Every function this suite passes in is module-level and
+                # captures nothing hypothesis generates -- only the DataFrame rows
+                # vary per example -- so the answer is fixed per (func, return
+                # type) and checking it once is enough.
+                check_key = (func_name, return_type.simpleString())
+                if check_key not in self._transpile_checked:
+                    self.assertTrue(
+                        transpiled_udf.transpiled,
+                        f"transpilation produced no Catalyst expression for "
+                        f"{func_name!r} -- the differential comparison would be "
+                        "meaningless without it",
+                    )
+                    self._transpile_checked.add(check_key)
                 try:
                     transpiled_value = df.select(
                         transpiled_udf(*udf_arg_columns, **kwargs)

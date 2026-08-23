@@ -25,6 +25,7 @@ property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 """
 
 import unittest
+import warnings
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
@@ -1732,6 +1733,85 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(fresh(10), 18, "bad test expectation")
             self.assertEqual(df.select(u("a")).collect()[0][0], 18)
 
+    def test_udf_transpile_nested_scopes_shadow_the_literal(self):
+        # A lambda parameter or comprehension target rebinds the name, so the
+        # literal substitution must stop at the nested scope's boundary. These
+        # bodies all fall back (no Lambda / Call / comprehension lowering exists),
+        # but the rewrite is asserted directly: the moment one of those nodes is
+        # lowerable, substituting through it would be a silent wrong answer.
+        import ast as _ast
+
+        from pyspark.sql.transpile import _analyze_func, _normalize_function
+
+        def in_comprehension(a):
+            b = 5  # noqa: F841 -- shadowed by the comprehension target, deliberately
+            return [b for b in [a]]
+
+        def in_lambda(a):
+            b = 5
+            return (lambda b: b + a)(b)
+
+        for func, expected, value in [
+            (in_comprehension, "return [b for b in [a]]", [7]),
+            # The argument `(b)` IS ours to substitute; the body's `b` is not.
+            (in_lambda, "return (lambda b: b + a)(5)", 12),
+        ]:
+            with self.subTest(func=func.__name__):
+                self.assertEqual(value, func(7), "bad test expectation")
+                analysis, errors = _analyze_func(func, LongType())
+                self.assertIsNotNone(analysis, f"expected an analysis, got {errors}")
+                normalized = _normalize_function(
+                    func, analysis.function_ast, analysis.params, analysis.receiver
+                )
+                self.assertEqual(
+                    expected, _ast.unparse(_ast.fix_missing_locations(normalized).body[0])
+                )
+
+    def test_udf_transpile_recovered_source_must_match_the_code_object(self):
+        # `_get_function_from_ast` recovers a FunctionDef from TEXT. For a
+        # one-line factory, `inspect.getsource` on the returned lambda yields the
+        # whole `def` line, so the OUTER function is what gets picked -- and its
+        # parameters are not the lambda's. Refuse, rather than resolve names
+        # against an unrelated scope. The two-line spelling is unaffected.
+        from pyspark.sql.transpile import _analyze_func
+
+        offset = 3
+
+        one_line_factory = lambda: lambda x: x + offset  # noqa: E731
+
+        def two_line_factory():
+            return lambda x: x + offset
+
+        analysis, errors = _analyze_func(one_line_factory(), LongType())
+        self.assertIsNone(analysis, "the outer def's signature must not be accepted")
+        self.assertIn("different function", " ".join(errors))
+
+        analysis, errors = _analyze_func(two_line_factory(), LongType())
+        self.assertIsNotNone(analysis, f"expected an analysis, got {errors}")
+        self.assertEqual(["x"], analysis.params)
+
+    def test_udf_transpile_value_dependent_refusal_is_not_permanent(self):
+        # The go/no-go decision is AST-only, and captured values are re-read on
+        # every lowering. A capture that is unbakeable when the UDF is defined
+        # must therefore not disable transpilation for its lifetime.
+        captured = [1, 2, 3]  # a list has no column equivalent
+
+        def uses_capture(a):
+            return a + captured
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                u = UserDefinedFunction(uses_capture, LongType())
+            self.assertEqual([], u.transpiled, "an unbakeable capture must not lower")
+            self.assertIsNotNone(
+                u._transpile_analysis, "a value-dependent refusal must keep the analysis"
+            )
+            captured = 5
+            self.assertNotEqual([], u.transpiled, "a bakeable capture must lower now")
+            df = self.spark.createDataFrame([(10,)], "a long")
+            self.assertEqual(15, df.select(u("a")).collect()[0][0])
+
     def test_udf_transpile_config_toggle_no_stale_nodes(self):
         # Built with the flags on, executed with them off -> clean fallback to
         # interpreted Python (the optimizer drops the transpiled node), no error.
@@ -2581,7 +2661,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         )
                         df = self.spark.createDataFrame([(10,)], "a long")
                         self.assertEqual(11, df.select(pudf("a")).collect()[0][0])
-                    # Restored with the conf, since nothing is cached.
+                    # Restored with the conf, since the property caches nothing.
+                    # The PLAN does not follow: the ``df.select`` above cached a
+                    # ``_judf`` built with no options, and that cache is for the
+                    # UDF's lifetime -- see the ``transpiled`` docstring.
                     self.assertNotEqual([], pudf.transpiled, f"{key}=true lowers again")
 
     def test_udf_transpile_no_return_yields_null_and_warns(self):

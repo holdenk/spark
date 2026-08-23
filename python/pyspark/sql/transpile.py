@@ -146,8 +146,6 @@ class AbstractTranspiler(object):
 
     def _transpile_from_ast(
         self,
-        src: Optional[str],
-        ast_info: ast.AST,
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
@@ -304,10 +302,10 @@ def _returns_only_none_implicitly(body: List[ast.stmt]) -> bool:
 
     * Technically could also throw.
     """
-    nodes = list(_own_scope_nodes(body))
-    if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in nodes):
-        return False
-    return not any(isinstance(n, ast.Return) for n in nodes)
+    # Any one of the three forces False, so stop at the first.
+    return not any(
+        isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom)) for n in _own_scope_nodes(body)
+    )
 
 
 def _underlying_function(func: Callable) -> Optional[types.FunctionType]:
@@ -504,6 +502,26 @@ class _LiteralNormalizer(ast.NodeTransformer):
             "bytes) can be transpiled, so this falls back to interpreted Python"
         )
 
+    def _visit_nested_scope(self, node: ast.AST) -> ast.AST:
+        """Leave a nested scope untouched: its own bindings shadow ours.
+
+        A lambda parameter or comprehension target rebinds a name, so
+        substituting our literal at those read sites would be a wrong rewrite
+        (``b = 5; return [b for b in [a]]`` must not become ``[5 for b in [a]]``).
+        Nothing here is lowerable today -- ``_convert_chunk`` has no arm for any
+        of these nodes -- so leaving the names in place refuses cleanly instead.
+        """
+        return node
+
+    visit_Lambda = _visit_nested_scope
+    visit_FunctionDef = _visit_nested_scope
+    visit_AsyncFunctionDef = _visit_nested_scope
+    visit_ClassDef = _visit_nested_scope
+    visit_ListComp = _visit_nested_scope
+    visit_SetComp = _visit_nested_scope
+    visit_DictComp = _visit_nested_scope
+    visit_GeneratorExp = _visit_nested_scope
+
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if not isinstance(node.ctx, ast.Load):
             return node
@@ -513,8 +531,10 @@ class _LiteralNormalizer(ast.NodeTransformer):
         # Checking parameters first would turn `def f(a): a = 5; return a * 2`
         # into `a * 2`.
         if node.id in self._env:
-            # Each use gets its own copy so the tree stays free of shared nodes.
-            return copy.deepcopy(self._env[node.id])
+            # Fresh node per use so the tree stays free of shared nodes. The
+            # wrapped value is always an immutable scalar (see ``_bake``), so
+            # rewrapping is enough -- no deep copy needed.
+            return ast.Constant(value=self._env[node.id].value)
         if node.id == self._self_param:
             # A body that references the receiver itself (`return self`) has no
             # column equivalent: it is not bound at the call site. Refused here,
@@ -586,7 +606,7 @@ class _LiteralNormalizer(ast.NodeTransformer):
                 # Resolve against the env as it stands BEFORE this statement, then
                 # bind. Visiting first is what makes `b = 1` then `b = b` legal
                 # while keeping each binding's value the one in scope at the time.
-                resolved = self.visit(ast.fix_missing_locations(value))
+                resolved = self.visit(value)
                 literal = _as_literal(resolved)
                 if literal is None:
                     raise UnsupportedOperationException(
@@ -612,7 +632,7 @@ class _LiteralNormalizer(ast.NodeTransformer):
                 # raised: discarding `x % 0` would turn Python's ZeroDivisionError
                 # into a NULL, and `x + "abc"` a TypeError. After visiting, a
                 # literal or a bare column read is all that is safe to discard.
-                discarded = self.visit(ast.fix_missing_locations(stmt.value))
+                discarded = self.visit(stmt.value)
                 safe = _as_literal(discarded) is not None or (
                     isinstance(discarded, ast.Name) and discarded.id in self._params
                 )
@@ -628,7 +648,7 @@ class _LiteralNormalizer(ast.NodeTransformer):
                     f"{type(stmt).__name__} statements are only supported as the "
                     "function's final statement; assignments may precede it"
                 )
-            return self.visit(ast.fix_missing_locations(stmt))
+            return self.visit(stmt)
         raise UnsupportedOperationException("the function body is empty")
 
 
@@ -646,16 +666,6 @@ def _normalize_function(
     Raises :class:`UnsupportedOperationException` when anything cannot be
     resolved soundly, which the caller turns into a fallback.
     """
-    # This walk covers nested scopes, not just the top level: ``_extract_code_globals``
-    # recurses into nested code objects, so a nested ``global x`` puts a name that is
-    # ALSO a body-local into the global capture table, where it would resolve to the
-    # module value for a body that raises UnboundLocalError.
-    for node in ast.walk(function_ast):
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise UnsupportedOperationException(
-                "`global` / `nonlocal` declarations rebind names outside the "
-                "function and are not supported by the transpiler"
-            )
     scope = _capture_scope(func)
     normalizer = _LiteralNormalizer(params, scope, receiver)
     # ``ast.NodeTransformer`` rewrites in place, and the caller holds onto
@@ -1246,16 +1256,11 @@ class CatalystTranspiler(AbstractTranspiler):
 
     def _transpile_from_ast(
         self,
-        src: Optional[str],
-        ast_info: ast.AST,
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
         param_categories: Optional[dict] = None,
     ) -> Optional[Column]:
-        # Short circuit on nothing to transpile.
-        if src == "" or ast_info is None:
-            return None
         # Per-variant input-type assumption ({public_param_index -> category}),
         # read by ``_category`` to choose str vs numeric operators.
         self._param_categories = param_categories or {}
@@ -1324,7 +1329,11 @@ CatalystTranspiler.register()
 
 def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     """Get the transpilers we should try."""
-    configured_transpilers = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers")
+    # Defaulted, so a newer Python client against a driver that does not know this
+    # conf yields "no transpilers" rather than an error.
+    configured_transpilers = session.conf.get(
+        "spark.sql.experimental.optimizer.pyTranspilers", "catalyst"
+    )
     if not configured_transpilers:
         return []
     transpiler_names = configured_transpilers.split(",")
@@ -1390,29 +1399,24 @@ def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[st
     return [{i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)] or [{}]
 
 
-def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.AST]]:
+def _get_ast_from_func(func: Callable) -> Optional[ast.AST]:
     """Try and get the AST from a given callable"""
     # Note: consider maybe dill? (see the JYTHON PR)
     # inspect getsource does not work for functions defined in vanilla
     # repl, but does for those in files or in ipython.
     # It also fails when we give it an instance of a callable class.
     try:
-        src = inspect.getsource(func)
-        src = textwrap.dedent(src).strip()
-        ast_info = ast.parse(src)
+        return ast.parse(textwrap.dedent(inspect.getsource(func)).strip())
     except Exception:
         try:
             # getattr keeps mypy happy: `__call__` on a bare Callable is
             # not attribute-accessible in the type system.
-            src = inspect.getsource(getattr(func, "__call__"))
-            src = textwrap.dedent(src).strip()
-            ast_info = ast.parse(src)
+            call = getattr(func, "__call__")
+            return ast.parse(textwrap.dedent(inspect.getsource(call)).strip())
         except Exception:
             # No usable source (REPL/stdin definition, builtin, ...) --
-            # return cleanly so the caller reports "cannot transpile"
-            # instead of surfacing an UnboundLocalError as the reason.
-            return None, None
-    return src, ast_info
+            # return cleanly so the caller reports "cannot transpile".
+            return None
 
 
 def _get_parameter_list(node: ast.FunctionDef) -> list[str]:
@@ -1494,8 +1498,6 @@ class _TranspileAnalysis:
 
     def __init__(
         self,
-        src: Optional[str],
-        ast_info: ast.AST,
         function_ast: ast.FunctionDef,
         params: List[str],
         public_params: List[str],
@@ -1503,8 +1505,6 @@ class _TranspileAnalysis:
         returnType: "DataTypeOrString",
         combos: List[dict],
     ) -> None:
-        self.src = src
-        self.ast_info = ast_info
         self.function_ast = function_ast
         self.params = params
         self.public_params = public_params
@@ -1558,13 +1558,22 @@ def _analyze_func(
             "the visible source is the wrapped function's, not the "
             "wrapper's, so transpilation would change behavior"
         ]
-    src, ast_info = _get_src_ast_from_func(func)
+    ast_info = _get_ast_from_func(func)
     if ast_info is None:
         return None, ["Error getting ast for function, cannot transpile"]
     # Get the lambda body and parameters
     function_ast = _get_function_from_ast(ast_info)
     if function_ast is None:
         return None, ["Error extracting function body from ast, cannot transpile"]
+    # This walk covers nested scopes, not just the top level: ``_extract_code_globals``
+    # recurses into nested code objects, so a nested ``global x`` puts a name that is
+    # ALSO a body-local into the global capture table, where it would resolve to the
+    # module value for a body that raises UnboundLocalError.
+    if any(isinstance(n, (ast.Global, ast.Nonlocal)) for n in ast.walk(function_ast)):
+        return None, [
+            "`global` / `nonlocal` declarations rebind names outside the "
+            "function and are not supported by the transpiler"
+        ]
     # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
     # positional-only parameters can't be represented by the positional
     # ``_udf_param_N`` placeholder scheme: a call site may omit a
@@ -1586,6 +1595,19 @@ def _analyze_func(
             "positional-only arguments are not supported by the transpiler"
         ]
     params = _get_parameter_list(function_ast)
+    # The FunctionDef above was recovered from TEXT, which can describe a
+    # different function than the one that runs: for ``def make(): return lambda
+    # x: x + N``, ``inspect.getsource`` on the returned lambda yields the whole
+    # ``def make()`` line, so the outer def is what gets picked. Its parameters
+    # must match the code object whose locals ``_capture_scope`` reads, or names
+    # resolve against an unrelated scope.
+    fn = _underlying_function(func)
+    if fn is not None and list(fn.__code__.co_varnames[: fn.__code__.co_argcount]) != params:
+        return None, [
+            "the source recovered for this UDF describes a different function "
+            "than the one it will run (its parameters do not match); falling "
+            "back to interpreted Python"
+        ]
     # The transpiler strips a leading ``self`` on the assumption that the source
     # came from a bound ``__call__`` / method whose receiver is not supplied at the
     # call site. A PLAIN function whose first parameter happens to be named
@@ -1620,8 +1642,6 @@ def _analyze_func(
         )
     return (
         _TranspileAnalysis(
-            src=src,
-            ast_info=ast_info,
             function_ast=function_ast,
             params=params,
             public_params=public_params,
@@ -1634,13 +1654,20 @@ def _analyze_func(
 
 
 def _build_transpiled(
-    session: "SparkSession", func: Callable[..., Any], analysis: _TranspileAnalysis
+    session: "SparkSession",
+    func: Callable[..., Any],
+    analysis: _TranspileAnalysis,
+    first_only: bool = False,
 ) -> Tuple[List[Column], List[str], List[List[str]]]:
     """Resolve captured values and lower ``func`` to Catalyst expressions.
 
     Call this at ``judf`` creation time: the captured values it reads are baked
     into the returned expressions, and they must be the same values
     ``_wrap_function``'s ``cloudpickle`` snapshot sees.
+
+    ``first_only`` stops at the first option produced, for callers that only ask
+    "does this lower at all?" -- every lowered node is a py4j roundtrip, and a
+    result truncated this way must never reach a plan.
     """
     errors: List[str] = []
     try:
@@ -1650,6 +1677,7 @@ def _build_transpiled(
         normalized = _normalize_function(
             func, analysis.function_ast, analysis.params, analysis.receiver
         )
+        transpilers = _get_transpilers(session)
     except Exception as e:
         return [], [str(e)], []
     transpiled: List[Column] = []
@@ -1658,12 +1686,10 @@ def _build_transpiled(
     # params are tried as both numeric and string so the JVM can pick the
     # option matching the actual column types (or fall back if none match).
     # Maybe multiple transpilers (think CUDA, etc.).
-    for transpiler in _get_transpilers(session):
+    for transpiler in transpilers:
         for combo in analysis.combos:
             try:
                 transpiled_column = transpiler._transpile_from_ast(
-                    analysis.src,
-                    analysis.ast_info,
                     normalized,
                     # The receiver is already stripped: ``_normalize_function``
                     # refuses any reference to it, so every name the lowering can
@@ -1677,6 +1703,8 @@ def _build_transpiled(
                     input_categories.append(
                         [combo.get(i, "numeric") for i in range(len(analysis.public_params))]
                     )
+                    if first_only:
+                        return transpiled, errors, input_categories
             except Exception as e:
                 errors.append(str(e))
     return transpiled, errors, input_categories

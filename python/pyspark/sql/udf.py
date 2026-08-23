@@ -102,8 +102,8 @@ def _create_py_udf(
     # in Arrow is needed, that is, when the user-specified return type(SQL Type) of the UDF and the
     # actual instance(Python Value(Type)) that the UDF returns are different.
     # Arrow and Pickle have different type coercion rules, so a UDF might have a different result
-    # with/without Arrow optimization. Arrow optimization is nevertheless enabled by default as of
-    # SPARK-54555; set spark.sql.execution.pythonUDF.arrow.enabled to false to opt back out.
+    # with/without Arrow optimization. That's the main reason the Arrow optimization for Python
+    # UDFs is disabled by default.
 
     is_arrow_enabled = False
     if useArrow is None:
@@ -243,18 +243,23 @@ class UserDefinedFunction:
         # not depend on captured values; the captures are read only when the
         # ``judf`` is built, which is also where ``_create_judf`` cloudpickles the
         # function -- so the baked literals and the snapshot agree exactly. See
-        # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means no
-        # transpilation, whether it was never possible or has been turned off
-        # (``asNondeterministic()``). The lowered options and their input
-        # categories are no longer stored: ``transpiled`` is a property that
-        # re-lowers, because a baked capture is only valid for the values current
-        # when it ran.
+        # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means this
+        # UDF is not a candidate at all -- an unsupported signature or return type,
+        # or ``asNondeterministic()``. It is NOT cleared when a lowering refuses:
+        # that can depend on the captured values, which are re-read every time, so
+        # the same UDF may lower later. The options and their input categories are
+        # not stored either; ``transpiled`` re-lowers, because a baked capture is
+        # only valid for the values current when it ran.
         self._transpile_analysis: Optional["_TranspileAnalysis"] = None
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
-        # the right order. Empty list when transpilation didn't happen.
+        # the right order. Empty list when this UDF is not a candidate.
         self._transpiled_param_names: list[str] = []
+        # True once a lowering has actually produced options, so a later refusal
+        # means the captured values changed rather than a body the transpiler
+        # never supported -- only the former is worth warning about again.
+        self._transpile_validated = False
         from pyspark.sql import SparkSession
 
         session = SparkSession._instantiatedSession
@@ -305,22 +310,26 @@ class UserDefinedFunction:
                 # later by ``_create_judf``, so this adds no extra JVM work.
                 analysis, errors = _analyze_func(func, self.returnType)
                 if analysis is not None:
+                    self._transpile_analysis = analysis
+                    # Copied rather than aliased -- ``asNondeterministic`` empties
+                    # this field while the analysis keeps its own list.
+                    self._transpiled_param_names = list(analysis.public_params)
                     # Lower once purely to validate, so an unsupported body is
                     # reported where the UDF is defined rather than at first use
-                    # (which is what the existing tests assert). These
-                    # expressions are discarded; the ones that reach the plan
-                    # come from a fresh lowering in ``_create_judf``.
-                    options, build_errors, _ = _build_transpiled(session, func, analysis)
+                    # (which is what the existing tests assert). These expressions
+                    # are discarded; the ones that reach the plan come from a fresh
+                    # lowering in ``_create_judf``. A refusal here does NOT clear
+                    # the analysis: it may be value-dependent (an unbakeable
+                    # capture, say), and the values are re-read per lowering, so
+                    # the same UDF can transpile later.
+                    options, build_errors, _ = _build_transpiled(
+                        session, func, analysis, first_only=True
+                    )
                     errors = errors + build_errors
-                    if options:
-                        self._transpile_analysis = analysis
-                        # Only meaningful once something actually lowered: set
-                        # alongside the analysis so the two cannot disagree about
-                        # whether this UDF transpiles. Copied rather than aliased
-                        # -- ``asNondeterministic`` empties this field while the
-                        # analysis keeps its own list.
-                        self._transpiled_param_names = list(analysis.public_params)
-                if self._transpile_analysis is None:
+                    self._transpile_validated = bool(options)
+                else:
+                    options = []
+                if not options:
                     detail = f": {errors}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
         except Exception as e:
@@ -367,13 +376,17 @@ class UserDefinedFunction:
             options, errors, input_categories = _build_transpiled(
                 session, self.func, self._transpile_analysis
             )
-            if not options and errors:
-                # This UDF validated at construction, so a refusal here means the
+            if options:
+                self._transpile_validated = True
+            elif errors and self._transpile_validated:
+                # A lowering has succeeded before, so a refusal now means the
                 # captured values changed since (a cell rebound to something
                 # unbakeable, say). Warn rather than fall back mutely: every other
                 # fallback path tells the user, and a silent one looks like the
-                # transpiler simply chose not to fire. No errors means no
-                # transpiler was configured for THIS session, which is a
+                # transpiler simply chose not to fire. Gated on having validated so
+                # a body the transpiler never supported warns once, at definition,
+                # instead of on every judf build and ``transpiled`` read. No errors
+                # means no transpiler was configured for THIS session, which is a
                 # deliberate setting rather than something to warn about.
                 warnings.warn(f"Unable to transpile UDF {self.func}: {errors}")
             return options, input_categories
@@ -386,14 +399,17 @@ class UserDefinedFunction:
     def transpiled(self) -> list:
         """The Catalyst expressions this UDF would be rewritten into, if any.
 
-        Introspection helper: each access re-lowers the function, so captured
-        values are read as of the call. An empty list means the UDF runs as
-        interpreted Python.
+        Introspection helper: each access re-lowers the function against the
+        ACTIVE session (or the instantiated one), re-reading its transpile and
+        ANSI confs and the captured values as of the call. An empty list means a
+        lowering right now would produce nothing and the UDF runs as interpreted
+        Python. Unlike ``_create_judf`` it will not create a session just to
+        answer.
 
-        Prefers the ACTIVE session, the same one ``_create_judf`` will build the
-        JVM UDF against, and re-reads that session's transpile and ANSI confs, so
-        what this reports matches what gets planned. Unlike ``_create_judf`` it
-        will not create a session just to answer.
+        This reports what a lowering NOW would give, which is what gets planned
+        only until the first query: ``_judf`` caches its lowering for the UDF's
+        lifetime, so afterwards a conf flip or a rebound capture changes this
+        without changing the plan.
         """
         from pyspark.sql import SparkSession
 
@@ -631,7 +647,10 @@ class UserDefinedFunction:
             # (which pass a wrapper) also pass ``include_transpiled=False``.
             # Raised rather than asserted because ``python -O`` strips asserts.
             if func is not self.func:
-                raise PySparkRuntimeError("cannot transpile a func other than self.func")
+                raise PySparkRuntimeError(
+                    errorClass="CANNOT_TRANSPILE_MISMATCHED_FUNCTION",
+                    messageParameters={"func": str(func)},
+                )
             transpiled, input_categories = self._build_transpiled_options(spark)
         else:
             transpiled, input_categories = [], []
