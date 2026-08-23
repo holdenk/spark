@@ -245,9 +245,12 @@ class UserDefinedFunction:
         # function -- so the baked literals and the snapshot agree exactly. See
         # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means this
         # UDF is not a candidate at all -- an unsupported signature or return type,
-        # ``asNondeterministic()``, or a JVM that could not answer the conf reads
-        # below (the ``except`` at the end of this method). It is NOT cleared when
-        # a lowering refuses:
+        # ``asNondeterministic()``, a JVM that could not answer the conf reads below
+        # (the ``except`` at the end of this method), or -- the common case -- the
+        # transpile confs being off HERE, at construction. Candidacy is decided
+        # once; only the lowering re-reads the confs, so a UDF built while
+        # ``transpilePyUDFs`` was off stays interpreted even if it is turned on
+        # later. It is NOT cleared when a lowering refuses:
         # that can depend on the captured values, which are re-read every time, so
         # the same UDF may lower later. The options and their input categories are
         # not stored either; ``transpiled`` re-lowers, because a baked capture is
@@ -413,6 +416,11 @@ class UserDefinedFunction:
         only until the first query: ``_judf`` caches its lowering for the UDF's
         lifetime, so afterwards a conf flip or a rebound capture changes this
         without changing the plan.
+
+        Empty forever for a UDF that was not a transpile CANDIDATE, whatever the
+        confs say now -- candidacy is settled once, in ``__init__``, and the
+        commonest reason to miss it is the confs having been off back then. Turning
+        them on afterwards does not make an existing UDF eligible; rebuild it.
         """
         from pyspark.sql import SparkSession
 

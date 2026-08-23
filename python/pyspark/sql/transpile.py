@@ -73,10 +73,10 @@ Consequences worth knowing as a user:
   ``cloudpickle.register_pickle_by_value``, makes it eligible.
 * Only ``None`` and the basic scalars (``int``, ``float``, ``str``, ``bool``,
   ``bytes``) are bakeable, and an ``int`` has to fit a 64-bit integer since
-  Python's are unbounded. Anything else falls back. Two values of a bakeable
+  Python's are unbounded. Anything else falls back. Some values of a bakeable
   type are refused as well: NaN, whose ordering and equality differ from
-  Python's, and a ``str`` that is not UTF-8 encodable (a lone surrogate), which
-  py4j cannot carry.
+  Python's; the infinities, which no integral cast accepts; and a ``str`` that is
+  not UTF-8 encodable (a lone surrogate), which py4j cannot carry.
 * Only closure cells and module globals are read. ``self.<attr>`` on a callable
   instance is not captured -- resolving it faithfully means reproducing Python's
   descriptor and MRO lookup and cloudpickle's instance-state rules, which is left
@@ -177,6 +177,20 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return False
 
 
+def _unwrap_unary_signs(node: ast.AST) -> ast.AST:
+    """``node`` with any leading unary ``+``/``-`` chain stripped.
+
+    Python never parses a signed number as one ``Constant``: ``-2.5`` is
+    ``UnaryOp(USub, Constant(2.5))`` and ``--2.5`` nests two of them. Callers that
+    only care what KIND of value is underneath (whole vs fractional, say) unwrap
+    first rather than matching ``ast.Constant`` and silently missing every signed
+    spelling.
+    """
+    while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        node = node.operand
+    return node
+
+
 def _refuse_fractional_repeat_count(node: ast.AST) -> None:
     """Refuse a string repeat (``s * n``) whose count is a fractional literal.
 
@@ -190,7 +204,14 @@ def _refuse_fractional_repeat_count(node: ast.AST) -> None:
     and a captured ``n = 2.5`` now bakes to a literal here. A column-backed count
     keeps the pre-existing behavior -- constraining that needs a narrower input
     category than "numeric" on the JVM side, which is left to a follow-up.
+
+    Unary signs are unwrapped first. A sign cannot change whether a number is
+    whole, but it does change the node type: ``s * -2.5`` is
+    ``UnaryOp(USub, Constant(2.5))``, so matching ``ast.Constant`` alone let every
+    signed fractional count through and lower to ``repeat(s, cast(-2.5 as int))``,
+    returning ``''`` where Python raises TypeError.
     """
+    node = _unwrap_unary_signs(node)
     if not isinstance(node, ast.Constant):
         return
     # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool is
@@ -490,12 +511,19 @@ class _LiteralNormalizer(ast.NodeTransformer):
             # NaN silently flips `a < nan` and `a == nan`. A NaN COLUMN value can
             # only be documented (the type says nothing about it), but a captured
             # one is known right here, so refuse it.
-            if isinstance(value, float) and math.isnan(value):
+            #
+            # The infinities go with it. They cannot be written as a literal (only
+            # reached through ``float('inf')`` or a capture), and the trailing cast
+            # to an integral return type raises CAST_OVERFLOW where the interpreted
+            # path returns NULL -- breaking a query rather than falling back, which
+            # is what every guard here exists to avoid.
+            if isinstance(value, float) and not math.isfinite(value):
                 raise UnsupportedOperationException(
-                    f"{description} holds NaN, which Python compares as false "
+                    f"{description} holds the non-finite float {value}, which has "
+                    "no faithful column equivalent: Python compares NaN as false "
                     "against everything while Spark orders it above all other "
-                    "doubles and equal to itself, so the transpiler falls back to "
-                    "interpreted Python"
+                    "doubles, and an infinity cannot be cast to an integral type. "
+                    "The transpiler falls back to interpreted Python"
                 )
             # A lone surrogate is a legal Python str but not encodable, and py4j
             # encodes every command as UTF-8 -- baking it would raise inside the

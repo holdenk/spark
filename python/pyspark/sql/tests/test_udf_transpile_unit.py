@@ -1652,7 +1652,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 pudf, warned = self._fallback_warnings(func, BooleanType())
                 self.assertEqual([], pudf.transpiled, f"captured NaN ({label}) must not be baked")
                 self.assertIn(
-                    "holds NaN",
+                    "non-finite float",
                     " ".join(str(w.message) for w in warned),
                     f"{label}: expected the explicit NaN guard",
                 )
@@ -1660,6 +1660,33 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     df = self.spark.createDataFrame([(5,)], "a long")
                     self.assertEqual(expected, df.select(pudf("a")).collect()[0][0], label)
                 self.assertEqual(expected, func(5), f"{label}: bad test expectation")
+
+    def test_udf_transpile_captured_infinity_falls_back(self):
+        # An infinity goes with NaN: unspellable as a literal, so only a capture
+        # reaches it, and the trailing cast to the declared LongType raises
+        # CAST_OVERFLOW. That BREAKS the query -- the interpreted path returns NULL
+        # -- which is the outcome every guard in ``_bake`` exists to avoid.
+        def make_adder(value):
+            # A closure, not a default argument: a defaulted parameter is refused
+            # by its own guard and the test would pass for the wrong reason.
+            def add_infinity(a):
+                return a + value
+
+            return add_infinity
+
+        for label, value in [("inf", float("inf")), ("-inf", float("-inf"))]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(make_adder(value), LongType())
+                self.assertEqual([], pudf.transpiled, f"captured {label} must not be baked")
+                self.assertIn(
+                    "non-finite float",
+                    " ".join(str(w.message) for w in warned),
+                    f"{label}: expected the non-finite guard",
+                )
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([(10,)], "a long")
+                    # Interpreted: a float result for a LongType UDF becomes NULL.
+                    self.assertIsNone(df.select(pudf("a")).collect()[0][0], label)
 
     def test_udf_transpile_captured_unencodable_str_falls_back(self):
         # A lone surrogate is a legal Python str but not UTF-8 encodable, and py4j
@@ -1990,11 +2017,27 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def literal_fraction(s):
             return s * 2.5
 
+        # A sign does not change whether a count is whole, but it does change the
+        # node type: these parse as UnaryOp over the Constant, so matching
+        # ast.Constant alone let them lower to repeat(s, cast(-2.5 as int)) --
+        # 'abab' for +2.5 and '' for -2.5, where Python raises TypeError.
+        def positive_fraction(s):
+            return s * +2.5
+
+        def negative_fraction(s):
+            return s * -2.5
+
+        def double_signed_fraction(s):
+            return s * --2.5
+
         for label, func in [
             ("captured 2.5", captured_fraction),
             # 2.0 is a whole number but still a float, and Python raises for it.
             ("captured 2.0", captured_whole_float),
             ("literal 2.5", literal_fraction),
+            ("literal +2.5", positive_fraction),
+            ("literal -2.5", negative_fraction),
+            ("literal --2.5", double_signed_fraction),
         ]:
             with self.subTest(case=label):
                 pudf, warned = self._fallback_warnings(func, S)
