@@ -2030,6 +2030,17 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def double_signed_fraction(s):
             return s * --2.5
 
+        # Nor does wrapping it in anything else. These are BinOp / IfExp, not a
+        # Constant at any depth of unary sign, and both lowered to 'abab'. The
+        # transpiler does not evaluate expressions, so it cannot know what a
+        # computed count comes to and fails closed on the fractional value being
+        # present at all.
+        def computed_fraction(s):
+            return s * (2.5 + 0)
+
+        def conditional_fraction(s):
+            return s * (2.5 if s is not None else 3.5)
+
         for label, func in [
             ("captured 2.5", captured_fraction),
             # 2.0 is a whole number but still a float, and Python raises for it.
@@ -2038,6 +2049,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("literal +2.5", positive_fraction),
             ("literal -2.5", negative_fraction),
             ("literal --2.5", double_signed_fraction),
+            ("computed 2.5 + 0", computed_fraction),
+            ("conditional 2.5", conditional_fraction),
         ]:
             with self.subTest(case=label):
                 pudf, warned = self._fallback_warnings(func, S)
@@ -2053,19 +2066,63 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         df.select(pudf("s")).collect()
                 self.assertRaises(TypeError, func, "ab")
 
-        # A whole captured count still lowers, and the option really is kept --
-        # asserted on the plan, since a fallback would produce 'ababab' too.
+        # A count built only from whole numbers still lowers, and the option really
+        # is kept -- asserted on the plan, since a fallback would give 'ababab' too.
         whole = 3
 
         def captured_whole(s):
             return s * whole
 
+        def computed_whole(s):
+            return s * (2 + 1)
+
         with self.sql_conf(_TRANSPILE_ON):
-            pudf = UserDefinedFunction(captured_whole, S)
-            self.assertTrue(pudf.transpiled, "a whole captured count still lowers")
-            lowered = self.spark.createDataFrame([("ab",)], "s string").select(pudf("s"))
-            self.assertEqual("ababab", lowered.collect()[0][0])
-            self.assertEqual(0, self._eval_python_count(lowered))
+            for label, func in [("captured 3", captured_whole), ("2 + 1", computed_whole)]:
+                with self.subTest(case=label):
+                    pudf = UserDefinedFunction(func, S)
+                    self.assertTrue(pudf.transpiled, f"{label}: a whole count still lowers")
+                    lowered = self.spark.createDataFrame([("ab",)], "s string").select(pudf("s"))
+                    self.assertEqual("ababab", lowered.collect()[0][0])
+                    self.assertEqual(0, self._eval_python_count(lowered))
+
+    def test_udf_transpile_body_literal_value_guards(self):
+        # The long-range / non-finite / UTF-8 guards used to live only on the
+        # CAPTURE path, but a literal assignment is substituted by the normalizer
+        # and then lowered as a body constant, so each was reachable around the
+        # guard. All three now run where any value becomes a ``lit()``.
+        #
+        # The surrogate is the worst of the three: py4j encodes every command as
+        # UTF-8, so reaching ``lit`` raises inside the socket write and drops the
+        # gateway connection -- damaging the whole session rather than falling back.
+        long_min = -(2**63)
+
+        def negated_boundary(a):
+            # ``-long_min`` folds to a Constant one past LongType's ceiling, which
+            # reached ``lit`` and produced a raw Java NumberFormatException.
+            b = -long_min
+            return a + b
+
+        def overflowing_float(a):
+            b = 1e400  # an ordinary-looking literal that evaluates to inf
+            return a + b
+
+        def lone_surrogate(s):
+            t = "\ud800"
+            return s + t
+
+        for label, func, return_type, needle in [
+            ("negated long boundary", negated_boundary, LongType(), "outside the range"),
+            ("1e400", overflowing_float, LongType(), "non-finite float"),
+            ("lone surrogate", lone_surrogate, StringType(), "not UTF-8 encodable"),
+        ]:
+            with self.subTest(case=label):
+                pudf, warned = self._fallback_warnings(func, return_type)
+                self.assertEqual([], pudf.transpiled, f"{label} must not be lowered")
+                self.assertIn(
+                    needle,
+                    " ".join(str(w.message) for w in warned),
+                    f"{label}: expected the value guard, not a py4j or JVM error",
+                )
 
     def test_udf_transpile_string_operands_fall_back(self):
         # Operand/type combos with no valid string lowering for the bound column

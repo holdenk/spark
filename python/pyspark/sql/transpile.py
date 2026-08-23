@@ -177,53 +177,50 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return False
 
 
-def _unwrap_unary_signs(node: ast.AST) -> ast.AST:
-    """``node`` with any leading unary ``+``/``-`` chain stripped.
-
-    Python never parses a signed number as one ``Constant``: ``-2.5`` is
-    ``UnaryOp(USub, Constant(2.5))`` and ``--2.5`` nests two of them. Callers that
-    only care what KIND of value is underneath (whole vs fractional, say) unwrap
-    first rather than matching ``ast.Constant`` and silently missing every signed
-    spelling.
-    """
-    while isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        node = node.operand
-    return node
-
-
 def _refuse_fractional_repeat_count(node: ast.AST) -> None:
-    """Refuse a string repeat (``s * n``) whose count is a fractional literal.
+    """Refuse a string repeat (``s * n``) whose count is not a whole number.
 
     Python's ``str * n`` needs a whole ``n`` -- both ``"ab" * 2.5`` and ``"ab" *
     2.0`` are a TypeError -- while Spark's ``repeat`` takes any numeric and would
     truncate, returning a value where Python raises.
 
-    Only literal counts are checked, which is exactly the case capturing
-    introduces: before this module could resolve free variables, ``n`` in
-    ``lambda s: s * n`` could only be a column or a literal already in the body,
-    and a captured ``n = 2.5`` now bakes to a literal here. A column-backed count
-    keeps the pre-existing behavior -- constraining that needs a narrower input
-    category than "numeric" on the JVM side, which is left to a follow-up.
+    Refuses when a non-integral number appears ANYWHERE in the count expression,
+    not just when the count is itself a fractional constant. Matching one node
+    shape is the wrong altitude here: ``s * -2.5`` is ``UnaryOp`` and
+    ``s * (2.5 + 0)`` is ``BinOp``, and both lowered to
+    ``repeat(s, cast(... as int))`` -- ``''`` and ``'abab'`` where Python raises
+    TypeError. Since this transpiler deliberately does not evaluate expressions, it
+    cannot know what a computed count comes to, so it fails closed on the presence
+    of the value that could only truncate.
 
-    Unary signs are unwrapped first. A sign cannot change whether a number is
-    whole, but it does change the node type: ``s * -2.5`` is
-    ``UnaryOp(USub, Constant(2.5))``, so matching ``ast.Constant`` alone let every
-    signed fractional count through and lower to ``repeat(s, cast(-2.5 as int))``,
-    returning ``''`` where Python raises TypeError.
+    Two consequences, both deliberate:
+
+    * A count with no number in it at all -- a bare column, ``s * n`` -- still
+      lowers. That is the pre-existing behavior; constraining it needs a narrower
+      input category than "numeric" on the JVM side and is left to a follow-up.
+    * A fractional literal somewhere in the expression that cannot reach the count
+      (``s * (a if a > 2.5 else 3)``) is refused too. Over-refusing costs a
+      lowering; under-refusing returns a wrong answer.
     """
-    node = _unwrap_unary_signs(node)
-    if not isinstance(node, ast.Constant):
-        return
-    # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool is
-    # categorised "bool" and never reaches the repeat arm, so refuse it here
-    # rather than imply support the lowering does not have.
-    if isinstance(node.value, int) and not isinstance(node.value, bool):
-        return
-    raise UnsupportedOperationException(
-        "the count in a string repeat (`s * n`) is not a whole number; Python "
-        "raises TypeError for a fractional count while Spark's `repeat` would "
-        "truncate it, so this falls back to interpreted Python"
-    )
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Constant):
+            continue
+        value = inner.value
+        # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool
+        # is categorised "bool" and never reaches the repeat arm, so refuse it here
+        # rather than imply support the lowering does not have.
+        if isinstance(value, int) and not isinstance(value, bool):
+            continue
+        if not isinstance(value, (int, float, complex)):
+            # A non-number cannot be a count; whatever it is doing in this
+            # expression, the lowering refuses it on its own terms.
+            continue
+        raise UnsupportedOperationException(
+            f"the count in a string repeat (`s * n`) involves {value!r}, which is "
+            "not a whole number; Python raises TypeError for a fractional count "
+            "while Spark's `repeat` would truncate it, so this falls back to "
+            "interpreted Python"
+        )
 
 
 def _is_definitely_boolean(node: ast.AST) -> bool:
@@ -260,6 +257,64 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
 # (``int.__radd__``, ``str.__radd__``, ...) that Catalyst would then apply with
 # base-type semantics, and ``bool`` is only safe here because it is listed.
 _BAKEABLE_TYPES = (int, float, str, bool, bytes)
+
+
+def _refuse_unrepresentable_value(description: str, value: Any) -> None:
+    """Refuse a bakeable-TYPE value whose VALUE has no faithful column equivalent.
+
+    Called wherever a Python value becomes a ``lit()`` -- both for a captured name
+    (:meth:`_LiteralNormalizer._bake`) and for a literal written in the body
+    (``_convert_chunk``'s ``ast.Constant`` arm). Keeping one copy matters because
+    the two paths converge: a literal assignment (``b = 1e400``) is substituted by
+    the normalizer and then lowered as a body constant, so a check on only one side
+    is a check that can be walked around.
+    """
+    # Python ints are unbounded, so a value can exceed what LongType holds. Refuse
+    # explicitly rather than letting ``lit`` throw a Java stack trace -- and were
+    # ``lit`` ever to accept such a value (a decimal, say), it would still classify
+    # as "numeric" and then fail CheckAnalysis against a bigint column, killing the
+    # query instead of falling back. ``bool`` is excluded: it subclasses int but is
+    # 0/1.
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not JVM_LONG_MIN <= value <= JVM_LONG_MAX
+    ):
+        raise UnsupportedOperationException(
+            f"{description} is {value}, which is outside the range of a 64-bit "
+            "integer; Python integers are unbounded but Spark's LongType is not, "
+            "so the transpiler falls back to interpreted Python"
+        )
+    # NaN compares false against everything in Python, but Spark orders it above
+    # every other double and treats it as equal to itself, so a baked NaN silently
+    # flips `a < nan` and `a == nan`. A NaN COLUMN value can only be documented
+    # (the type says nothing about it), but one that is known here can be refused.
+    #
+    # The infinities go with it: the trailing cast to an integral return type
+    # raises CAST_OVERFLOW where the interpreted path returns NULL -- breaking a
+    # query rather than falling back, which is what every guard here exists to
+    # avoid. ``1e400`` is an ordinary-looking literal that evaluates to one.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise UnsupportedOperationException(
+            f"{description} is the non-finite float {value}, which has no faithful "
+            "column equivalent: Python compares NaN as false against everything "
+            "while Spark orders it above all other doubles, and an infinity cannot "
+            "be cast to an integral type. The transpiler falls back to interpreted "
+            "Python"
+        )
+    # A lone surrogate is a legal Python str but not encodable, and py4j encodes
+    # every command as UTF-8. This one must be refused BEFORE reaching ``lit``:
+    # the UnicodeEncodeError happens inside the socket write, which drops the
+    # gateway connection rather than falling back, damaging the whole session.
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise UnsupportedOperationException(
+                f"{description} is a string that is not UTF-8 encodable, which "
+                "cannot be sent to the JVM, so the transpiler falls back to "
+                "interpreted Python"
+            )
 
 
 def _as_literal(node: ast.AST) -> Optional[ast.Constant]:
@@ -489,54 +544,7 @@ class _LiteralNormalizer(ast.NodeTransformer):
     @staticmethod
     def _bake(description: str, value: Any) -> ast.expr:
         if value is None or type(value) in _BAKEABLE_TYPES:
-            # Python ints are unbounded, so a capture can exceed what LongType
-            # holds. Refuse explicitly rather than letting ``lit`` throw a Java
-            # stack trace -- and were ``lit`` ever to accept such a value (a
-            # decimal, say), it would still classify as "numeric" and then fail
-            # CheckAnalysis against a bigint column, killing the query instead of
-            # falling back. ``bool`` is excluded: it subclasses int but is 0/1.
-            if (
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and not JVM_LONG_MIN <= value <= JVM_LONG_MAX
-            ):
-                raise UnsupportedOperationException(
-                    f"{description} holds {value}, which is outside the range of "
-                    "a 64-bit integer; Python integers are unbounded but Spark's "
-                    "LongType is not, so the transpiler falls back to interpreted "
-                    "Python"
-                )
-            # NaN compares false against everything in Python, but Spark orders it
-            # above every other double and treats it as equal to itself, so a baked
-            # NaN silently flips `a < nan` and `a == nan`. A NaN COLUMN value can
-            # only be documented (the type says nothing about it), but a captured
-            # one is known right here, so refuse it.
-            #
-            # The infinities go with it. They cannot be written as a literal (only
-            # reached through ``float('inf')`` or a capture), and the trailing cast
-            # to an integral return type raises CAST_OVERFLOW where the interpreted
-            # path returns NULL -- breaking a query rather than falling back, which
-            # is what every guard here exists to avoid.
-            if isinstance(value, float) and not math.isfinite(value):
-                raise UnsupportedOperationException(
-                    f"{description} holds the non-finite float {value}, which has "
-                    "no faithful column equivalent: Python compares NaN as false "
-                    "against everything while Spark orders it above all other "
-                    "doubles, and an infinity cannot be cast to an integral type. "
-                    "The transpiler falls back to interpreted Python"
-                )
-            # A lone surrogate is a legal Python str but not encodable, and py4j
-            # encodes every command as UTF-8 -- baking it would raise inside the
-            # socket write and drop the gateway connection rather than fall back.
-            if isinstance(value, str):
-                try:
-                    value.encode("utf-8")
-                except UnicodeEncodeError:
-                    raise UnsupportedOperationException(
-                        f"{description} holds a string that is not UTF-8 "
-                        "encodable, which cannot be sent to the JVM, so the "
-                        "transpiler falls back to interpreted Python"
-                    )
+            _refuse_unrepresentable_value(description, value)
             return ast.Constant(value=value)
         raise UnsupportedOperationException(
             f"{description} holds a {type(value).__name__}, which has no column "
@@ -1285,7 +1293,13 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Return(value=value):
                 return self._convert_chunk(params, value)
             case ast.Constant(value=value):
-                # Avoid circular import issue.
+                # Every literal that reaches a plan passes through here -- one the
+                # user wrote, one ``_LiteralNormalizer`` substituted for a captured
+                # name, and one it folded out of a literal assignment -- so this is
+                # where the value domain has to be checked. Guarding only the
+                # capture path let ``b = 1e400`` and ``t = "\ud800"`` straight
+                # through, and the surrogate takes the gateway down with it.
+                _refuse_unrepresentable_value(f"the literal {value!r}", value)
                 return lit(value)
             case ast.Name(id=name, ctx=ast.Load()):
                 # Insert columns referencing the param indexes for children
