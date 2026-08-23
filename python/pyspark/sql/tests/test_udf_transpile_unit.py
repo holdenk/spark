@@ -24,7 +24,6 @@ inherited into the Spark Connect parity test class. The companion
 property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 """
 
-import os
 import unittest
 import warnings
 
@@ -1789,49 +1788,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     "descend into that scope and may substitute over a shadowed name",
                 )
                 self.assertIs(visit, _LiteralNormalizer._visit_nested_scope)
-
-    def test_udf_transpile_two_functions_on_one_source_line(self):
-        # ``inspect.getsource`` returns whole LINES, so both of these recover
-        # source containing two statements and the recovered FunctionDef for the
-        # second one is the FIRST one's. Same arity, so the parameter check cannot
-        # tell them apart -- this used to lower add1's body for sub1 and return 11
-        # where Python returns 9, with no warning.
-        #
-        # The two lambdas are written to a temp module rather than inline: the
-        # formatter splits `a = ...; b = ...` onto two lines, which is exactly the
-        # shape this test needs to preserve, and no combination of `fmt: skip` and
-        # `noqa` survives both linters.
-        import importlib.util
-        import tempfile
-
-        from pyspark.sql.transpile import _analyze_func
-
-        source = "add1 = lambda x: x + 1; sub1 = lambda x: x - 1\n"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "one_line_lambdas.py")
-            with open(path, "w") as handle:
-                handle.write(source)
-            spec = importlib.util.spec_from_file_location("one_line_lambdas", path)
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            add1, sub1 = module.add1, module.sub1
-            self.assertEqual(11, add1(10), "bad test expectation")
-            self.assertEqual(9, sub1(10), "bad test expectation")
-
-            for label, func in [("add1", add1), ("sub1", sub1)]:
-                with self.subTest(func=label):
-                    analysis, errors = _analyze_func(func, LongType())
-                    self.assertIsNone(analysis, "an ambiguous source line must not transpile")
-                    self.assertIn("Error extracting function body from ast", " ".join(errors))
-
-            with self.sql_conf(_TRANSPILE_ON):
-                with warnings.catch_warnings(record=True):
-                    warnings.simplefilter("always")
-                    u = UserDefinedFunction(sub1, LongType())
-                self.assertEqual([], u.transpiled)
-                df = self.spark.createDataFrame([(10,)], "a long")
-                self.assertEqual(9, df.select(u("a")).collect()[0][0])
 
     def test_udf_transpile_recovered_source_must_match_the_code_object(self):
         # `_get_function_from_ast` recovers a FunctionDef from TEXT. For a

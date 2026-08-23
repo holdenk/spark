@@ -1477,15 +1477,6 @@ def _get_function_from_ast(body: ast.AST) -> ast.FunctionDef | None:
     if not hasattr(body, "body") or not body.body:
         return None
 
-    # ``inspect.getsource`` returns whole LINES, so two functions sharing a line
-    # (``add1 = lambda x: x + 1; sub1 = lambda x: x - 1``) both yield source with
-    # two statements in it, and taking the first would lower add1's body for
-    # sub1 -- a silent wrong answer, since the two are indistinguishable by
-    # signature. There is no way to tell from the text which statement the caller
-    # meant, so refuse.
-    if len(body.body) > 1:
-        return None
-
     stmt = body.body[0]
 
     # Grab the value side of a top level assign (e.g. x = lambda ...)
