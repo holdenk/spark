@@ -35,12 +35,12 @@ keeps the option matrix small; prefer doing so. To bound plan growth,
 functions with more than three untyped parameters only emit the
 all-numeric and all-string variants.
 
-A lambda is lowered only when its source names it directly and alone: bind it
-to a name (``f = lambda x: x + 1``, annotated if you like) and give it a line
-of its own. Passed straight to ``udf(...)``, wrapped in another call, returned
-by another lambda, or sharing a line with a second lambda, nothing in the
-source read back says which lambda is the UDF, so it falls back to interpreted
-Python rather than risk the wrong body.
+A lambda is lowered only when its source names it directly and alone: bind it to
+a name (``f = lambda x: x + 1``, annotated if you like) or return it from a
+``def`` (``return lambda x: x + n``), on a line of its own. Passed straight to
+``udf(...)``, wrapped in another call, returned by another lambda, or sharing a
+line with a second lambda, nothing in the source read back says which lambda is
+the UDF, so it falls back to interpreted Python rather than risk the wrong body.
 
 Free variables and literal assignments
 --------------------------------------
@@ -1006,7 +1006,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
             case ast.Name(id=name) if name in params:
                 # ``params`` is the caller-facing list, so its indexes are already
-                # the ``_udf_param_N`` / category indexes -- see ``_transpile_func``.
+                # the ``_udf_param_N`` / category indexes -- see ``_analyze_func``.
                 return self._param_categories.get(params.index(name), "numeric")
             case ast.BinOp(left=left, op=op, right=right):
                 lc = self._category(params, left)
@@ -1330,7 +1330,7 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Name(id=name, ctx=ast.Load()):
                 # Insert columns referencing the param indexes for children
                 if name in params:
-                    # ``params`` excludes any bound receiver (see ``_transpile_func``),
+                    # ``params`` excludes any bound receiver (see ``_analyze_func``),
                     # so its indexes ARE the placeholder indexes. A reference to the
                     # receiver never reaches here: ``_normalize_function`` refuses it
                     # earlier, where the receiver's real name is known.
@@ -1863,9 +1863,9 @@ def _analyze_func(
                 "parameters the call site supplies, so the placeholder "
                 "positions cannot be assigned"
             ]
-        spoken_for = int(inspect.isfunction(call_entry) or isinstance(call_entry, classmethod)) + int(
-            inspect.ismethod(call_target)
-        )
+        spoken_for = int(
+            inspect.isfunction(call_entry) or isinstance(call_entry, classmethod)
+        ) + int(inspect.ismethod(call_target))
     if spoken_for > 1 or spoken_for > len(params):
         # Two receivers at once -- a ``classmethod`` over an already-bound method
         # prepends the class ON TOP of the method's own ``__self__`` -- or one with

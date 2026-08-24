@@ -24,6 +24,7 @@ inherited into the Spark Connect parity test class. The companion
 property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 """
 
+import tempfile
 import unittest
 import warnings
 
@@ -1499,9 +1500,13 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             # ``u.transpiled`` only says options were PRODUCED; the JVM may still
             # discard them and run interpreted Python, returning the right value and
             # hiding a wrong lowering. Pass ``require_lowered=False`` only where the
-            # JVM is EXPECTED to discard them.
+            # JVM is EXPECTED to discard them -- asserted in that direction too, so a
+            # case pinned as a lowering gap fails here once the gap closes rather than
+            # passing on beside a comment that no longer holds.
             if require_lowered:
                 self.assertEqual(0, self._eval_python_count(projected), str(func))
+            else:
+                self.assertGreater(self._eval_python_count(projected), 0, str(func))
             return [r[0] for r in projected.collect()]
 
     def _raises(self, func, schema, rows, needle="numeric"):
@@ -1869,11 +1874,53 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         analysis, errors = _analyze_func(one_line_factory(), LongType())
         self.assertIsNone(analysis, "the outer def's signature must not be accepted")
-        self.assertIn("different function", " ".join(errors))
+        # SPARK-58650's lambda check reaches this first: it compares the located
+        # lambda's parameters against the held code object's and refuses on the
+        # mismatch. `_analyze_func`'s own code-object comparison stays behind it as
+        # the backstop for shapes that check does not look at -- a `def`, or a
+        # callable instance's `__call__`, whose source can also go stale.
+        self.assertIn("different parameters", " ".join(errors))
 
         analysis, errors = _analyze_func(two_line_factory(), LongType())
         self.assertIsNotNone(analysis, f"expected an analysis, got {errors}")
         self.assertEqual(["x"], analysis.params)
+
+    def test_udf_transpile_refuses_a_def_whose_file_changed_since_import(self):
+        # The backstop the test above names: a `def` reaches `_analyze_func`'s own
+        # code-object comparison, because the lambda checks only look at a held
+        # lambda. `inspect.getsource` reads through `linecache`, so editing a module
+        # under a live driver makes it return the NEW text for the OLD code object.
+        # Where the parameters differ that is caught; a same-signature body edit is
+        # the known limitation documented in `_get_ast_from_func`.
+        import importlib.util
+        import linecache
+        import os
+        import sys
+
+        from pyspark.sql.transpile import _analyze_func
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "stale_udf_module.py")
+            with open(path, "w") as f:
+                f.write("def target(a):\n    return a + 1\n")
+            spec = importlib.util.spec_from_file_location("stale_udf_module", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.addCleanup(sys.modules.pop, "stale_udf_module", None)
+            sys.modules["stale_udf_module"] = module
+
+            analysis, errors = _analyze_func(module.target, LongType())
+            self.assertIsNotNone(analysis, f"the pristine module must analyze: {errors}")
+
+            # Same line count, different parameter name, so the code object Python
+            # will run no longer matches the text on disk.
+            with open(path, "w") as f:
+                f.write("def target(renamed):\n    return renamed + 1\n")
+            linecache.clearcache()
+
+            analysis, errors = _analyze_func(module.target, LongType())
+            self.assertIsNone(analysis, "stale source must not be lowered")
+            self.assertIn("different function", " ".join(errors))
 
     def test_udf_transpile_value_dependent_refusal_is_not_permanent(self):
         # The go/no-go decision is AST-only, and captured values are re-read on
@@ -2566,9 +2613,17 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ),
             [True, False, False],
         )
+        # Run the binary one, rather than only asserting it produced options: an
+        # annotation is the ONLY way a binary input column gets lowered (an untyped
+        # param declares numeric and string, so the JVM discards every option -- see
+        # ``test_udf_transpile_untyped_param_on_a_binary_column_falls_back``), so this
+        # is the one place that path is executed end to end.
+        self.assertEqual(
+            self._vals(bytes_ident, BinaryType(), "a binary", [(b"z",), (None,)]),
+            [b"z", None],
+        )
         with self.sql_conf(_TRANSPILE_ON):
             self.assertFalse(UserDefinedFunction(bool_add, LongType()).transpiled)
-            self.assertTrue(UserDefinedFunction(bytes_ident, BinaryType()).transpiled)
 
     def test_param_category_combos_caps_preserve_typed_pins(self):
         # With more than three untyped params the cap collapses the untyped ones
@@ -2625,18 +2680,40 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("bool in and", _make_bool_capture(True), B, "a long", [(1,), (-1,)], [True, False]),
             ("bool False", _make_bool_capture(False), B, "a long", [(1,)], [False]),
             ("None identity", _make_none_capture(None), L, "a long", [(7,)], [7]),
+            # Bound to a LONG column, not a binary one: the baked value is what this
+            # is about, and the parameter is a lambda's, so it cannot be annotated.
+            # An untyped parameter only ever declares numeric and string, so a binary
+            # INPUT column matches no option -- pinned in the next test.
             (
                 "bytes value",
                 _make_returning_capture(b"ab"),
                 BinaryType(),
-                "a binary",
-                [(b"z",)],
-                [bytearray(b"ab")],
+                "a long",
+                [(1,)],
+                [b"ab"],
             ),
         ]
         for label, func, rt, schema, rows, expected in cases:
             with self.subTest(case=label):
                 self.assertEqual(self._vals(func, rt, schema, rows), expected, label)
+
+    def test_udf_transpile_untyped_param_on_a_binary_column_falls_back(self):
+        # `_param_category_combos` tries an untyped parameter as numeric and string
+        # only, so nothing it emits declares a binary input and the JVM discards
+        # every option for a binary column. The fallback is clean -- the interpreted
+        # UDF returns the same value -- so this is a lowering gap, not a wrong
+        # answer. Annotating the parameter (`def f(a: bytes)`) pins the category and
+        # does lower; a lambda has nowhere to put the annotation.
+        self.assertEqual(
+            self._vals(
+                _make_returning_capture(b"ab"),
+                BinaryType(),
+                "a binary",
+                [(b"z",)],
+                require_lowered=False,
+            ),
+            [b"ab"],
+        )
 
     def test_udf_transpile_global_baked_only_when_pickled_by_value(self):
         # A module-level lambda has no importable qualified name, so cloudpickle
