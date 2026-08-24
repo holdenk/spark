@@ -147,28 +147,11 @@ case class UserDefinedPythonFunction(
         optionInputTypesForUse.length == transpiledExprsForUse.length &&
         optionInputTypesForUse.forall(_.length == e.length)) {
       val udfChildren = udfExpr.children.toArray
-      // Resolve the `_udf_param_N` placeholders the transpiler emits into the bound
+      // Construct a projection of `_udf_param_N` placeholders the transpiler emits into the bound
       // UDF arguments. Apply this ONLY to the transpiled options -- never to
-      // `udfExpr` itself, whose children are the user's argument expressions. A user
-      // column literally named `_udf_param_N` passed as an argument must not be
-      // rewritten, so we leave `udfExpr` untouched.
+      // `udfExpr` itself, whose children are the user's argument expressions.
       def resolveUDFParams(expression: Expression, children: Array[Expression]): Expression = {
-        expression match {
-          case UnresolvedAttribute(nameParts)
-              if nameParts.length == 1 && nameParts.head.startsWith("_udf_param_") =>
-            val suffix = nameParts.head.stripPrefix("_udf_param_")
-            val index = suffix.toIntOption.getOrElse {
-              throw QueryCompilationErrors.invalidUDFParameterPlaceholder(nameParts.head)
-            }
-            if (index >= 0 && index < children.length) {
-              children(index)
-            } else {
-              throw QueryCompilationErrors.invalidUDFParameterPlaceholderIndex(
-                index, children.length)
-            }
-          case _ =>
-            expression.mapChildren(resolveUDFParams(_, children))
-        }
+        expression.children = children.zipWithIndex.map { (e, i) => e.alias(f"_udf_param_{i}") }
       }
       val resolvedOptions = transpiledExprsForUse.map(resolveUDFParams(_, udfChildren))
       TranspiledPythonUDF(name, udfExpr, resolvedOptions, optionInputTypesForUse)
