@@ -261,6 +261,9 @@ class UserDefinedFunction:
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
         # the right order. Empty list when this UDF is not a candidate.
         self._transpiled_param_names: list[str] = []
+        # Names from the list above Python forbids calling by keyword. The
+        # rewrite below must raise for these, not silently coerce to positional.
+        self._positional_only_param_names: frozenset = frozenset()
         # True once a lowering has actually produced options, so a later refusal
         # means the captured values changed rather than a body the transpiler
         # never supported -- only the former is worth warning about again.
@@ -320,6 +323,9 @@ class UserDefinedFunction:
                     # Copied rather than aliased -- ``asNondeterministic`` empties
                     # this field while the analysis keeps its own list.
                     self._transpiled_param_names = list(analysis.public_params)
+                    self._positional_only_param_names = frozenset(
+                        analysis.positional_only_public_params
+                    )
                     # Lower once purely to validate, so an unsupported body is
                     # reported where the UDF is defined rather than at first use
                     # (which is what the existing tests assert). These expressions
@@ -344,6 +350,7 @@ class UserDefinedFunction:
             warnings.warn(f"Exception transpiling UDF {func}: {e}")
             self._transpile_analysis = None
             self._transpiled_param_names = []
+            self._positional_only_param_names = frozenset()
 
     def _build_transpiled_options(self, session: Optional["SparkSession"]) -> Tuple[list, list]:
         """Lower this UDF to Catalyst expressions, reading captured values now.
@@ -696,30 +703,24 @@ class UserDefinedFunction:
 
         sc = get_active_spark_context()
 
-        # Transpilation rewrites the UDF into a Catalyst expression that
-        # references its inputs positionally via ``_udf_param_N`` (see
-        # ``UserDefinedPythonFunction.builder.resolveUDFParams``). If the
-        # caller used kwargs, the JVM-side substitution would otherwise
-        # splice ``NamedArgumentExpression`` wrappers into the rewritten
-        # tree (and into nested function calls like ``isnotnull``, which
-        # rejects named arguments). Resolve kwargs to positional here
-        # using the parameter list captured at transpilation time so the
-        # rewritten expression sees plain column refs in declared order.
+        # Rewrite kwargs to positional so a transpiled ``_udf_param_N``
+        # expression sees plain column refs, not a ``NamedArgumentExpression``
+        # (which breaks nested calls like ``isnotnull``). Uses the param list
+        # captured for every transpile CANDIDATE, not ``self.transpiled``,
+        # which re-lowers on every access.
         #
-        # Tested against the stored parameter list rather than ``self.transpiled``,
-        # which re-lowers on every access. That list is set for every transpile
-        # CANDIDATE, not only for UDFs that currently lower, which is deliberate:
-        # whether a lowering succeeds depends on captured values read at ``judf``
-        # build time, so it is not knowable here, and this rewrite is safe either
-        # way -- resolving a kwarg to its declared position is what the JVM's own
-        # named-argument binding does. Erring the other way would splice
-        # ``NamedArgumentExpression`` into a rewritten tree and fail the query.
+        # A positional-only param is never resolved here -- Python itself
+        # rejects calling one by keyword, and rewriting would paper over
+        # that. Left unresolved, its kwarg reaches the JVM as a
+        # ``NamedArgumentExpression``, which drops the transpiled
+        # expression and falls back to interpreted Python, so the worker's
+        # own keyword call raises the same ``TypeError`` Python would.
         if kwargs and self._transpiled_param_names:
             params = self._transpiled_param_names
             ordered: list = list(args)
             remaining_kwargs = dict(kwargs)
             for pname in params[len(args) :]:
-                if pname in remaining_kwargs:
+                if pname in remaining_kwargs and pname not in self._positional_only_param_names:
                     ordered.append(remaining_kwargs.pop(pname))
                 else:
                     # Caller didn't supply this param positionally or by
@@ -885,6 +886,7 @@ class UserDefinedFunction:
         # always runs as interpreted Python.
         self._transpile_analysis = None
         self._transpiled_param_names = []
+        self._positional_only_param_names = frozenset()
         self._transpile_validated = False
         return self
 
