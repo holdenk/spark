@@ -2543,6 +2543,54 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     self.assertEqual("ababab", lowered.collect()[0][0])
                     self.assertEqual(0, self._eval_python_count(lowered))
 
+    def test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column(self):
+        # A PINNED KNOWN DIVERGENCE (SPARK-55207), not behavior we want.
+        # ``_refuse_fractional_repeat_count`` can only inspect the count's SOURCE, so
+        # it refuses a visible non-integral number and lets through a count whose
+        # fractional part arrives at runtime in a column -- where ``repeat``
+        # truncates and Python raises TypeError. Pinned in both directions so the
+        # three places this is documented (the module docstring, that function's
+        # first consequence bullet, and the ``transpilePyUDFs`` conf description)
+        # cannot drift, and so the eventual fix trips here and has to update them.
+        #
+        # Wider than a bare ``s * n``: Add/Sub/Mult/Mod all lower, so a count built
+        # only from whole constants clears the guard as well.
+        S = StringType()
+
+        def bare(s, n):
+            return s * n
+
+        def plus_one(s, n):
+            return s * (n + 1)
+
+        def negated(s, n):
+            return s * -n
+
+        def modded(s, n):
+            return s * (n % 3)
+
+        for label, func, expected in [
+            ("s * n", bare, "abab"),
+            ("s * (n + 1)", plus_one, "ababab"),
+            # A negative count is not merely truncated: ``repeat`` returns ''.
+            ("s * -n", negated, ""),
+            ("s * (n % 3)", modded, "abab"),
+        ]:
+            with self.subTest(case=label):
+                self.assertRaises(TypeError, func, "ab", 2.5)
+                # ``_vals`` asserts the option was really USED, not just produced --
+                # a fallback here would return the TypeError, not a value.
+                self.assertEqual(
+                    [expected],
+                    self._vals(func, S, "s string, n double", [("ab", 2.5)]),
+                    f"{label}: divergence changed; update the three doc sites above",
+                )
+
+        # The case a fix must NOT break, and the reason refusing every column count
+        # is the wrong fix: an integral count column lowers and agrees with Python.
+        self.assertEqual("ababab", bare("ab", 3))
+        self.assertEqual(["ababab"], self._vals(bare, S, "s string, n bigint", [("ab", 3)]))
+
     def test_udf_transpile_body_literal_value_guards(self):
         # The long-range / non-finite / UTF-8 guards used to live only on the
         # CAPTURE path, but a literal assignment is substituted by the normalizer

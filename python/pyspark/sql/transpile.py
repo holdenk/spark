@@ -97,7 +97,7 @@ Consequences worth knowing as a user:
 * Only closure cells and module globals are read. ``self.<attr>`` on a callable
   instance is not captured -- resolving it faithfully means reproducing Python's
   descriptor and MRO lookup and cloudpickle's instance-state rules, which is left
-  to a follow-up.
+  to SPARK-59029.
 
 Capture timing: captured values are read when the UDF's ``judf`` is created, the
 same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
