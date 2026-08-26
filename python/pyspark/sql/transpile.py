@@ -36,14 +36,21 @@ functions with more than three untyped parameters only emit the
 all-numeric and all-string variants.
 
 Text repeat carries a known divergence. Python's ``s * n`` needs a whole ``n``
-(``"ab" * 2.5`` and ``"ab" * 2.0`` are both a TypeError) while Spark's ``repeat``
-truncates. The rule: a count is refused when a non-integral number is VISIBLE in
-it -- a literal, or a captured value -- and lowered otherwise, so any count whose
-fractional part only arrives at runtime, in a column, still diverges. On a
-``double`` column holding 2.5, ``s * n`` gives ``'abab'``, ``s * (n + 1)``
-``'ababab'`` and ``s * -n`` ``''``, where Python raises every time. Casting the
-count to an integral type makes the two paths agree -- on ``'abab'``, not on the
-TypeError; the only way to get Python's error is to leave the UDF interpreted.
+(``"ab" * 2.5`` and ``"ab" * 2.0`` are both a TypeError), while the lowering emits
+``repeat(s, cast(n as int))`` -- and that cast, added here rather than by ``repeat``,
+truncates. The guard can only read the count's SOURCE, so it refuses when a
+non-integral CONSTANT is visible there (a literal, or a captured value) and lowers
+everything else, whatever its shape. A count whose fractional part only arrives at
+runtime, in a column, therefore still diverges: on a ``double`` column holding 2.5,
+``s * n`` gives ``'abab'``, ``s * (n + 1)`` ``'ababab'``, ``s * (n * 2)``
+``'ababababab'`` and ``s * -n`` ``''``, where Python raises every time.
+
+Annotating does NOT close this, despite what annotations do for the option matrix
+above: ``int`` and ``float`` both map to the one "numeric" category, and that
+matches any non-decimal numeric column, so ``def f(s: str, n: int)`` bound to a
+``double`` column lowers and returns ``'abab'``. Casting the COLUMN to an integral
+type does work, but it makes the two paths agree on ``'abab'`` rather than on the
+TypeError -- the only way to get Python's error is to leave the UDF interpreted.
 
 A lambda is lowered only when its source names it directly and alone: bind it to
 a name (``f = lambda x: x + 1``, annotated if you like) or return it from a
@@ -226,12 +233,17 @@ def _refuse_fractional_repeat_count(node: ast.AST) -> None:
 
     Two consequences, both deliberate:
 
-    * A count with no non-integral number VISIBLE in it still lowers, and that is
-      wider than a bare ``s * n``: ``Add``/``Sub``/``Mult``/``Mod`` are all lowered,
-      so ``s * (n + 1)`` and ``s * -n`` pass too and diverge on a fractional column
-      (``'ababab'`` and ``''`` for ``('ab', 2.5)``). Pre-existing behavior;
-      constraining it needs a narrower input category than "numeric" on the JVM
-      side and is left to a follow-up.
+    * This walk only inspects ``ast.Constant``, so a count holding no non-integral
+      constant lowers whatever its SHAPE -- not just a bare ``s * n``, but equally
+      ``s * -n`` (a ``UnaryOp``) and ``s * (n + 1)`` / ``s * (n * 2)`` (a ``BinOp``
+      over whole constants). Each diverges on a fractional column: ``''``,
+      ``'ababab'``, ``'ababababab'`` for ``('ab', 2.5)``. Pre-existing behavior, and
+      an ``int`` annotation does not help -- ``int`` and ``float`` share the one
+      "numeric" category. Constraining it means splitting that category into
+      integral and fractional on BOTH sides (the precedent is the JVM matcher
+      already excluding DecimalType from "numeric" for the same kind of reason) and
+      assigning categories PER USE, since a category is per public parameter today
+      while "is a repeat count" is per use. Left to a follow-up.
     * A fractional literal somewhere in the expression that cannot reach the count
       (``s * (a if a > 2.5 else 3)``) is refused too. Over-refusing costs a
       lowering; under-refusing returns a wrong answer.
@@ -490,9 +502,9 @@ class _CapturedScope:
             # reading it before that assignment raises UnboundLocalError, and
             # resolving it from an enclosing scope would return a value where the
             # UDF actually fails. A body-local that a nested scope closes over
-            # lands in ``co_cellvars`` instead and refuses below as unresolvable --
-            # but only because ``_analyze_func`` refuses ``global``/``nonlocal``: a
-            # nested ``global x`` would put a cellvar in the globals table below.
+            # lands in ``co_cellvars`` instead and refuses below as unresolvable;
+            # what keeps that true is ``_analyze_func``'s ``global``/``nonlocal``
+            # refusal -- see the note there.
             raise UnsupportedOperationException(
                 f"{name!r} is a local variable that is read before it is "
                 "assigned; Python raises UnboundLocalError here, so the "

@@ -620,8 +620,9 @@ object SQLConf {
         "UDF construction. Transpiled UDFs attempt to match the Python functionality but " +
         "may not be 100% equivalent. Some known differences include: overflows from input types " +
         "(you can precast to decimal to avoid), type coercion on comparison, implicit " +
-        "returns, and a non-integral text repeat count arriving from a column (Spark " +
-        "truncates where Python raises). " +
+        "returns, and a non-integral text repeat count arriving from a column (the " +
+        "cast the transpiler inserts truncates it where Python raises; an `int` " +
+        "annotation does not prevent this, cast the column instead). " +
         "A UDF that reads a free variable (a closure cell or a module global) " +
         "may have that value baked into the plan as a literal, read at the same moment " +
         "the interpreted path pickles the function, so rebinding the name afterwards " +

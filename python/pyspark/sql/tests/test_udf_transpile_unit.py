@@ -2458,10 +2458,11 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # Capturing is what makes this reachable: before free variables could be
         # resolved, a count was either a column or a literal already in the body.
         # A captured `n = 2.5` now bakes to a literal here, so the guard is needed.
-        # A COLUMN count is NOT constrained -- the "numeric" category the JVM
-        # matches on covers DOUBLE as well as LONG -- which is the pre-existing
-        # behavior; narrowing it needs a new input category and is left to a
-        # follow-up.
+        # A COLUMN count is NOT constrained -- the "numeric" category the JVM matches
+        # on covers DOUBLE as well as LONG -- which is pre-existing behavior, pinned
+        # with its actual values by
+        # ``test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column``
+        # below. Narrowing it is left to a follow-up; see that test for the shapes.
         S = StringType()
         fraction = 2.5
         whole_float = 2.0
@@ -2545,16 +2546,24 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
     def test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column(self):
         # A PINNED KNOWN DIVERGENCE (SPARK-55207), not behavior we want.
-        # ``_refuse_fractional_repeat_count`` can only inspect the count's SOURCE, so
-        # it refuses a visible non-integral number and lets through a count whose
-        # fractional part arrives at runtime in a column -- where ``repeat``
-        # truncates and Python raises TypeError. Pinned in both directions so the
-        # three places this is documented (the module docstring, that function's
-        # first consequence bullet, and the ``transpilePyUDFs`` conf description)
-        # cannot drift, and so the eventual fix trips here and has to update them.
+        # ``_refuse_fractional_repeat_count`` walks only ``ast.Constant``, so it
+        # refuses a visible non-integral constant and lets through a count whose
+        # fractional part arrives at runtime in a column -- where the ``cast(... as
+        # int)`` the lowering inserts truncates and Python raises TypeError.
         #
-        # Wider than a bare ``s * n``: Add/Sub/Mult/Mod all lower, so a count built
-        # only from whole constants clears the guard as well.
+        # Because the guard turns on the CONSTANTS present, not the node shape, this
+        # covers every shape that reaches either repeat arm: no count operator at all
+        # (``s * n``), a UnaryOp (``s * -n``), a BinOp over whole constants
+        # (``s * (n + 1)``, ``s * (n * 2)``, ``s * (n % 3)``), and both operand
+        # orders -- ``_convert_chunk`` has a separate arm per order, each guarding
+        # its own operand, so a fix applied to one arm must fail here on the other.
+        #
+        # Pinned so the eventual fix trips this test and has to revisit the prose
+        # that describes the divergence: the module docstring, that function's first
+        # consequence bullet, the ``transpilePyUDFs`` conf description, and the
+        # comment in the preceding test. This asserts VALUES, so it cannot catch
+        # those going stale on their own -- it only forces the question when the
+        # behavior changes.
         S = StringType()
 
         def bare(s, n):
@@ -2569,27 +2578,55 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def modded(s, n):
             return s * (n % 3)
 
-        for label, func, expected in [
-            ("s * n", bare, "abab"),
-            ("s * (n + 1)", plus_one, "ababab"),
+        def mult_inside(s, n):
+            return s * (n * 2)
+
+        def reversed_order(n, s):
+            # The ``numeric * string`` arm, which is a separate branch.
+            return n * s
+
+        for label, func, schema, row, pyargs, expected in [
+            ("s * n", bare, "s string, n double", ("ab", 2.5), ("ab", 2.5), "abab"),
+            ("s * (n + 1)", plus_one, "s string, n double", ("ab", 2.5), ("ab", 2.5), "ababab"),
             # A negative count is not merely truncated: ``repeat`` returns ''.
-            ("s * -n", negated, ""),
-            ("s * (n % 3)", modded, "abab"),
+            ("s * -n", negated, "s string, n double", ("ab", 2.5), ("ab", 2.5), ""),
+            ("s * (n % 3)", modded, "s string, n double", ("ab", 2.5), ("ab", 2.5), "abab"),
+            (
+                "s * (n * 2)",
+                mult_inside,
+                "s string, n double",
+                ("ab", 2.5),
+                ("ab", 2.5),
+                "ababababab",
+            ),
+            ("n * s", reversed_order, "n double, s string", (2.5, "ab"), (2.5, "ab"), "abab"),
         ]:
             with self.subTest(case=label):
-                self.assertRaises(TypeError, func, "ab", 2.5)
-                # ``_vals`` asserts the option was really USED, not just produced --
-                # a fallback here would return the TypeError, not a value.
+                self.assertRaises(TypeError, func, *pyargs)
+                # ``_vals`` asserts the option was really USED, not just produced: on
+                # a fallback its plan check fails before it ever collects a row.
                 self.assertEqual(
                     [expected],
-                    self._vals(func, S, "s string, n double", [("ab", 2.5)]),
-                    f"{label}: divergence changed; update the three doc sites above",
+                    self._vals(func, S, schema, [row]),
+                    f"{label}: divergence changed; revisit the prose named above",
                 )
 
         # The case a fix must NOT break, and the reason refusing every column count
         # is the wrong fix: an integral count column lowers and agrees with Python.
         self.assertEqual("ababab", bare("ab", 3))
         self.assertEqual(["ababab"], self._vals(bare, S, "s string, n bigint", [("ab", 3)]))
+
+        # Nor does annotating the count `int` close it -- `int` and `float` share the
+        # single "numeric" category, which matches any non-decimal numeric column.
+        # Pinned because the module docstring recommends annotation for pinning
+        # categories, so this is the shape a user is most likely to think is safe.
+        def annotated_int(s: str, n: int):
+            return s * n
+
+        self.assertRaises(TypeError, annotated_int, "ab", 2.5)
+        self.assertEqual(
+            ["abab"], self._vals(annotated_int, S, "s string, n double", [("ab", 2.5)])
+        )
 
     def test_udf_transpile_body_literal_value_guards(self):
         # The long-range / non-finite / UTF-8 guards used to live only on the

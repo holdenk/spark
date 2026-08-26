@@ -464,6 +464,14 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         interpreted side unconditionally, as this used to, made the whole suite
         blind to "transpiled returned a value where Python raised" -- which is
         what `"ab" * 2.5` -> 'abab' was, and what the dropped-binding NULLs were.
+
+        One divergence this policy would flag is known and deliberate, but no
+        strategy here reaches it today: a text repeat whose count column is
+        fractional truncates rather than raising. The strategies draw only longs and
+        bools, so nothing generates it; a string-times-double strategy added later
+        will fail here, and should be skipped rather than carved out. The shapes are
+        pinned in test_udf_transpile_unit.py, by
+        ``test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column``.
         """
         func_name = getattr(func, "__name__", repr(func))
         kwargs = kwargs or {}
