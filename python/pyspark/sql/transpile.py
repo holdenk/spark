@@ -176,6 +176,7 @@ import itertools
 import textwrap
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
+from pyspark.sql.internal import InternalFunction
 from pyspark.sql.types import (
     BinaryType,
     BooleanType,
@@ -275,10 +276,13 @@ def _promoting(op: str, *cols: Column) -> Column:
     only the analyzer knows the concrete column widths -- we only ever see a category, and
     "integral" spans tinyint through bigint.
 
-    Reached through ``call_function`` for the same reason ``div`` is: these are real Catalyst
-    expressions, and that is the door PySpark gives us to them.
+    Reached through ``InternalFunction`` rather than ``call_function``: these are registered as
+    internal expressions, so they are invisible to ``SHOW FUNCTIONS`` and to SQL. That is the
+    right side of the line -- for a SQL user `a + b` overflowing is the documented ANSI contract,
+    and a public registration would additionally owe an ``@ExpressionDescription`` and a row in
+    ``sql-expression-schema.md``, for a function nobody should call by name.
     """
-    return call_function(f"python_promoting_{op}", *cols)
+    return InternalFunction._invoke_internal_function_over_columns(f"python_promoting_{op}", *cols)
 
 
 def _is_numeric_cat(category: Optional[str]) -> bool:

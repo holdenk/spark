@@ -503,15 +503,6 @@ object FunctionRegistry {
     expression[TrySubtract]("try_subtract"),
     expression[TryMultiply]("try_multiply"),
     expression[TryElementAt]("try_element_at"),
-    // Arithmetic that widens its operands so a transpiled Python UDF does not raise on an
-    // intermediate Python would have carried -- see PythonNumericPromotion. Registered because
-    // the transpiler builds its lowerings out of `call_function`, the same way it reaches `div`.
-    // Not intended for hand-written SQL: there, `a + b` overflowing is the ANSI contract, and
-    // getting a decimal back instead would be a surprise.
-    expression[PythonPromotingAdd]("python_promoting_add"),
-    expression[PythonPromotingSubtract]("python_promoting_subtract"),
-    expression[PythonPromotingMultiply]("python_promoting_multiply"),
-    expression[PythonPromotingAbs]("python_promoting_abs"),
     expressionBuilder("try_avg", TryAverageExpressionBuilder, setAlias = true),
     expressionBuilder("try_sum", TrySumExpressionBuilder, setAlias = true),
     expression[TryToBinary]("try_to_binary"),
@@ -1120,6 +1111,17 @@ object FunctionRegistry {
     // BuiltinRegistryMixin normalizes to the builtin 3-part key (system.builtin.name).
     internal.registerFunction(FunctionIdentifier(name), info, newBuilder)
   }
+
+  // Arithmetic that widens its operands so a transpiled Python UDF does not raise on an
+  // intermediate Python would have carried -- see PythonNumericPromotion. Internal on purpose:
+  // for a SQL user `a + b` overflowing is the documented ANSI contract, and these have no
+  // meaning outside the transpiler. Registering them publicly also made every type-mismatched
+  // call (`python_promoting_add(1, 1.5)`) surface as INTERNAL_ERROR, and obliged them to carry
+  // @ExpressionDescription plus a row in sql-expression-schema.md.
+  registerInternalExpression[PythonPromotingAdd]("python_promoting_add")
+  registerInternalExpression[PythonPromotingSubtract]("python_promoting_subtract")
+  registerInternalExpression[PythonPromotingMultiply]("python_promoting_multiply")
+  registerInternalExpression[PythonPromotingAbs]("python_promoting_abs")
 
   registerInternalExpression[Product]("product")
   registerInternalExpression[BloomFilterAggregate]("bloom_filter_agg")
