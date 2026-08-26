@@ -663,7 +663,9 @@ class UserDefinedFunction:
             # ``self.func``; lowering a different function than the one pickled
             # would be a silent wrong answer, so pin that the profiler call sites
             # (which pass a wrapper) also pass ``include_transpiled=False``.
-            # Raised rather than asserted because ``python -O`` strips asserts.
+            # Raised (not asserted -- ``python -O`` strips those) rather than
+            # warned-and-fallen-back: this can only fire on an internal caller bug,
+            # where a loud test failure beats a silent wrong answer.
             if func is not self.func:
                 raise PySparkRuntimeError(
                     errorClass="CANNOT_TRANSPILE_MISMATCHED_FUNCTION",

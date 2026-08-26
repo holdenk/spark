@@ -617,10 +617,12 @@ object SQLConf {
         "Transpilation also requires ANSI mode (spark.sql.ansi.enabled=true) -- " +
         "the rewritten expressions target ANSI semantics, so with ANSI off the " +
         "transpiler falls back to interpreted Python and a warning is logged at " +
-        "UDF construction. Transpiled UDFS attempt to match the Python functionality but " +
+        "UDF construction. Transpiled UDFs attempt to match the Python functionality but " +
         "may not be 100% equivalent. Some known differences include: overflows from input types " +
-        "(you can precast to decimal to avoid), type coercion on comparison, and implicit " +
-        "returns. A UDF that reads a free variable (a closure cell or a module global) " +
+        "(you can precast to decimal to avoid), type coercion on comparison, implicit " +
+        "returns, and a non-integral text repeat count arriving from a column (Spark " +
+        "truncates where Python raises). " +
+        "A UDF that reads a free variable (a closure cell or a module global) " +
         "may have that value baked into the plan as a literal, read at the same moment " +
         "the interpreted path pickles the function, so rebinding the name afterwards " +
         "changes neither. Baking is limited to values cloudpickle would capture by " +

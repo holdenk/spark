@@ -35,6 +35,16 @@ keeps the option matrix small; prefer doing so. To bound plan growth,
 functions with more than three untyped parameters only emit the
 all-numeric and all-string variants.
 
+Text repeat carries a known divergence. Python's ``s * n`` needs a whole ``n``
+(``"ab" * 2.5`` and ``"ab" * 2.0`` are both a TypeError) while Spark's ``repeat``
+truncates. The rule: a count is refused when a non-integral number is VISIBLE in
+it -- a literal, or a captured value -- and lowered otherwise, so any count whose
+fractional part only arrives at runtime, in a column, still diverges. On a
+``double`` column holding 2.5, ``s * n`` gives ``'abab'``, ``s * (n + 1)``
+``'ababab'`` and ``s * -n`` ``''``, where Python raises every time. Casting the
+count to an integral type makes the two paths agree -- on ``'abab'``, not on the
+TypeError; the only way to get Python's error is to leave the UDF interpreted.
+
 A lambda is lowered only when its source names it directly and alone: bind it to
 a name (``f = lambda x: x + 1``, annotated if you like) or return it from a
 ``def`` (``return lambda x: x + n``), on a line of its own. Passed straight to
@@ -216,9 +226,12 @@ def _refuse_fractional_repeat_count(node: ast.AST) -> None:
 
     Two consequences, both deliberate:
 
-    * A count with no number in it at all -- a bare column, ``s * n`` -- still
-      lowers. That is the pre-existing behavior; constraining it needs a narrower
-      input category than "numeric" on the JVM side and is left to a follow-up.
+    * A count with no non-integral number VISIBLE in it still lowers, and that is
+      wider than a bare ``s * n``: ``Add``/``Sub``/``Mult``/``Mod`` are all lowered,
+      so ``s * (n + 1)`` and ``s * -n`` pass too and diverge on a fractional column
+      (``'ababab'`` and ``''`` for ``('ab', 2.5)``). Pre-existing behavior;
+      constraining it needs a narrower input category than "numeric" on the JVM
+      side and is left to a follow-up.
     * A fractional literal somewhere in the expression that cannot reach the count
       (``s * (a if a > 2.5 else 3)``) is refused too. Over-refusing costs a
       lowering; under-refusing returns a wrong answer.
@@ -477,7 +490,9 @@ class _CapturedScope:
             # reading it before that assignment raises UnboundLocalError, and
             # resolving it from an enclosing scope would return a value where the
             # UDF actually fails. A body-local that a nested scope closes over
-            # lands in ``co_cellvars`` instead and refuses below as unresolvable.
+            # lands in ``co_cellvars`` instead and refuses below as unresolvable --
+            # but only because ``_analyze_func`` refuses ``global``/``nonlocal``: a
+            # nested ``global x`` would put a cellvar in the globals table below.
             raise UnsupportedOperationException(
                 f"{name!r} is a local variable that is read before it is "
                 "assigned; Python raises UnboundLocalError here, so the "
@@ -1891,8 +1906,8 @@ def _analyze_func(
     # Warned here rather than while lowering: this depends only on the AST, and
     # ``_build_transpiled`` runs again for every ``judf`` and every read of the
     # ``transpiled`` property, so warning there would repeat for the UDF's life.
-    # Warned even when transpilation goes on to fail -- the user still wants to
-    # know the function never returns a value.
+    # Warned even when the LOWERING goes on to fail -- the user still wants to know
+    # the function never returns a value.
     if _returns_only_none_implicitly(function_ast.body):
         warnings.warn(
             f"UDF {func} has no return statement, so it always returns None "
