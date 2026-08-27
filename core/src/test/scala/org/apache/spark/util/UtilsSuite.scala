@@ -1214,6 +1214,7 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties {
     assert(redactedConf("spark.regular.property") === "regular_value")
     assert(redactedConf("spark.sensitive.property") === Utils.REDACTION_REPLACEMENT_TEXT)
     assert(redactedConf("spark.hadoop.fs.s3a.access.key") === Utils.REDACTION_REPLACEMENT_TEXT)
+    assert(redactedConf("spark.hadoop.fs.s3a.access.credential") === Utils.REDACTION_REPLACEMENT_TEXT)
     assert(redactedConf("spark.hadoop.fs.s3a.access_key") === "regular_value")
   }
 
