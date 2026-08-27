@@ -48,7 +48,8 @@ runtime, in a column, therefore still diverges: on a ``double`` column holding 2
 Annotating does NOT close this, despite what annotations do for the option matrix
 above: ``int`` and ``float`` both map to the one "numeric" category, and that
 matches any non-decimal numeric column, so ``def f(s: str, n: int)`` bound to a
-``double`` column lowers and returns ``'abab'``. Casting the COLUMN to an integral
+``double`` column lowers and returns ``'abab'``. Tracked as SPARK-58595.
+Casting the COLUMN to an integral
 type does work, but it makes the two paths agree on ``'abab'`` rather than on the
 TypeError -- the only way to get Python's error is to leave the UDF interpreted.
 
@@ -243,7 +244,7 @@ def _refuse_fractional_repeat_count(node: ast.AST) -> None:
       integral and fractional on BOTH sides (the precedent is the JVM matcher
       already excluding DecimalType from "numeric" for the same kind of reason) and
       assigning categories PER USE, since a category is per public parameter today
-      while "is a repeat count" is per use. Left to a follow-up.
+      while "is a repeat count" is per use. Left to SPARK-58595.
     * A fractional literal somewhere in the expression that cannot reach the count
       (``s * (a if a > 2.5 else 3)``) is refused too. Over-refusing costs a
       lowering; under-refusing returns a wrong answer.

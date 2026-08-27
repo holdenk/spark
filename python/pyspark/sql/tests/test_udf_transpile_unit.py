@@ -2472,7 +2472,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # on covers DOUBLE as well as LONG -- which is pre-existing behavior, pinned
         # with its actual values by
         # ``test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column``
-        # below. Narrowing it is left to a follow-up; see that test for the shapes.
+        # below. Narrowing it is SPARK-58595; see that test for the shapes.
         S = StringType()
         fraction = 2.5
         whole_float = 2.0
@@ -2555,7 +2555,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     self.assertEqual(0, self._eval_python_count(lowered))
 
     def test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column(self):
-        # A PINNED KNOWN DIVERGENCE (SPARK-55207), not behavior we want.
+        # A PINNED KNOWN DIVERGENCE, not behavior we want; the fix is SPARK-58595,
+        # which will make this test fail -- deliberately, see the note at the end.
         # ``_refuse_fractional_repeat_count`` walks only ``ast.Constant``, so it
         # refuses a visible non-integral constant and lets through a count whose
         # fractional part arrives at runtime in a column -- where the ``cast(... as

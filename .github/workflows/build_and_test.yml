@@ -664,9 +664,10 @@ jobs:
       RUN_HYPOTHESIS: ${{ fromJson(needs.precondition.outputs.required).transpile }}
       # Each generated example runs two full Spark jobs (transpiled vs. interpreted
       # differential), and PYSPARK_TEST_TIMEOUT above covers the whole module rather
-      # than one test, so every test shares that budget: at 50 examples the module
-      # was killed 27 tests in. 20 keeps it around 250-300s on a runner, ~10s per
-      # test. The explicit @example edge seeds always run regardless of this cap.
+      # than one test, so all 26 tests share that single budget -- 50 examples
+      # exhausted it and the module was killed partway through. 20 leaves headroom:
+      # the module runs in ~170s locally at 25 examples, against a 450s budget. The
+      # explicit @example edge seeds always run regardless of this cap.
       RUN_HYPOTHESIS_MAX_EXAMPLES: 20
     steps:
     - name: Bootstrap composite actions
