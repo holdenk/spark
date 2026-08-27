@@ -2083,6 +2083,141 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         for combo in combos:
             self.assertEqual(combo[0], "string")
 
+    # ------------------------------------------------------------------
+    # Per-node memoization of the four static-inference methods. Each is
+    # memoized per AST node per input-type variant, which is what keeps
+    # inference from being quadratic in the size of the body -- and what makes
+    # stale entries a correctness hazard across variants. One test each way.
+    # ------------------------------------------------------------------
+
+    # ``inference method -> memo attribute it populates``.
+    _INFERENCE_MEMOS = {
+        "_category": "_category_memo",
+        "_safe_category": "_safe_category_memo",
+        "_is_definitely_basic_type": "_basic_type_memo",
+        "_is_definitely_boolean": "_boolean_memo",
+    }
+
+    @staticmethod
+    def _counting_inference(memo_attr, original, tally, key):
+        """Wrap an inference method so ``tally[key]`` counts node *evaluations*.
+
+        An evaluation is a call that misses the memo, hence the membership check
+        before delegating: the memo lookup is inlined into each method (a wrapper
+        would cost a stack frame per recursion level and halve the expression
+        depth the transpiler accepts), so there is no separate entry point that
+        only misses reach.
+        """
+
+        def counting(transpiler, *args):
+            node = args[-1]
+            if node is not None and node not in getattr(transpiler, memo_attr):
+                tally[key] += 1
+            return original(transpiler, *args)
+
+        return counting
+
+    def test_udf_transpile_evaluates_each_node_once_per_method(self):
+        # Every one of these asks about a node and then descends into that same
+        # node's children, which ask about their own children again, so without a
+        # memo each level re-walks a subtree an enclosing level already walked and
+        # inference costs O(nodes^2) in the size of the body.
+        #
+        # Assert the memoized guarantee rather than a timing: no method evaluates
+        # the same node twice, so a method's evaluation count cannot exceed the
+        # number of distinct nodes in the tree. One shape per method that drives
+        # it, so that no memo is covered only vacuously.
+        import ast as _ast
+
+        from pyspark.sql.transpile import CatalystTranspiler
+
+        # Stay well under CPython's MAXINDENT of 100 -- the nested-if body below
+        # indents one more level per step.
+        size = 40
+        chain = "def f(a):\n    return " + " + ".join(["a"] * (size + 1)) + "\n"
+        boolop = "def f(a):\n    return " + "(" * size + "(a > 0)" + " and (a > 0))" * size + "\n"
+        if_lines = ["    " * (k + 1) + f"if a > {k}:" for k in range(size)]
+        if_lines += [
+            "    " * (size + 1) + "return 1",
+            "    " * size + "else:",
+            "    " * (size + 1) + "return 2",
+        ]
+        nested_if = "def f(a):\n" + "\n".join(if_lines) + "\n"
+
+        # (label, source, return type, methods this shape must actually exercise)
+        cases = [
+            ("arithmetic chain", chain, LongType(), ["_category"]),
+            (
+                "nested boolop",
+                boolop,
+                BooleanType(),
+                ["_is_definitely_basic_type", "_is_definitely_boolean"],
+            ),
+            ("nested if/else", nested_if, LongType(), ["_safe_category"]),
+        ]
+
+        for label, src, return_type, drivers in cases:
+            with self.subTest(shape=label):
+                ast_info = _ast.parse(src)
+                function_ast = ast_info.body[0]
+                # Distinct objects, not ``ast.walk``'s raw count: CPython shares
+                # operator and context nodes (``Add``, ``Load``) as singletons, so
+                # walk yields the same object once per referencing node and
+                # over-counts by roughly 2x.
+                distinct_nodes = len({id(n) for n in _ast.walk(function_ast)})
+
+                evaluations = dict.fromkeys(self._INFERENCE_MEMOS, 0)
+                originals: dict = {}
+                transpiler = CatalystTranspiler()
+                try:
+                    # Installed inside the `try` so a failure part-way through
+                    # still restores what landed -- this patches a shared class.
+                    for name, memo in self._INFERENCE_MEMOS.items():
+                        originals[name] = getattr(CatalystTranspiler, name)
+                        setattr(
+                            CatalystTranspiler,
+                            name,
+                            self._counting_inference(memo, originals[name], evaluations, name),
+                        )
+                    column = transpiler._transpile_from_ast(
+                        src, ast_info, function_ast, ["a"], return_type, {0: "numeric"}
+                    )
+                finally:
+                    for name, original in originals.items():
+                        setattr(CatalystTranspiler, name, original)
+
+                self.assertIsNotNone(column)
+                for name in drivers:
+                    # Non-vacuous: this shape nests `size` levels deep through
+                    # `name`, so it evaluates at least one node per level.
+                    self.assertGreaterEqual(evaluations[name], size, name)
+                for name, memo in self._INFERENCE_MEMOS.items():
+                    # No node evaluated twice by the same method...
+                    self.assertLessEqual(evaluations[name], distinct_nodes, name)
+                    # ...and every evaluation recorded, so the bound above cannot
+                    # be met just by this tree happening not to re-ask.
+                    self.assertEqual(len(getattr(transpiler, memo)), evaluations[name], name)
+
+    def test_udf_transpile_memoized_categories_do_not_leak_across_variants(self):
+        # One transpiler instance lowers every input-type variant in turn, and a
+        # node's category is only meaningful under the variant's assumption, so
+        # ``_transpile_from_ast`` drops the memos with it. ``a * b`` is a repeat
+        # (string) for numeric-times-string either way round, and a multiply
+        # (numeric) for numeric-times-numeric -- so with a string return type
+        # exactly the two mixed variants survive. A memo carried over from the
+        # first variant would report numeric for all four and emit nothing.
+        def mul(a, b):
+            return a * b
+
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(mul, StringType())
+        # Sorted: which variants survive is the point, the order they come out of
+        # ``itertools.product`` in is not.
+        self.assertEqual(
+            sorted(pudf._transpiled_input_categories),
+            [["numeric", "string"], ["string", "numeric"]],
+        )
+
 
 if __name__ == "__main__":
     from pyspark.testing import main
