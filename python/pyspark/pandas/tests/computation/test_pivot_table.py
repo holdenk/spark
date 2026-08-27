@@ -70,6 +70,40 @@ class PivotTableMixin:
             almost=True,
         )
 
+    def test_pivot_table_aggfunc_name(self):
+        pdf = pd.DataFrame(
+            {"a": [4, 2, 3, 4], "b": [1, 2, 2, 4], "c": [1, 2, 9, 4], "e": [10, 20, 20, 40]}
+        )
+        psdf = ps.from_pandas(pdf)
+
+        # A Spark SQL function name names the function to apply, whatever its case.
+        self.assert_eq(
+            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="SUM").sort_index(),
+            pdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="sum").sort_index(),
+            almost=True,
+        )
+
+        # ... but a value that is more, or less, than a function name is rejected rather than
+        # ending up as part of the aggregate expression.
+        expected_error_message = (
+            r"aggregate function must be a Spark SQL function name such as 'sum', "
+            r"optionally qualified with a catalog and a database, got "
+        )
+        # the rejected shapes themselves are enumerated in test_validate_agg_func_name; what
+        # matters here is that each way of passing an aggfunc reaches the check
+        aggfunc = "first((SELECT 1)) as `b` -- "
+        with self.assertRaisesRegex(ValueError, expected_error_message):
+            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc=aggfunc)
+        with self.assertRaisesRegex(ValueError, expected_error_message):
+            psdf.pivot_table(index=["c"], columns="a", values=["b"], aggfunc=aggfunc)
+        with self.assertRaisesRegex(ValueError, expected_error_message):
+            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc={"b": aggfunc})
+        # every entry of the dict is checked, not just the first one
+        with self.assertRaisesRegex(ValueError, expected_error_message):
+            psdf.pivot_table(
+                index=["c"], columns="a", values=["b", "e"], aggfunc={"b": "sum", "e": aggfunc}
+            )
+
 
 class PivotTableTests(
     PivotTableMixin,

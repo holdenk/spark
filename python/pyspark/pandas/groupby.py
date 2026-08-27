@@ -86,6 +86,7 @@ from pyspark.pandas.utils import (
     name_like_string,
     same_anchor,
     scol_for,
+    validate_agg_func_name,
     verify_temp_column_name,
 )
 from pyspark.sql import Column, Window
@@ -186,6 +187,8 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
         func_or_funcs : dict, str or list
              a dict mapping from column name (string) to
              aggregate functions (string or list of strings).
+             Each aggregate function is named by a Spark SQL function name,
+             optionally qualified with a catalog and a database.
 
         Returns
         -------
@@ -377,6 +380,10 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
             if len(label) != psdf._internal.column_labels_level:
                 raise TypeError("The length of the key must be the same as the column label level.")
             for aggfunc in [value] if isinstance(value, str) else value:
+                # ``aggfunc`` is formatted into a Spark SQL expression below, and names an
+                # output column, so use the validated name rather than the given one.
+                aggfunc = validate_agg_func_name(aggfunc)
+
                 column_label = tuple(list(label) + [aggfunc]) if multi_aggs else label
                 column_labels.append(column_label)
 
