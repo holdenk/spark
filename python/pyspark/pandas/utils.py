@@ -21,6 +21,7 @@ Commonly used utils in pandas-on-Spark.
 import functools
 import json
 import os
+import re
 import threading
 import warnings
 from contextlib import contextmanager
@@ -74,6 +75,10 @@ ERROR_MESSAGE_CANNOT_COMBINE = (
 
 SPARK_CONF_ARROW_ENABLED = "spark.sql.execution.arrow.pyspark.enabled"
 SPARK_CONF_PANDAS_STRUCT_MODE = "spark.sql.execution.pandas.structHandlingMode"
+
+# A function name as Spark SQL spells it: an identifier, optionally qualified with a catalog and
+# a database. See ``validate_agg_func_name``.
+_AGG_FUNC_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,2}")
 
 
 class PandasAPIOnSparkAdviceWarning(Warning):
@@ -745,6 +750,28 @@ def is_name_like_value(
         return as_spark_type(type(value), raise_error=False) is not None
     else:
         return True
+
+
+def validate_agg_func_name(agg_func: Any) -> str:
+    """
+    Check the given aggregate function name is only that: a name, and return it.
+
+    An aggregate function given as a string is formatted into a Spark SQL expression by its
+    callers, so it has to be just a function name: a plain identifier, optionally qualified with
+    a catalog and a database. Anything further, such as quoting, a comment or an argument list,
+    is parsed as part of the surrounding expression rather than naming the function to apply, so
+    it is rejected here instead.
+
+    Callers should format the returned name rather than the one they were given: a str subclass
+    can render as something other than its own value, in which case the two differ.
+    """
+    match = _AGG_FUNC_NAME_PATTERN.fullmatch(agg_func) if isinstance(agg_func, str) else None
+    if match is None:
+        raise ValueError(
+            "aggregate function must be a Spark SQL function name such as 'sum', "
+            "optionally qualified with a catalog and a database, got %r." % (agg_func,)
+        )
+    return match.group()
 
 
 def validate_axis(axis: Optional[Axis] = 0, none_axis: Literal[0, 1] = 0) -> Literal[0, 1]:

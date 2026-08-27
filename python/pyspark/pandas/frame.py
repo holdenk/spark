@@ -131,6 +131,7 @@ from pyspark.pandas.utils import (
     name_like_string,
     same_anchor,
     scol_for,
+    validate_agg_func_name,
     validate_arguments_and_invoke_function,
     validate_axis,
     validate_bool_kwarg,
@@ -1433,6 +1434,8 @@ class DataFrame(Frame, Generic[T]):
              aggregate functions (list of strings).
              If a list is given, the aggregation is performed against
              all columns.
+             Each aggregate function is named by a Spark SQL function name,
+             optionally qualified with a catalog and a database.
 
         Returns
         -------
@@ -6964,6 +6967,8 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
         aggfunc : function (string), dict, default mean
             If dict is passed, the key is column to aggregate and value
             is function or list of functions.
+            A function is named by a Spark SQL function name, optionally
+            qualified with a catalog and a database.
         fill_value : scalar, default None
             Value to replace missing values with.
 
@@ -7083,7 +7088,10 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
             if not isinstance(self._internal.spark_type_for(values), NumericType):
                 raise TypeError("values should be a numeric type.")
 
+        # ``aggfunc`` is formatted into a Spark SQL expression below, so each name is used as
+        # validated rather than as given.
         if isinstance(aggfunc, str):
+            aggfunc = validate_agg_func_name(aggfunc)
             if isinstance(values, list):
                 agg_cols = [
                     F.expr(
@@ -7103,7 +7111,8 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
                 ]
         elif isinstance(aggfunc, dict):
             aggfunc = {
-                key if is_name_like_tuple(key) else (key,): value for key, value in aggfunc.items()
+                key if is_name_like_tuple(key) else (key,): validate_agg_func_name(value)
+                for key, value in aggfunc.items()
             }
             agg_cols = [
                 F.expr(
