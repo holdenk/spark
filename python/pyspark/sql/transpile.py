@@ -51,7 +51,7 @@ import sys
 import textwrap
 import threading
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple
 
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
@@ -128,23 +128,24 @@ class CatalystTranspiler(AbstractTranspiler):
     def _reset_memos(self) -> None:
         """Drop every per-node memo. Called for each input-type variant.
 
-        One transpiler instance lowers every variant in turn (see
-        ``_transpile_func``) against the same AST, so nodes -- and therefore memo
-        keys -- are shared across variants. A category is only meaningful under
-        the ``_param_categories`` assumption it was inferred beneath, so the
-        memos cannot outlive it.
+        One transpiler instance lowers every variant in turn against the same AST
+        (see ``_transpile_func``), so nodes -- and therefore memo keys -- are
+        shared across variants. ``_category_memo`` and ``_safe_category_memo``
+        hold answers derived under ``_param_categories``, so they cannot outlive
+        it. ``_boolean_memo`` is different: its predicate reads only the node's
+        shape and would be safe to keep across variants (verified -- never
+        clearing it leaves the suite green and agrees with the pre-change
+        transpiler on a 400-UDF differential; it would save re-deriving boolean
+        inference once per variant, worth ~3% of transpile time on a four-variant
+        boolean UDF). It is dropped with the rest anyway so there is one lifetime
+        rule rather than two, and so a predicate that later grows a dependency on
+        the assumption cannot go quietly stale.
 
-        The two predicate memos are strictly speaking safe to keep: those
-        predicates read only the node's shape, never ``_param_categories`` or
-        ``params``. They are dropped with the rest anyway, so there is one
-        lifetime rule rather than two, and so a predicate that later grows a
-        dependency on the assumption cannot go quietly stale. Every memo lives
-        here for the same reason -- adding one to ``__init__`` alone would leave
-        it uncleared, which is a wrong answer rather than a crash.
+        Every memo lives here rather than in ``__init__`` so that adding one
+        cannot leave it uncleared, which would be a wrong answer, not a crash.
         """
-        self._category_memo: dict[ast.AST, Union[str, UnsupportedOperationException]] = {}
+        self._category_memo: dict[ast.AST, str] = {}
         self._safe_category_memo: dict[ast.AST, Optional[str]] = {}
-        self._basic_type_memo: dict[ast.AST, bool] = {}
         self._boolean_memo: dict[ast.AST, bool] = {}
 
     # TODO (SPARK-55218): handle implicit-None return bodies like
@@ -167,21 +168,28 @@ class CatalystTranspiler(AbstractTranspiler):
         return self._convert_chunk(params, statements[0])
 
     # ------------------------------------------------------------------
-    # Static inference over the body's AST. All four methods below memoize
-    # per node, and all four are asked in the same shape: a caller classifies
-    # a node, then descends into that node's children, which classify their
-    # own children again -- so an unmemoized walk re-does an enclosing level's
-    # work and costs O(nodes^2) for the body. The memo makes each node's
-    # answer cost once. See ``_reset_memos`` for the lifetime.
+    # Static inference over the body's AST. ``_category``, ``_safe_category``
+    # and ``_is_definitely_boolean`` memoize per node -- see ``_category`` for
+    # why and ``_reset_memos`` for how long an entry lives. Three measured notes,
+    # because two of them look like tidy-ups and are not:
     #
-    # The memo lookup is inlined into each recursive method rather than sitting
-    # in a wrapper that delegates to it. A wrapper would add a stack frame per
-    # recursion level, and these recurse once per level of expression nesting:
-    # measured, the split halved the depth the transpiler accepts before
-    # RecursionError (a chain of `+` went from 994 operators to 495, and a
-    # comparison over one from 992 to 329). ``_transpile_func`` catches that
-    # and falls back to interpreted Python, so the cost would have been a
-    # silent loss of lowering on exactly the large bodies this memo is for.
+    # * The memo lookup is inlined in each method rather than delegated to from
+    #   a wrapper. A wrapper is one more stack frame per recursion level, which
+    #   halves the body size accepted before RecursionError (inference over a
+    #   chain of `+`: 994 operators -> 495, against an end-to-end lowering
+    #   ceiling of ~979). ``_transpile_func`` catches RecursionError and falls
+    #   back, so that shows up as lowering silently lost, not as an error.
+    # * For the same reason ``_is_definitely_basic_type`` uses ``all(map(f, xs))``
+    #   rather than a genexpr: it is the one predicate that recurses per level
+    #   down an arbitrarily long operand chain, and a genexpr's frame caps it at
+    #   496. ``_is_definitely_boolean`` keeps genexprs -- it only recurses
+    #   through ``BoolOp``/``IfExp`` nesting, which ``ast.parse`` caps near 200
+    #   long before a frame per level could matter.
+    # * ``_is_definitely_basic_type`` is deliberately not memoized: the
+    #   ``Compare`` arm is its only caller, and that arm's own memo means each
+    #   comparison is inspected once, so its walk never repeats (measured: zero
+    #   repeat visits on every shape tried, against 6x-11x fewer calls for the
+    #   three that do memoize).
     # ------------------------------------------------------------------
 
     def _is_definitely_basic_type(self, node: ast.AST) -> bool:
@@ -191,24 +199,17 @@ class CatalystTranspiler(AbstractTranspiler):
         All ast.Name's are treated as basic types for now this will need to be updated
         if/when we add free variables / closures to transpilation.
         """
-        if node in self._basic_type_memo:
-            return self._basic_type_memo[node]
         match node:
             case ast.Constant():
-                basic = True
+                return True
             case ast.BinOp(left=left, right=right):
-                # ``map``, not a genexpr: a genexpr is a second stack frame per
-                # recursion level, which halves the depth this accepts (see the
-                # note above this section). Both still short-circuit.
-                basic = all(map(self._is_definitely_basic_type, (left, right)))
+                return all(map(self._is_definitely_basic_type, (left, right)))
             case ast.UnaryOp(operand=operand):
-                basic = self._is_definitely_basic_type(operand)
+                return self._is_definitely_basic_type(operand)
             case ast.Name():
-                basic = True
+                return True
             case _:
-                basic = False
-        self._basic_type_memo[node] = basic
-        return basic
+                return False
 
     def _is_definitely_boolean(self, node: ast.AST) -> bool:
         """Return True when ``node`` is statically guaranteed to produce a Python
@@ -227,9 +228,9 @@ class CatalystTranspiler(AbstractTranspiler):
                 boolean = v is None or isinstance(v, bool)
             case ast.Compare(left=left, comparators=comparators):
                 # All comparison operators of simple types bool
-                boolean = all(map(self._is_definitely_basic_type, comparators + [left]))
+                boolean = all(self._is_definitely_basic_type(v) for v in comparators + [left])
             case ast.BoolOp(values=values):
-                boolean = all(map(self._is_definitely_boolean, values))
+                boolean = all(self._is_definitely_boolean(v) for v in values)
             case ast.UnaryOp(op=ast.Not()):
                 # `not x` always produces bool.
                 boolean = True
@@ -444,124 +445,104 @@ class CatalystTranspiler(AbstractTranspiler):
         operands are type-incompatible, so the caller drops that variant and the
         JVM picks another option / falls back to the Python UDF.
 
-        Memoized per AST node, because the callers ask in a shape that is
-        otherwise quadratic: ``_convert_chunk``'s ``BinOp`` arm classifies both
-        operands and then recurses into those same operands, which classify
-        their own children again one level down. Without the memo each level
-        walks the whole subtree and throws the answer away on descent. This is
-        driver-side work inside query planning, once per lowered variant, so it
-        is worth not repeating.
+        Memoized per AST node: ``_convert_chunk``'s ``BinOp`` arm classifies both
+        operands and then recurses into those same operands, which classify their
+        own children again, so without the memo every level re-walks a subtree an
+        enclosing level already walked -- O(nodes^2) driver-side, per variant.
 
-        Refusals are memoized alongside answers, because ``_safe_category``
-        swallows them: an unrecorded refusal means the offending subtree is
-        re-walked on every ask, which is the same quadratic for a body whose
-        nested ternary branches don't unify.
+        The point is the bound, not the constant. Inference calls drop 6x-11x on
+        the bodies that drive each method, which is worth 1.36x of end-to-end
+        ``_transpile_func`` time at a ~975-operator body and ~1.0x at ordinary
+        sizes -- py4j ``Column`` construction in ``_convert_chunk`` dominates and
+        is not memoized. So this is not here to speed up typical UDFs; it is here
+        so a large body costs time proportional to its size rather than to its
+        square, which is what made the pathological end of the range degenerate.
         """
         remembered = self._category_memo.get(node)
         if remembered is not None:
-            if isinstance(remembered, UnsupportedOperationException):
-                # The stored instance, not a copy built from its message: that
-                # keeps whatever the raise site put on it, so an error condition
-                # added here later survives a cache hit instead of arriving as a
-                # bare message. Re-raising one instance appends a frame to its
-                # traceback per hit, which is bounded by the nesting depth and
-                # discarded as soon as ``_transpile_func`` records ``str(e)``.
-                raise remembered
             return remembered
         category: str
-        try:
-            match node:
-                case ast.Constant(value=v):
-                    # bool subclasses int, so classify it first: int/float -> numeric,
-                    # str -> string, bool -> bool, bytes -> binary. None/complex/
-                    # Ellipsis have no usable Spark column type, so raise to drop this
-                    # variant and fall back rather than emit an option that fails
-                    # CheckAnalysis or silently diverges (e.g. `x + None` -> NULL where
-                    # Python raises TypeError).
-                    if isinstance(v, bool):
-                        category = "bool"
-                    elif isinstance(v, bytes):
-                        category = "binary"
-                    elif isinstance(v, (int, float)):
-                        category = "numeric"
-                    elif isinstance(v, str):
-                        category = "string"
-                    else:
-                        raise UnsupportedOperationException(
-                            f"constant {v!r} ({type(v).__name__}) has no usable column "
-                            "category; falling back to interpreted Python"
-                        )
-                case ast.Name(id=name) if name in params:
-                    # ``params`` is the caller-facing list, so its indexes are already
-                    # the ``_udf_param_N`` / category indexes -- see ``_transpile_func``.
-                    category = self._param_categories.get(params.index(name), "numeric")
-                case ast.BinOp(left=left, op=op, right=right):
-                    lc = self._category(params, left)
-                    rc = self._category(params, right)
-                    if isinstance(op, ast.Add) and lc == rc:
-                        category = lc  # str + str -> str, num + num -> num
-                    elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "numeric"}:
-                        category = "numeric"
-                    elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "string"}:
-                        category = "string"  # str * int / int * str -> repeat
-                    elif isinstance(op, (ast.Sub, ast.Mod)) and lc == rc == "numeric":
-                        category = "numeric"
-                    else:
-                        raise UnsupportedOperationException(
-                            f"operands of `{type(op).__name__}` are not type-compatible "
-                            "for this input-type variant"
-                        )
-                case ast.Return(value=value) if value is not None:
-                    category = self._category(params, value)
-                case ast.IfExp(body=if_body, orelse=if_orelse):
-                    # A ternary's category is its branches' common category. Without
-                    # this arm the catch-all labeled every IfExp "numeric", so e.g.
-                    # `("5" if c else "6") == 5` passed the equality guard as
-                    # numeric-vs-numeric and Spark's string-number coercion silently
-                    # diverged from Python's cross-type `==` (always False). A
-                    # None-literal branch adopts the other branch's category (NULL
-                    # unifies with any type in the lowered CASE WHEN); mismatched or
-                    # all-None branches raise so the variant is dropped.
-                    #
-                    # Inlined rather than a nested helper: a helper would be one more
-                    # stack frame per level of ternary nesting (see the note above
-                    # this section) for two call sites.
-                    branch_cats: List[Optional[str]] = []
-                    for b in (if_body, if_orelse):
-                        if isinstance(b, ast.Constant) and b.value is None:
-                            branch_cats.append(None)
-                        else:
-                            branch_cats.append(self._category(params, b))
-                    body_cat, else_cat = branch_cats
-                    if body_cat is not None and else_cat is not None and body_cat != else_cat:
-                        raise UnsupportedOperationException(
-                            f"ternary branches have mismatched categories ({body_cat} "
-                            f"vs {else_cat}) and cannot drive operator selection"
-                        )
-                    result_cat = body_cat if body_cat is not None else else_cat
-                    if result_cat is None:
-                        raise UnsupportedOperationException(
-                            "ternary with all-None branches has no usable column category"
-                        )
-                    category = result_cat
-                case _ if self._is_definitely_boolean(node):
-                    # Comparisons, `not`, and boolean ops produce a boolean column.
-                    # Labeling them "numeric" (the old catch-all) let booleans into
-                    # arithmetic/equality lowerings where ANSI analysis fails (e.g.
-                    # `(x > 0) + 1`, valid Python) instead of falling back.
+        match node:
+            case ast.Constant(value=v):
+                # bool subclasses int, so classify it first: int/float -> numeric,
+                # str -> string, bool -> bool, bytes -> binary. None/complex/
+                # Ellipsis have no usable Spark column type, so raise to drop this
+                # variant and fall back rather than emit an option that fails
+                # CheckAnalysis or silently diverges (e.g. `x + None` -> NULL where
+                # Python raises TypeError).
+                if isinstance(v, bool):
                     category = "bool"
-                case _:
-                    # Remaining nodes (unsupported calls, subscripts, ...) don't
-                    # drive concat/repeat selection and are rejected later by
-                    # `_convert_chunk`; treat as numeric for category purposes.
+                elif isinstance(v, bytes):
+                    category = "binary"
+                elif isinstance(v, (int, float)):
                     category = "numeric"
-        except UnsupportedOperationException as e:
-            # Also catches a refusal propagating up from a recursive call above:
-            # if a child has no category then neither does this node, so caching
-            # the same refusal against it is right (and is what the pre-memo code
-            # effectively did by re-deriving it).
-            self._category_memo[node] = e
-            raise
+                elif isinstance(v, str):
+                    category = "string"
+                else:
+                    raise UnsupportedOperationException(
+                        f"constant {v!r} ({type(v).__name__}) has no usable column "
+                        "category; falling back to interpreted Python"
+                    )
+            case ast.Name(id=name) if name in params:
+                # ``params`` is the caller-facing list, so its indexes are already
+                # the ``_udf_param_N`` / category indexes -- see ``_transpile_func``.
+                category = self._param_categories.get(params.index(name), "numeric")
+            case ast.BinOp(left=left, op=op, right=right):
+                lc = self._category(params, left)
+                rc = self._category(params, right)
+                if isinstance(op, ast.Add) and lc == rc:
+                    category = lc  # str + str -> str, num + num -> num
+                elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "numeric"}:
+                    category = "numeric"
+                elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "string"}:
+                    category = "string"  # str * int / int * str -> repeat
+                elif isinstance(op, (ast.Sub, ast.Mod)) and lc == rc == "numeric":
+                    category = "numeric"
+                else:
+                    raise UnsupportedOperationException(
+                        f"operands of `{type(op).__name__}` are not type-compatible "
+                        "for this input-type variant"
+                    )
+            case ast.Return(value=value) if value is not None:
+                category = self._category(params, value)
+            case ast.IfExp(body=if_body, orelse=if_orelse):
+                # A ternary's category is its branches' common category. Without
+                # this arm the catch-all labeled every IfExp "numeric", so e.g.
+                # `("5" if c else "6") == 5` passed the equality guard as
+                # numeric-vs-numeric and Spark's string-number coercion silently
+                # diverged from Python's cross-type `==` (always False). A
+                # None-literal branch adopts the other branch's category (NULL
+                # unifies with any type in the lowered CASE WHEN); mismatched or
+                # all-None branches raise so the variant is dropped.
+                def branch_category(b: ast.AST) -> Optional[str]:
+                    if isinstance(b, ast.Constant) and b.value is None:
+                        return None
+                    return self._category(params, b)
+
+                body_cat = branch_category(if_body)
+                else_cat = branch_category(if_orelse)
+                if body_cat is not None and else_cat is not None and body_cat != else_cat:
+                    raise UnsupportedOperationException(
+                        f"ternary branches have mismatched categories ({body_cat} "
+                        f"vs {else_cat}) and cannot drive operator selection"
+                    )
+                result_cat = body_cat if body_cat is not None else else_cat
+                if result_cat is None:
+                    raise UnsupportedOperationException(
+                        "ternary with all-None branches has no usable column category"
+                    )
+                category = result_cat
+            case _ if self._is_definitely_boolean(node):
+                # Comparisons, `not`, and boolean ops produce a boolean column.
+                # Labeling them "numeric" (the old catch-all) let booleans into
+                # arithmetic/equality lowerings where ANSI analysis fails (e.g.
+                # `(x > 0) + 1`, valid Python) instead of falling back.
+                category = "bool"
+            case _:
+                # Remaining nodes (unsupported calls, subscripts, ...) don't
+                # drive concat/repeat selection and are rejected later by
+                # `_convert_chunk`; treat as numeric for category purposes.
+                category = "numeric"
         self._category_memo[node] = category
         return category
 

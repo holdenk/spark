@@ -2084,17 +2084,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             self.assertEqual(combo[0], "string")
 
     # ------------------------------------------------------------------
-    # Per-node memoization of the four static-inference methods. Each is
-    # memoized per AST node per input-type variant, which is what keeps
+    # Per-node memoization of static inference. Three of the four inference
+    # methods memoize per AST node per input-type variant, which is what keeps
     # inference from being quadratic in the size of the body -- and what makes
-    # stale entries a correctness hazard across variants. One test each way.
+    # stale entries a correctness hazard across variants. One test each way,
+    # plus the invariant that lets the fourth go unmemoized.
     # ------------------------------------------------------------------
 
-    # ``inference method -> memo attribute it populates``.
+    # ``memoized inference method -> memo attribute it populates``.
+    # ``_is_definitely_basic_type`` is absent on purpose: it does not memoize,
+    # because the ``Compare`` memo already means its walk never repeats. That
+    # invariant is asserted separately, below.
     _INFERENCE_MEMOS = {
         "_category": "_category_memo",
         "_safe_category": "_safe_category_memo",
-        "_is_definitely_basic_type": "_basic_type_memo",
         "_is_definitely_boolean": "_boolean_memo",
     }
 
@@ -2147,12 +2150,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # (label, source, return type, methods this shape must actually exercise)
         cases = [
             ("arithmetic chain", chain, LongType(), ["_category"]),
-            (
-                "nested boolop",
-                boolop,
-                BooleanType(),
-                ["_is_definitely_basic_type", "_is_definitely_boolean"],
-            ),
+            ("nested boolop", boolop, BooleanType(), ["_is_definitely_boolean"]),
             ("nested if/else", nested_if, LongType(), ["_safe_category"]),
         ]
 
@@ -2195,8 +2193,62 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     # No node evaluated twice by the same method...
                     self.assertLessEqual(evaluations[name], distinct_nodes, name)
                     # ...and every evaluation recorded, so the bound above cannot
-                    # be met just by this tree happening not to re-ask.
+                    # be met just by this tree happening not to re-ask. Holds
+                    # because every shape here lowers: a refusal is not memoized,
+                    # so adding a shape that refuses would make evaluations
+                    # legitimately exceed the memo size.
                     self.assertEqual(len(getattr(transpiler, memo)), evaluations[name], name)
+
+    def test_udf_transpile_basic_type_predicate_never_revisits_a_node(self):
+        # ``_is_definitely_basic_type`` is the one inference method with no memo,
+        # on the grounds that ``_is_definitely_boolean``'s ``Compare`` arm is its
+        # only caller and that arm is itself memoized, so nothing asks twice.
+        # That is the whole justification for leaving it unmemoized, so assert it
+        # rather than trust the comment: a second caller appearing -- the change
+        # that would make the missing memo cost something -- fails here.
+        import ast as _ast
+
+        from pyspark.sql.transpile import CatalystTranspiler
+
+        size = 40
+        # Many separate comparisons over sizeable operands, and one comparison
+        # over a long chain: between them, every route into the predicate.
+        many = " or ".join(f"(a + {k} > {k})" for k in range(size))
+        chain = " + ".join(["a"] * (size + 1))
+        cases = [
+            ("many comparisons", f"def f(a):\n    return {many}\n"),
+            ("comparison over a chain", f"def f(a):\n    return ({chain}) > 0\n"),
+        ]
+
+        for label, src in cases:
+            with self.subTest(shape=label):
+                ast_info = _ast.parse(src)
+                function_ast = ast_info.body[0]
+                visits: dict = {}
+                original = CatalystTranspiler._is_definitely_basic_type
+
+                def counting(transpiler, node):
+                    visits[id(node)] = visits.get(id(node), 0) + 1
+                    return original(transpiler, node)
+
+                transpiler = CatalystTranspiler()
+                try:
+                    CatalystTranspiler._is_definitely_basic_type = counting
+                    column = transpiler._transpile_from_ast(
+                        src, ast_info, function_ast, ["a"], BooleanType(), {0: "numeric"}
+                    )
+                finally:
+                    CatalystTranspiler._is_definitely_basic_type = original
+
+                self.assertIsNotNone(column)
+                # Non-vacuous: the predicate really is reached on this shape.
+                self.assertGreaterEqual(len(visits), size)
+                self.assertEqual(
+                    [n for n, count in visits.items() if count > 1],
+                    [],
+                    "nodes visited more than once -- _is_definitely_basic_type now "
+                    "needs a memo, or has gained a second caller",
+                )
 
     def test_udf_transpile_memoized_categories_do_not_leak_across_variants(self):
         # One transpiler instance lowers every input-type variant in turn, and a
