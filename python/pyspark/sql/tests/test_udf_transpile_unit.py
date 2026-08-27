@@ -144,8 +144,18 @@ class _WrappingInt(int):
 _CAPTURED_WRAPPING_INT = _WrappingInt(5)
 
 
+def _make_receiver_adder(n):
+    """A ``__call__``-shaped closure over ``n``, for patching onto a class."""
+
+    def call(self, x):
+        return x + n
+
+    return call
+
+
 class _PatchableCallable:
-    """Importable, so pickled by reference. One test patches its ``__call__``."""
+    """Importable, so pickled by reference. Two tests patch its ``__call__`` -- one
+    with a closure over a cell, one with a body reading a global."""
 
     def __call__(self, x):
         return x + 1
@@ -1714,8 +1724,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("-(2**70)", -(2**70)),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(_make_adder(off), L)
-                self.assertEqual([], pudf.transpiled, f"{label} must not be baked")
+                pudf, warned, options = self._fallback_warnings(_make_adder(off), L)
+                self.assertEqual([], options, f"{label} must not be baked")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
                 self.assertIn(
                     "outside the range of a 64-bit integer",
@@ -1733,8 +1743,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # string/string or numeric/numeric, so the variant is dropped. Assert both
         # halves -- the value alone would pass whether or not the bool gate works,
         # since the interpreted path produces 11 either way.
-        pudf, warned = self._fallback_warnings(_make_adder(True), L)
-        self.assertEqual([], pudf.transpiled, "a captured bool has no Add lowering")
+        pudf, warned, options = self._fallback_warnings(_make_adder(True), L)
+        self.assertEqual([], options, "a captured bool has no Add lowering")
         self.assertNotIn(
             "outside the range of a 64-bit integer",
             " ".join(str(w.message) for w in warned),
@@ -1760,8 +1770,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         for label, func, expected in [("<", lt_nan, False), ("==", eq_nan, False)]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, BooleanType())
-                self.assertEqual([], pudf.transpiled, f"captured NaN ({label}) must not be baked")
+                pudf, warned, options = self._fallback_warnings(func, BooleanType())
+                self.assertEqual([], options, f"captured NaN ({label}) must not be baked")
                 self.assertIn(
                     "non-finite float",
                     " ".join(str(w.message) for w in warned),
@@ -1787,8 +1797,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         for label, value in [("inf", float("inf")), ("-inf", float("-inf"))]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(make_adder(value), LongType())
-                self.assertEqual([], pudf.transpiled, f"captured {label} must not be baked")
+                pudf, warned, options = self._fallback_warnings(make_adder(value), LongType())
+                self.assertEqual([], options, f"captured {label} must not be baked")
                 self.assertIn(
                     "non-finite float",
                     " ".join(str(w.message) for w in warned),
@@ -1809,8 +1819,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def concat_surrogate(s):
             return s + surrogate
 
-        pudf, warned = self._fallback_warnings(concat_surrogate, StringType())
-        self.assertEqual([], pudf.transpiled, "an unencodable capture must not be baked")
+        pudf, warned, options = self._fallback_warnings(concat_surrogate, StringType())
+        self.assertEqual([], options, "an unencodable capture must not be baked")
         self.assertIn(
             "not UTF-8 encodable",
             " ".join(str(w.message) for w in warned),
@@ -2512,8 +2522,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("conditional 2.5", conditional_fraction),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, S)
-                self.assertEqual([], pudf.transpiled, f"{label} must not be lowered")
+                pudf, warned, options = self._fallback_warnings(func, S)
+                self.assertEqual([], options, f"{label} must not be lowered")
                 self.assertIn(
                     "not a whole number",
                     " ".join(str(w.message) for w in warned),
@@ -2659,8 +2669,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("lone surrogate", lone_surrogate, StringType(), "not UTF-8 encodable"),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, return_type)
-                self.assertEqual([], pudf.transpiled, f"{label} must not be lowered")
+                pudf, warned, options = self._fallback_warnings(func, return_type)
+                self.assertEqual([], options, f"{label} must not be lowered")
                 self.assertIn(
                     needle,
                     " ".join(str(w.message) for w in warned),
@@ -2803,18 +2813,34 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     # ------------------------------------------------------------------
 
     def _fallback_warnings(self, func, return_type):
-        """Build ``func`` with transpilation on; return (udf, fallback warnings)."""
+        """Build ``func`` with transpilation on.
+
+        Returns ``(udf, fallback warnings, options)``. The third element is what
+        matters: ``transpiled`` is a PROPERTY that re-lowers against the active
+        session every read, so once this helper's ``sql_conf`` block exits the conf
+        is back off and ``pudf.transpiled`` returns ``[]`` for ANY udf -- which makes
+        a caller's ``assertEqual([], pudf.transpiled)`` pass without testing
+        anything. The options have to be read HERE, while the conf is still on, and
+        handed back. Assert on the returned list, never on the property.
+        """
         import warnings as _warnings
 
         with self.sql_conf(_TRANSPILE_ON):
             with _warnings.catch_warnings(record=True) as caught:
                 _warnings.simplefilter("always")
                 pudf = UserDefinedFunction(func, return_type)
-            return pudf, [w for w in caught if "Unable to transpile" in str(w.message)]
+            return (
+                pudf,
+                [w for w in caught if "Unable to transpile" in str(w.message)],
+                pudf.transpiled,
+            )
 
     def test_udf_transpile_captures_closure_freevars(self):
-        # A closure cell always travels inside the pickled payload, so it is
-        # safe to bake regardless of where the UDF was defined.
+        # A closure cell travels inside the pickled payload for these shapes -- a
+        # factory-built function is pickled by value, closure included -- so its cell
+        # is safe to bake. NOT unconditionally safe, though: see
+        # ``test_udf_transpile_callable_instance_cell_gated_on_call_owner``, where a
+        # by-reference class re-imports and rebuilds its own closure.
         L = LongType()
         cases = [
             ("factory lambda", _make_adder(3), L, "a long", [(10,), (-1,)], [13, 2]),
@@ -2881,8 +2907,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # REFERENCE: the executor re-imports the module and reads whatever the
         # global holds there, so baking the driver's value could disagree. It
         # must fall back -- and still compute the right answer.
-        pudf, warned = self._fallback_warnings(_importable_reads_global, LongType())
-        self.assertEqual([], pudf.transpiled, "globals of a by-reference UDF must not be baked")
+        pudf, warned, options = self._fallback_warnings(_importable_reads_global, LongType())
+        self.assertEqual([], options, "globals of a by-reference UDF must not be baked")
         self.assertTrue(warned, "expected a fallback warning")
         self.assertIn("pickled by reference", str(warned[0].message))
         with self.sql_conf(_TRANSPILE_ON):
@@ -2908,8 +2934,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         finally:
             cloudpickle.unregister_pickle_by_value(module)
         # Back to falling back once unregistered.
-        pudf, _ = self._fallback_warnings(_importable_reads_global, LongType())
-        self.assertEqual([], pudf.transpiled)
+        pudf, _, options = self._fallback_warnings(_importable_reads_global, LongType())
+        self.assertEqual([], options)
 
     def test_udf_transpile_falls_back_for_non_bakeable_captures(self):
         # Only None and basic scalars have a column equivalent. Everything else
@@ -2932,8 +2958,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         ]
         for label, func in cases:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label} must not transpile")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
 
     def test_udf_transpile_falls_back_for_unresolvable_names(self):
@@ -2961,8 +2987,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("undefined name", undefined_name),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label} must not transpile")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
 
     def test_udf_transpile_globals_follow_the_carrying_function(self):
@@ -2984,8 +3010,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("inherited __call__", _DynSubCallable()),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label}: globals must not be baked")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label}: globals must not be baked")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
                 self.assertIn("pickled by reference", str(warned[0].message), label)
                 with self.sql_conf(_TRANSPILE_ON):
@@ -3004,8 +3030,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("`self.attr` that does not resolve", _AddMissingAttr(), AttributeError),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label} must not transpile")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
                 self.assertRaises(exc, func, 1)
                 with self.sql_conf(_TRANSPILE_ON):
@@ -3026,8 +3052,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("int subclass overriding __radd__", reads_wrapping_int, 999),
         ]:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label} must not transpile")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(1,)], "a long")
@@ -3045,13 +3071,35 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         _PatchableCallable.__call__ = lambda self, x: x + _CAPTURED_INT
 
         func = _PatchableCallable()
-        pudf, warned = self._fallback_warnings(func, LongType())
-        self.assertEqual([], pudf.transpiled, "globals must not be baked")
+        pudf, warned, options = self._fallback_warnings(func, LongType())
+        self.assertEqual([], options, "globals must not be baked")
         self.assertTrue(warned, "expected a fallback warning")
         self.assertIn("pickled by reference", str(warned[0].message))
         with self.sql_conf(_TRANSPILE_ON):
             df = self.spark.createDataFrame([(1,)], "a long")
             # The executor's re-imported ``__call__`` is the original ``x + 1``.
+            self.assertEqual(df.select(pudf("a")).collect()[0][0], 2)
+
+    def test_udf_transpile_callable_instance_cell_gated_on_call_owner(self):
+        # The CELL twin of the test above, and the reason ``_capture_scope`` gates one
+        # decision rather than gating globals only. A closure cell is not
+        # unconditionally safe to bake: when the receiver's class is re-imported, so
+        # is the factory call that built ``__call__``, producing a FRESH cell over
+        # whatever that import yields. Ungated, this baked the driver's 99 while the
+        # executor's re-imported ``__call__`` computed ``x + 7``.
+        original = _PatchableCallable.__call__
+        self.addCleanup(setattr, _PatchableCallable, "__call__", original)
+        _PatchableCallable.__call__ = _make_receiver_adder(99)
+
+        func = _PatchableCallable()
+        self.assertEqual(100, func(1), "the driver really does see the patched cell")
+        pudf, warned, options = self._fallback_warnings(func, LongType())
+        self.assertEqual([], options, "a cell on a by-reference class must not be baked")
+        self.assertTrue(warned, "expected a fallback warning")
+        self.assertIn("pickled by reference", str(warned[0].message))
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,)], "a long")
+            # Interpreted, against the class the executor re-imports: ``x + 1``.
             self.assertEqual(df.select(pudf("a")).collect()[0][0], 2)
 
     def test_udf_transpile_literal_assignment_forms(self):
@@ -3276,8 +3324,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         ]
         for label, func, expected in cases:
             with self.subTest(case=label):
-                pudf, warned = self._fallback_warnings(func, LongType())
-                self.assertEqual([], pudf.transpiled, f"{label} must not transpile")
+                pudf, warned, options = self._fallback_warnings(func, LongType())
+                self.assertEqual([], options, f"{label} must not transpile")
                 self.assertTrue(warned, f"{label}: expected a fallback warning")
                 with self.sql_conf(_TRANSPILE_ON):
                     df = self.spark.createDataFrame([(10,)], "a long")
@@ -3288,8 +3336,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # must refuse rather than resolve it from the module globals, which
         # would return a value where the UDF actually raises.
         with self.subTest(case="read before assign"):
-            pudf, warned = self._fallback_warnings(read_before_assign, LongType())
-            self.assertEqual([], pudf.transpiled)
+            pudf, warned, options = self._fallback_warnings(read_before_assign, LongType())
+            self.assertEqual([], options)
             self.assertTrue(warned)
             self.assertRaises(UnboundLocalError, read_before_assign, 1)
             with self.sql_conf(_TRANSPILE_ON):
@@ -3647,10 +3695,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             "not a docstring"
             return x + b
 
-        pudf, warned = self._fallback_warnings(string_in_the_middle, LongType())
-        self.assertEqual(
-            [], pudf.transpiled, "a mid-body string must not be treated as a docstring"
-        )
+        pudf, warned, options = self._fallback_warnings(string_in_the_middle, LongType())
+        self.assertEqual([], options, "a mid-body string must not be treated as a docstring")
         self.assertTrue(warned)
 
     def _timing_probe(self, mutate_at, transpile):

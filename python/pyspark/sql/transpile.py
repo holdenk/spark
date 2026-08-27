@@ -521,12 +521,13 @@ class _CapturedScope:
         if self._global_values is not None and name in self._global_values:
             return self._global_values[name]
         if self._global_values is None:
+            # ``None`` means the driver's snapshot does not travel, which empties the
+            # cell table too -- so this covers a closure cell as well as a global.
             raise UnsupportedOperationException(
-                f"cannot capture the global {name!r}: this UDF is pickled by "
-                "reference, so the executor re-imports its module and reads "
-                "whatever value the global holds there. Baking the driver's "
-                "value could silently disagree, so the transpiler falls back "
-                "to interpreted Python"
+                f"cannot capture {name!r}: this UDF is pickled by reference, so the "
+                "executor re-imports its module and re-reads whatever the closure "
+                "cell or module global holds there. Baking the driver's value could "
+                "silently disagree, so the transpiler falls back to interpreted Python"
             )
         raise UnsupportedOperationException(
             f"name {name!r} is not a parameter and could not be resolved from the UDF's scope"
@@ -541,25 +542,36 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             "could not determine the UDF's code object, so its scope cannot be resolved"
         )
     code = fn.__code__
-    # cloudpickle's own sentinel, so an unassigned cell is the object the
-    # executor would receive.
-    cells = dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
-
-    # Globals follow the function that CARRIES the code: ``_method_reduce``
-    # reduces a bound method to its ``__func__``, so gating on the instance's
-    # class would bake globals for a method inherited from a by-reference base.
-    globals_travel = _pickled_by_value(fn)
+    # Does the DRIVER's snapshot of this function reach the executor at all, or does
+    # the executor re-import and build its own? Everything below is gated on this,
+    # cells as much as globals: a re-imported class re-executes its own body, so a
+    # ``__call__`` that was built by a factory gets a FRESH closure over whatever
+    # that import produces. Baking the driver's cell there is exactly as wrong as
+    # baking its globals -- ``E.__call__ = _mk(7)`` on an importable class lowered
+    # to ``x + 99`` for a driver holding 99 while the executor computed ``x + 7``.
+    #
+    # It follows the function that CARRIES the code: ``_method_reduce`` reduces a
+    # bound method to its ``__func__``, so gating on the instance's class would bake
+    # for a method inherited from a by-reference base.
+    snapshot_travels = _pickled_by_value(fn)
     is_callable_instance = not isinstance(func, types.FunctionType) and not inspect.ismethod(func)
-    if globals_travel and is_callable_instance:
+    if snapshot_travels and is_callable_instance:
         # A callable instance reaches its code through ``type(func).__call__``,
         # which cloudpickle ships only when BOTH the class owning ``__call__`` and
         # the receiver's own class are by value. A by-reference class anywhere on
         # that path is re-imported with its original ``__call__``, however the
         # driver's was patched, so the carrying function alone is not enough.
         owner = next((k for k in type(func).__mro__ if "__call__" in k.__dict__), None)
-        globals_travel = (
+        snapshot_travels = (
             owner is not None and _pickled_by_value(owner) and _pickled_by_value(type(func))
         )
+    # cloudpickle's own sentinel, so an unassigned cell is the object the
+    # executor would receive.
+    cells = (
+        dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
+        if snapshot_travels
+        else {}
+    )
     # Mirror ``_function_getstate``: only the globals the code references ship.
     global_values = (
         {
@@ -567,7 +579,7 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             for name in _extract_code_globals(code)
             if name in fn.__globals__
         }
-        if globals_travel
+        if snapshot_travels
         else None
     )
     return _CapturedScope(
