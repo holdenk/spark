@@ -111,6 +111,13 @@ class AbstractTranspiler(object):
         on a method or callable instance, has been removed, so ``params[i]`` is the
         name bound to placeholder ``_udf_param_i`` with no offsetting needed. It is
         also the list ``param_categories`` is keyed by.
+
+        An override that reuses :class:`CatalystTranspiler`'s lowering must call
+        ``_reset_memos()`` after installing ``param_categories``, as that class
+        does. One instance lowers every input-type variant in turn, and its memos
+        cache answers derived under one ``param_categories``; carrying them into
+        the next variant lowers it under the wrong assumption, which analyses
+        cleanly and returns wrong data rather than failing.
         """
         pass
 
@@ -145,6 +152,12 @@ class CatalystTranspiler(AbstractTranspiler):
 
         Every memo lives here rather than in ``__init__`` so that adding one
         cannot leave it uncleared, which would be a wrong answer, not a crash.
+
+        A cached category also depends on ``params``, since ``_category`` resolves
+        a parameter name through ``params.index(name)``. That is safe only because
+        ``params`` is threaded unchanged through one lowering; whoever implements
+        SPARK-55207 (assignments, class vars, closures) introduces a second scope
+        and has to key on it or reset per scope.
         """
         self._category_memo: dict[ast.AST, str] = {}
         self._safe_category_memo: dict[ast.AST, Optional[str]] = {}
@@ -175,14 +188,16 @@ class CatalystTranspiler(AbstractTranspiler):
     # why, and ``_reset_memos`` for how long an entry lives. Two notes:
     #
     # * The memo lookup is inlined in each method rather than delegated to from a
-    #   wrapper. A wrapper is one more stack frame per recursion level, and these
-    #   recurse once per level of expression nesting, so it roughly halves the
-    #   body size accepted before RecursionError. ``_transpile_func`` catches
-    #   RecursionError and falls back to interpreted Python, so that would show up
-    #   as lowering silently lost rather than as an error. Anything else costing a
-    #   frame per level is the same trade -- a generator expression in place of a
-    #   plain ``and``, a nested helper -- so prefer the flat form on these
-    #   recursion paths even where it reads a little worse.
+    #   wrapper, and the same goes for anything else that costs a stack frame per
+    #   recursion level -- a nested helper, a generator expression in place of a
+    #   plain ``and``. These recurse once per level of expression nesting, so each
+    #   such frame roughly halves the body size accepted before RecursionError,
+    #   and ``_transpile_func`` catches RecursionError and falls back, so the cost
+    #   is lowering silently lost rather than an error. It only bites where source
+    #   can actually nest that deep: an operand chain or a right-associative
+    #   ternary chain, neither of which needs parentheses. ``BoolOp`` nesting does
+    #   need them and so stops at the tokenizer's ~200 cap first, which is why the
+    #   generator expressions in ``_is_definitely_boolean`` are left alone.
     # * ``_is_definitely_basic_type`` is deliberately not memoized: the
     #   ``Compare`` arm is its only caller, and that arm's own memo means each
     #   comparison is inspected once, so its walk never repeats. Both halves of
@@ -201,9 +216,7 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Constant():
                 return True
             case ast.BinOp(left=left, right=right):
-                # Bound once only to fit the line limit: a plain ``and`` of two
-                # calls, which measured faster than both ``all(map(...))`` and a
-                # genexpr, and unlike a genexpr adds no frame per level.
+                # Bound once only so the plain ``and`` fits the line limit.
                 basic = self._is_definitely_basic_type
                 return basic(left) and basic(right)
             case ast.UnaryOp(operand=operand):
@@ -517,13 +530,16 @@ class CatalystTranspiler(AbstractTranspiler):
                 # None-literal branch adopts the other branch's category (NULL
                 # unifies with any type in the lowered CASE WHEN); mismatched or
                 # all-None branches raise so the variant is dropped.
-                def branch_category(b: ast.AST) -> Optional[str]:
-                    if isinstance(b, ast.Constant) and b.value is None:
-                        return None
-                    return self._category(params, b)
-
-                body_cat = branch_category(if_body)
-                else_cat = branch_category(if_orelse)
+                # Inline rather than a nested helper: this recurses once per level
+                # of ternary nesting, and a right-associative chain needs no
+                # parentheses, so it is the one recursion path here that a frame
+                # per level really bounds (measured 497 nested ternaries with a
+                # helper, 994 without).
+                cats: List[Optional[str]] = []
+                for branch in (if_body, if_orelse):
+                    bare_none = isinstance(branch, ast.Constant) and branch.value is None
+                    cats.append(None if bare_none else self._category(params, branch))
+                body_cat, else_cat = cats
                 if body_cat is not None and else_cat is not None and body_cat != else_cat:
                     raise UnsupportedOperationException(
                         f"ternary branches have mismatched categories ({body_cat} "

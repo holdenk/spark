@@ -25,7 +25,6 @@ property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 """
 
 import contextlib
-import textwrap
 import unittest
 from unittest import mock
 
@@ -2109,10 +2108,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         """Wrap an inference method so ``tally[key]`` counts node *evaluations*.
 
         An evaluation is a call that misses the memo, hence the membership check
-        before delegating: the memo lookup is inlined into each method (a wrapper
-        would cost a stack frame per recursion level and halve the expression
-        depth the transpiler accepts), so there is no separate entry point that
-        only misses reach.
+        before delegating: the lookup is inlined into each method, so there is no
+        separate entry point that only misses reach.
         """
 
         def counting(transpiler, *args):
@@ -2137,8 +2134,11 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         from pyspark.sql.transpile import CatalystTranspiler
 
-        # Stay well under CPython's MAXINDENT of 100 -- the nested-if body below
-        # indents one more level per step.
+        # One size for three shapes, each with its own parser ceiling: `nested_if`
+        # indents a level per step and dies above 98 (MAXINDENT), `boolop` nests a
+        # paren per step and dies above 199 (nested-paren cap), `chain` has no
+        # parser limit. Raising this to strengthen the assertions hits the first
+        # two; give a shape its own size rather than lifting them together.
         size = 40
         chain = "def f(a):\n    return " + " + ".join(["a"] * (size + 1)) + "\n"
         boolop = "def f(a):\n    return " + "(" * size + "(a > 0)" + " and (a > 0))" * size + "\n"
@@ -2159,22 +2159,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         # Second source of truth guard: ``_reset_memos`` owns the inventory, and a
         # memo added there but not here would simply never be exercised below.
+        # Keys as well as values, so a renamed method reports this rather than an
+        # AttributeError from the patching below.
         self.assertEqual(
             sorted(self._INFERENCE_MEMOS.values()),
             sorted(a for a in vars(CatalystTranspiler()) if a.endswith("_memo")),
             "memo inventory drifted from _reset_memos",
         )
+        for method in self._INFERENCE_MEMOS:
+            self.assertTrue(hasattr(CatalystTranspiler, method), f"{method} no longer exists")
 
         for label, src, return_type, drivers in cases:
             with self.subTest(shape=label):
                 ast_info = _ast.parse(src)
                 function_ast = ast_info.body[0]
-                # Distinct objects, not ``ast.walk``'s raw count: CPython shares
-                # operator and context nodes (``Add``, ``Load``) as singletons, so
-                # walk yields the same object once per referencing node and
-                # over-counts by roughly 2x.
-                distinct_nodes = len({id(n) for n in _ast.walk(function_ast)})
-
                 evaluations = dict.fromkeys(self._INFERENCE_MEMOS, 0)
                 transpiler = CatalystTranspiler()
                 # ``patch.object`` rather than getattr/setattr pairs: these patch a
@@ -2200,13 +2198,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     # `name`, so it evaluates at least one node per level.
                     self.assertGreaterEqual(evaluations[name], size, name)
                 for name, memo in self._INFERENCE_MEMOS.items():
-                    # No node evaluated twice by the same method...
-                    self.assertLessEqual(evaluations[name], distinct_nodes, name)
-                    # ...and every evaluation recorded, so the bound above cannot
-                    # be met just by this tree happening not to re-ask. Holds
-                    # because every shape here lowers: a refusal is not memoized,
-                    # so adding a shape that refuses would make evaluations
-                    # legitimately exceed the memo size.
+                    # Every evaluation is recorded, i.e. distinct nodes asked ==
+                    # distinct nodes answered. Losing the memo write makes every
+                    # call a miss and the counts diverge; losing the lookup does
+                    # too. Exact only because every shape here lowers -- a refusal
+                    # is not memoized, so a refusing shape would legitimately
+                    # evaluate more than it records.
                     self.assertEqual(len(getattr(transpiler, memo)), evaluations[name], name)
 
     def test_udf_transpile_basic_type_predicate_never_revisits_a_node(self):
@@ -2242,13 +2239,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     return original(transpiler, node)
 
                 transpiler = CatalystTranspiler()
-                try:
-                    CatalystTranspiler._is_definitely_basic_type = counting
+                with mock.patch.object(CatalystTranspiler, "_is_definitely_basic_type", counting):
                     column = transpiler._transpile_from_ast(
                         src, ast_info, function_ast, ["a"], BooleanType(), {0: "numeric"}
                     )
-                finally:
-                    CatalystTranspiler._is_definitely_basic_type = original
 
                 self.assertIsNotNone(column)
                 # Non-vacuous: the predicate really is reached on this shape.
@@ -2263,17 +2257,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         # The shapes above can only catch a new caller they happen to reach, so
         # pin the other half of the invariant structurally: exactly one call site
         # outside the method's own recursion.
-        import inspect as _inspect
+        import pyspark.sql.transpile as _transpile
 
-        source = _inspect.getsource(CatalystTranspiler)
-        module = _ast.parse(textwrap.dedent(source))
+        # The whole module, not just ``CatalystTranspiler``: a caller could just as
+        # easily land in ``AbstractTranspiler`` or a module-level helper -- which is
+        # where both predicates lived until recently.
+        with open(_transpile.__file__) as handle:
+            module = _ast.parse(handle.read())
         callers = {
             fn.name
             for fn in _ast.walk(module)
             if isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef))
-            for call in _ast.walk(fn)
-            if isinstance(call, _ast.Attribute)
-            and call.attr == "_is_definitely_basic_type"
+            for ref in _ast.walk(fn)
+            if isinstance(ref, (_ast.Attribute, _ast.Name))
+            and getattr(ref, "attr", getattr(ref, "id", None)) == "_is_definitely_basic_type"
             and fn.name != "_is_definitely_basic_type"
         }
         self.assertEqual(
