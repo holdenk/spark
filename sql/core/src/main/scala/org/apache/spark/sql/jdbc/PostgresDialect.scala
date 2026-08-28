@@ -436,7 +436,8 @@ private case class PostgresDialect()
              |FROM pg_attribute
              |  JOIN pg_class ON pg_attribute.attrelid = pg_class.oid
              |  JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
-             |WHERE pg_class.relname = '$tableName' and pg_attribute.attname = '$columnName'
+             |WHERE pg_class.relname = '${escapeSql(tableName)}'
+             |  and pg_attribute.attname = '${escapeSql(columnName)}'
              |""".stripMargin
         try {
           Using.resource(conn.createStatement()) { stmt =>
