@@ -1232,6 +1232,18 @@ class JDBCSuite extends SharedSparkSession {
     }
   }
 
+  test("MsSqlServerDialect escapes a single quote in the renamed column name") {
+    // getRenameColumnQuery passes the qualified "table.column" name to sp_rename as a SQL string
+    // literal, so a single quote in the column name must be escaped to keep the literal
+    // well-formed. The table name arrives already quoted from JDBCTableCatalog.
+    val dialect = JdbcDialects.get("jdbc:sqlserver://127.0.0.1;databaseName=db")
+    assert(dialect.getRenameColumnQuery("\"tbl\"", "it's", "fine", 0) ===
+      "EXEC sp_rename '\"tbl\".\"it''s\"', \"fine\", 'COLUMN'")
+    // A name without a single quote produces the same statement as before.
+    assert(dialect.getRenameColumnQuery("\"db\".\"tbl\"", "ID", "RENAMED", 0) ===
+      "EXEC sp_rename '\"db\".\"tbl\".\"ID\"', \"RENAMED\", 'COLUMN'")
+  }
+
   test("quote column names by jdbc dialect") {
     val mySQLDialect = JdbcDialects.get("jdbc:mysql://127.0.0.1/db")
     val postgresDialect = JdbcDialects.get("jdbc:postgresql://127.0.0.1/db")
