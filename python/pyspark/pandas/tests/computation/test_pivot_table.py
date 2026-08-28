@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
+from pyspark.errors import ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -76,33 +77,38 @@ class PivotTableMixin:
         )
         psdf = ps.from_pandas(pdf)
 
-        # A Spark SQL function name names the function to apply, whatever its case.
-        self.assert_eq(
-            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="SUM").sort_index(),
-            pdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="sum").sort_index(),
-            almost=True,
-        )
+        # A Spark SQL function name names the function to apply, whatever its case, and it may
+        # be qualified with a catalog and a database.
+        for aggfunc in ["SUM", "system.builtin.sum"]:
+            with self.subTest(aggfunc=aggfunc):
+                self.assert_eq(
+                    psdf.pivot_table(
+                        index=["c"], columns="a", values="b", aggfunc=aggfunc
+                    ).sort_index(),
+                    pdf.pivot_table(
+                        index=["c"], columns="a", values="b", aggfunc="sum"
+                    ).sort_index(),
+                    almost=True,
+                )
 
-        # ... but a value that is more, or less, than a function name is rejected rather than
-        # ending up as part of the aggregate expression.
-        expected_error_message = (
-            r"aggregate function must be a Spark SQL function name such as 'sum', "
-            r"optionally qualified with a catalog and a database, got "
-        )
-        # the rejected shapes themselves are enumerated in test_validate_agg_func_name; what
-        # matters here is that each way of passing an aggfunc reaches the check
+        # ... but the name is given to Spark as a name, not as a fragment of the aggregate
+        # expression, so a value carrying anything further does not parse as one. What matters
+        # here is that each way of passing an aggfunc names it the same way; the shapes that do
+        # not parse are enumerated in GroupbyAggregateMixin.test_aggregate_func_name.
         aggfunc = "first((SELECT 1)) as `b` -- "
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc=aggfunc)
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.pivot_table(index=["c"], columns="a", values=["b"], aggfunc=aggfunc)
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc={"b": aggfunc})
-        # every entry of the dict is checked, not just the first one
-        with self.assertRaisesRegex(ValueError, expected_error_message):
+        with self.assertRaises(ParseException):
+            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc=aggfunc).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.pivot_table(index=["c"], columns="a", values=["b"], aggfunc=aggfunc).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.pivot_table(
+                index=["c"], columns="a", values=["b"], aggfunc={"b": aggfunc}
+            ).to_pandas()
+        # every entry of the dict names its own aggregation, not just the first one
+        with self.assertRaises(ParseException):
             psdf.pivot_table(
                 index=["c"], columns="a", values=["b", "e"], aggfunc={"b": "sum", "e": aggfunc}
-            )
+            ).to_pandas()
 
 
 class PivotTableTests(

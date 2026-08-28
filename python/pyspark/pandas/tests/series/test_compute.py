@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.errors import PySparkValueError
+from pyspark.errors import ParseException, PySparkValueError
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -163,12 +163,9 @@ class SeriesComputeMixin:
         msg = "If the given function is a list, it should only contains function names as strings."
         with self.assertRaisesRegex(ValueError, msg):
             psser.aggregate(["min", max])
-        msg = (
-            r"aggregate function must be a Spark SQL function name such as 'sum', "
-            r"optionally qualified with a catalog and a database, got "
-        )
-        with self.assertRaisesRegex(ValueError, msg):
-            psser.aggregate(["min", "first((SELECT 1)) as `x` -- "])
+        # each name is given to Spark as a name, not as a fragment of the aggregate expression
+        with self.assertRaises(ParseException):
+            psser.aggregate(["min", "first((SELECT 1)) as `x` -- "]).to_pandas()
 
     def test_drop(self):
         pdf = pd.DataFrame({"x": [10, 20, 15, 30, 45]})
