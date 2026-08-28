@@ -1232,6 +1232,30 @@ class JDBCSuite extends SharedSparkSession {
     }
   }
 
+  test("MySQLDialect quotes the table name in dropIndex and listIndexes") {
+    // createIndex and indexExists put the table name at identifier position via quoteIdentifier;
+    // dropIndex and listIndexes build the same position and now match them.
+    val dialect = JdbcDialects.get("jdbc:mysql://127.0.0.1/db")
+    val ident = Identifier.of(Array.empty[String], "ta ble")
+
+    assert(dialect.dropIndex("i 1", ident) === "DROP INDEX `i 1` ON `ta ble`")
+
+    val conn = mock(classOf[Connection])
+    val stmt = mock(classOf[Statement])
+    val rs = mock(classOf[ResultSet])
+    when(conn.createStatement()).thenReturn(stmt)
+    when(stmt.executeQuery(anyString())).thenReturn(rs)
+
+    val options =
+      new JDBCOptions("jdbc:mysql://127.0.0.1/db", "ta ble", Map.empty[String, String])
+    dialect.listIndexes(conn, ident, options)
+
+    val sqlCaptor = ArgumentCaptor.forClass(classOf[String])
+    verify(stmt).executeQuery(sqlCaptor.capture())
+    assert(sqlCaptor.getValue.contains("SHOW INDEXES FROM `ta ble`"),
+      s"Unexpected listIndexes SQL: ${sqlCaptor.getValue}")
+  }
+
   test("MsSqlServerDialect escapes a single quote in the renamed column name") {
     // getRenameColumnQuery passes the qualified "table.column" name to sp_rename as a SQL string
     // literal, so a single quote in the column name must be escaped to keep the literal
