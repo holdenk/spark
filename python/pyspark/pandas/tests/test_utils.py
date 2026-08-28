@@ -21,7 +21,6 @@ from pyspark.errors import PySparkAssertionError
 from pyspark.pandas.indexes.base import Index
 from pyspark.pandas.utils import (
     lazy_property,
-    validate_agg_func_name,
     validate_arguments_and_invoke_function,
     validate_bool_kwarg,
     validate_index_loc,
@@ -97,44 +96,6 @@ class UtilsTestsMixin:
 
         with self.assertRaises(ValueError):
             validate_mode("r")
-
-    def test_validate_agg_func_name(self):
-        for name in ["sum", "SUM", "stddev_pop", "_x", "x1", "system.builtin.sum", "a.b.c"]:
-            self.assert_eq(validate_agg_func_name(name), name)
-
-        for name in [
-            "sum ",
-            " sum",
-            "sum\n",
-            "sum\t",
-            "`sum`",
-            "sum;",
-            "sum -- ",
-            "sum/* */",
-            "sum(`B`) as `B` -- ",
-            "first((SELECT 1)) as `B` -- ",
-            "(SELECT 1) + min",
-            "a.b.c.d",
-            ".sum",
-            "sum.",
-            "1sum",
-            "",
-            "süm",
-            None,
-            1,
-        ]:
-            with self.subTest(name=name):
-                with self.assertRaisesRegex(ValueError, "must be a Spark SQL function name"):
-                    validate_agg_func_name(name)
-
-        # a str subclass may render as something other than its own value, so the validated
-        # name is returned for the caller to use in place of the one it was given
-        class Renaming(str):
-            def __str__(self) -> str:
-                return "first((SELECT 1)) as `B` -- "
-
-        self.assert_eq(validate_agg_func_name(Renaming("sum")), "sum")
-        self.assertIs(type(validate_agg_func_name(Renaming("sum"))), str)
 
     def test_validate_index_loc(self):
         psidx = Index([1, 2, 3])

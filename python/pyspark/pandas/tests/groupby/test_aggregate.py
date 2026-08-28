@@ -18,6 +18,7 @@
 import pandas as pd
 
 from pyspark import pandas as ps
+from pyspark.errors import ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -211,43 +212,40 @@ class GroupbyAggregateMixin:
             pdf.groupby("A").agg({"B": "sum"}).sort_index(),
         )
 
-        # ... but a value that is more, or less, than a function name is rejected rather than
-        # ending up as part of the aggregate expression.
-        expected_error_message = (
-            r"aggregate function must be a Spark SQL function name such as 'sum', "
-            r"optionally qualified with a catalog and a database, got "
-        )
+        # ... but the name is given to Spark as a name, not as a fragment of the aggregate
+        # expression, so a value carrying anything further does not parse as one.
         for aggfunc in [
             "sum(`B`) as `B` -- ",
             "first((SELECT 1)) as `B` -- ",
             "(SELECT 1) + min",
             "sum + 1",
-            "sum -- ",
-            "sum/* */",
-            "`sum`",
+            "sum, max",
             "sum;",
-            "sum ",
-            "sum\n",
             "",
         ]:
             with self.subTest(aggfunc=aggfunc):
-                with self.assertRaisesRegex(ValueError, expected_error_message):
-                    psdf.groupby("A").agg({"B": aggfunc})
+                with self.assertRaises(ParseException):
+                    psdf.groupby("A").agg({"B": aggfunc}).to_pandas()
 
-        # every way of naming the aggregation goes through the same check
+        # every way of naming the aggregation names it the same way
         aggfunc = "first((SELECT 1)) as `B` -- "
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.groupby("A").agg(aggfunc)
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.groupby("A").agg([aggfunc])
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.groupby("A").agg({"B": ["min", aggfunc]})
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.groupby("A").agg(b=("B", aggfunc))
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.groupby("A").agg(b=ps.NamedAgg(column="B", aggfunc=aggfunc))
-        with self.assertRaisesRegex(ValueError, expected_error_message):
-            psdf.agg({"B": aggfunc})
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(aggfunc).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg([aggfunc]).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg({"B": ["min", aggfunc]}).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(b=("B", aggfunc)).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(b=ps.NamedAgg(column="B", aggfunc=aggfunc)).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.agg({"B": aggfunc}).to_pandas()
+
+        # a list of aggregations is checked for holding names at all, as a dict of them is
+        msg = "If the given function is a list, it should only contains function names as strings."
+        with self.assertRaisesRegex(ValueError, msg):
+            psdf.groupby("A").agg([1])
 
     def test_aggregate_relabel(self):
         # this is to test named aggregation in groupby
