@@ -27,8 +27,8 @@ import org.apache.spark.sql.types.LongType
 /**
  * Unit tests for [[ResolveTranspiledPythonUDFOptions]], which prunes a
  * TranspiledPythonUDF's per-input-type options to those whose declared categories match the
- * resolved argument types. func=null in the leaf PythonUDF is intentional: these structural
- * tests don't execute Python.
+ * resolved argument types and whose expressions resolve. func=null in the leaf PythonUDF is
+ * intentional: these structural tests don't execute Python.
  */
 class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
 
@@ -91,5 +91,26 @@ class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
     val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(onlyOpt), Nil)
     val pruned = prune(node, LocalRelation(a))
     assert(pruned.transpiledOptions == List(onlyOpt))
+  }
+
+  test("drops an option that fails to resolve even when its category matches") {
+    val a = $"a".long
+    val unresolved = UnresolvedAttribute("no_such_col")
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(unresolved),
+      List(List("numeric")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions.isEmpty)
+    assert(pruned.optionInputCategories.isEmpty)
+  }
+
+  test("keeps a resolved option and drops a sibling that does not resolve") {
+    val a = $"a".long
+    val good = Add(a, Literal(1L))
+    val bad = UnresolvedAttribute("no_such_col")
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(good, bad),
+      List(List("numeric"), List("numeric")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions == List(good))
+    assert(pruned.optionInputCategories.isEmpty)
   }
 }
