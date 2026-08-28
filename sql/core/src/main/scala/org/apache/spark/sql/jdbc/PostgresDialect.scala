@@ -388,7 +388,8 @@ private case class PostgresDialect()
     if (!oldTable.namespace().sameElements(newTable.namespace())) {
       throw QueryCompilationErrors.cannotRenameTableAcrossSchemaError()
     }
-    s"ALTER TABLE ${getFullyQualifiedQuotedTableName(oldTable)} RENAME TO ${newTable.name()}"
+    s"ALTER TABLE ${getFullyQualifiedQuotedTableName(oldTable)} RENAME TO " +
+      s"${quoteIdentifier(newTable.name())}"
   }
 
   /**
