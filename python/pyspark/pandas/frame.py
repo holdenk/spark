@@ -7089,8 +7089,6 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
                 raise TypeError("values should be a numeric type.")
 
         def agg_col(func_name: str, label: Label) -> PySparkColumn:
-            # ``func_name`` names the function to apply and nothing else: ``call_function``
-            # passes it to Spark as a name rather than as a fragment of an expression to parse.
             name = self._internal.spark_column_name_for(label)
             return F.call_function(func_name, unresolved_scol_for(name)).alias(name)
 
