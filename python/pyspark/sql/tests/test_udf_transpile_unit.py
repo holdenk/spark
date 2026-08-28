@@ -24,7 +24,10 @@ inherited into the Spark Connect parity test class. The companion
 property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 """
 
+import contextlib
+import textwrap
 import unittest
+from unittest import mock
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
@@ -2154,6 +2157,14 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             ("nested if/else", nested_if, LongType(), ["_safe_category"]),
         ]
 
+        # Second source of truth guard: ``_reset_memos`` owns the inventory, and a
+        # memo added there but not here would simply never be exercised below.
+        self.assertEqual(
+            sorted(self._INFERENCE_MEMOS.values()),
+            sorted(a for a in vars(CatalystTranspiler()) if a.endswith("_memo")),
+            "memo inventory drifted from _reset_memos",
+        )
+
         for label, src, return_type, drivers in cases:
             with self.subTest(shape=label):
                 ast_info = _ast.parse(src)
@@ -2165,24 +2176,23 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 distinct_nodes = len({id(n) for n in _ast.walk(function_ast)})
 
                 evaluations = dict.fromkeys(self._INFERENCE_MEMOS, 0)
-                originals: dict = {}
                 transpiler = CatalystTranspiler()
-                try:
-                    # Installed inside the `try` so a failure part-way through
-                    # still restores what landed -- this patches a shared class.
+                # ``patch.object`` rather than getattr/setattr pairs: these patch a
+                # shared class, and it unwinds whatever was installed even if the
+                # loop itself raises part-way through.
+                with contextlib.ExitStack() as patches:
                     for name, memo in self._INFERENCE_MEMOS.items():
-                        originals[name] = getattr(CatalystTranspiler, name)
-                        setattr(
-                            CatalystTranspiler,
-                            name,
-                            self._counting_inference(memo, originals[name], evaluations, name),
+                        original = getattr(CatalystTranspiler, name)
+                        patches.enter_context(
+                            mock.patch.object(
+                                CatalystTranspiler,
+                                name,
+                                self._counting_inference(memo, original, evaluations, name),
+                            )
                         )
                     column = transpiler._transpile_from_ast(
                         src, ast_info, function_ast, ["a"], return_type, {0: "numeric"}
                     )
-                finally:
-                    for name, original in originals.items():
-                        setattr(CatalystTranspiler, name, original)
 
                 self.assertIsNotNone(column)
                 for name in drivers:
@@ -2249,6 +2259,30 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     "nodes visited more than once -- _is_definitely_basic_type now "
                     "needs a memo, or has gained a second caller",
                 )
+
+        # The shapes above can only catch a new caller they happen to reach, so
+        # pin the other half of the invariant structurally: exactly one call site
+        # outside the method's own recursion.
+        import inspect as _inspect
+
+        source = _inspect.getsource(CatalystTranspiler)
+        module = _ast.parse(textwrap.dedent(source))
+        callers = {
+            fn.name
+            for fn in _ast.walk(module)
+            if isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+            for call in _ast.walk(fn)
+            if isinstance(call, _ast.Attribute)
+            and call.attr == "_is_definitely_basic_type"
+            and fn.name != "_is_definitely_basic_type"
+        }
+        self.assertEqual(
+            callers,
+            {"_is_definitely_boolean"},
+            "_is_definitely_basic_type has gained a caller; it recurses per level "
+            "down an operand chain, so a second asker reintroduces the repeated "
+            "walk that the missing memo relies on not happening",
+        )
 
     def test_udf_transpile_memoized_categories_do_not_leak_across_variants(self):
         # One transpiler instance lowers every input-type variant in turn, and a

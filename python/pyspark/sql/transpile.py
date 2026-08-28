@@ -121,7 +121,11 @@ class CatalystTranspiler(AbstractTranspiler):
     variety = "catalyst"
 
     def __init__(self) -> None:
-        # Per-variant input-type assumption; see ``_transpile_from_ast``.
+        super().__init__()
+        # ``_transpile_from_ast`` sets both of these per variant before anything
+        # reads them, so this is not what makes them correct in production -- it
+        # is so that constructing a transpiler and calling an inference method
+        # directly, as the tests do, does not hit an uninitialised attribute.
         self._param_categories: dict = {}
         self._reset_memos()
 
@@ -132,14 +136,12 @@ class CatalystTranspiler(AbstractTranspiler):
         (see ``_transpile_func``), so nodes -- and therefore memo keys -- are
         shared across variants. ``_category_memo`` and ``_safe_category_memo``
         hold answers derived under ``_param_categories``, so they cannot outlive
-        it. ``_boolean_memo`` is different: its predicate reads only the node's
-        shape and would be safe to keep across variants (verified -- never
-        clearing it leaves the suite green and agrees with the pre-change
-        transpiler on a 400-UDF differential; it would save re-deriving boolean
-        inference once per variant, worth ~3% of transpile time on a four-variant
-        boolean UDF). It is dropped with the rest anyway so there is one lifetime
-        rule rather than two, and so a predicate that later grows a dependency on
-        the assumption cannot go quietly stale.
+        it. ``_boolean_memo`` is different -- its predicate reads only the node's
+        shape, so keeping it across variants would be sound, and would save
+        re-deriving boolean inference once per variant. It is dropped with the
+        rest anyway so there is one lifetime rule rather than two, and so a
+        predicate that later grows a dependency on the assumption cannot go
+        quietly stale.
 
         Every memo lives here rather than in ``__init__`` so that adding one
         cannot leave it uncleared, which would be a wrong answer, not a crash.
@@ -170,26 +172,22 @@ class CatalystTranspiler(AbstractTranspiler):
     # ------------------------------------------------------------------
     # Static inference over the body's AST. ``_category``, ``_safe_category``
     # and ``_is_definitely_boolean`` memoize per node -- see ``_category`` for
-    # why and ``_reset_memos`` for how long an entry lives. Three measured notes,
-    # because two of them look like tidy-ups and are not:
+    # why, and ``_reset_memos`` for how long an entry lives. Two notes:
     #
-    # * The memo lookup is inlined in each method rather than delegated to from
-    #   a wrapper. A wrapper is one more stack frame per recursion level, which
-    #   halves the body size accepted before RecursionError (inference over a
-    #   chain of `+`: 994 operators -> 495, against an end-to-end lowering
-    #   ceiling of ~979). ``_transpile_func`` catches RecursionError and falls
-    #   back, so that shows up as lowering silently lost, not as an error.
-    # * For the same reason ``_is_definitely_basic_type`` uses ``all(map(f, xs))``
-    #   rather than a genexpr: it is the one predicate that recurses per level
-    #   down an arbitrarily long operand chain, and a genexpr's frame caps it at
-    #   496. ``_is_definitely_boolean`` keeps genexprs -- it only recurses
-    #   through ``BoolOp``/``IfExp`` nesting, which ``ast.parse`` caps near 200
-    #   long before a frame per level could matter.
+    # * The memo lookup is inlined in each method rather than delegated to from a
+    #   wrapper. A wrapper is one more stack frame per recursion level, and these
+    #   recurse once per level of expression nesting, so it roughly halves the
+    #   body size accepted before RecursionError. ``_transpile_func`` catches
+    #   RecursionError and falls back to interpreted Python, so that would show up
+    #   as lowering silently lost rather than as an error. Anything else costing a
+    #   frame per level is the same trade -- a generator expression in place of a
+    #   plain ``and``, a nested helper -- so prefer the flat form on these
+    #   recursion paths even where it reads a little worse.
     # * ``_is_definitely_basic_type`` is deliberately not memoized: the
     #   ``Compare`` arm is its only caller, and that arm's own memo means each
-    #   comparison is inspected once, so its walk never repeats (measured: zero
-    #   repeat visits on every shape tried, against 6x-11x fewer calls for the
-    #   three that do memoize).
+    #   comparison is inspected once, so its walk never repeats. Both halves of
+    #   that are asserted by
+    #   ``test_udf_transpile_basic_type_predicate_never_revisits_a_node``.
     # ------------------------------------------------------------------
 
     def _is_definitely_basic_type(self, node: ast.AST) -> bool:
@@ -203,7 +201,11 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Constant():
                 return True
             case ast.BinOp(left=left, right=right):
-                return all(map(self._is_definitely_basic_type, (left, right)))
+                # Bound once only to fit the line limit: a plain ``and`` of two
+                # calls, which measured faster than both ``all(map(...))`` and a
+                # genexpr, and unlike a genexpr adds no frame per level.
+                basic = self._is_definitely_basic_type
+                return basic(left) and basic(right)
             case ast.UnaryOp(operand=operand):
                 return self._is_definitely_basic_type(operand)
             case ast.Name():
@@ -458,9 +460,10 @@ class CatalystTranspiler(AbstractTranspiler):
         so a large body costs time proportional to its size rather than to its
         square, which is what made the pathological end of the range degenerate.
         """
-        remembered = self._category_memo.get(node)
-        if remembered is not None:
-            return remembered
+        # ``in``, not ``.get() is not None``, matching the other two memos: it
+        # stays correct if a category is ever added that is falsy or None.
+        if node in self._category_memo:
+            return self._category_memo[node]
         category: str
         match node:
             case ast.Constant(value=v):
@@ -492,7 +495,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 rc = self._category(params, right)
                 if isinstance(op, ast.Add) and lc == rc:
                     category = lc  # str + str -> str, num + num -> num
-                elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "numeric"}:
+                elif isinstance(op, ast.Mult) and lc == rc == "numeric":
                     category = "numeric"
                 elif isinstance(op, ast.Mult) and {lc, rc} == {"numeric", "string"}:
                     category = "string"  # str * int / int * str -> repeat
