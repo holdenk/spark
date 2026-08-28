@@ -124,7 +124,7 @@ import textwrap
 import threading
 import types
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from pyspark.cloudpickle.cloudpickle import (
     _empty_cell_value,
@@ -1518,8 +1518,7 @@ def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[st
     matrix small) while keeping every typed param pinned.
     """
     n = len(public_params)
-    all_args = _positional_args(function_ast)
-    public_args = all_args[len(all_args) - n :]
+    public_args = function_ast.args.args[len(function_ast.args.args) - n :]
     candidates: List[List[str]] = []
     untyped = 0
     for arg in public_args:
@@ -1645,14 +1644,9 @@ def _get_ast_from_func(func: Callable) -> Optional[ast.AST]:
             return None
 
 
-def _positional_args(node: Union[ast.FunctionDef, ast.Lambda]) -> List[ast.arg]:
-    """Return the positional argument nodes in order, positional-only first."""
-    return node.args.posonlyargs + node.args.args
-
-
-def _get_parameter_list(node: Union[ast.FunctionDef, ast.Lambda]) -> list[str]:
-    """Return the positional argument names in order, positional-only first."""
-    return [arg.arg for arg in _positional_args(node)]
+def _get_parameter_list(node: ast.FunctionDef) -> list[str]:
+    """Return the positional argument names in order."""
+    return [arg.arg for arg in node.args.args]
 
 
 def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.FunctionDef], str]:
@@ -1716,7 +1710,7 @@ def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.
         # be the UDF) from one that RETURNED the lambda we hold, as in the one-line
         # ``make_adder = lambda n: lambda x: x + n`` -- there the outer lambda is
         # located and the inner is held, and lowering the outer would be wrong.
-        located_args = _get_parameter_list(stmt)
+        located_args = [arg.arg for arg in stmt.args.args]
         if located_args != list(held_code.co_varnames[: held_code.co_argcount]):
             return None, (
                 "the lambda defined in the source read for this one takes different "
@@ -1770,7 +1764,6 @@ class _TranspileAnalysis:
         function_ast: ast.FunctionDef,
         params: List[str],
         public_params: List[str],
-        positional_only_public_params: List[str],
         receiver: Optional[str],
         returnType: "DataTypeOrString",
         combos: List[dict],
@@ -1778,10 +1771,6 @@ class _TranspileAnalysis:
         self.function_ast = function_ast
         self.params = params
         self.public_params = public_params
-        # Subset of ``public_params`` Python forbids calling by keyword -- the
-        # call-site kwargs-to-positional rewrite in ``udf.py`` must not "fix" a
-        # keyword call to one of these, since Python itself would reject it.
-        self.positional_only_public_params = positional_only_public_params
         # Name of the implicit first parameter (``self`` / ``cls`` / whatever the
         # author called it), or ``None`` when the call site supplies every one.
         self.receiver = receiver
@@ -1851,10 +1840,12 @@ def _analyze_func(
             "`global` / `nonlocal` declarations rebind names outside the "
             "function and are not supported by the transpiler"
         ]
-    # Default/variadic/keyword-only params can't map to positional
-    # ``_udf_param_N`` placeholders -- the call site can skip them. A bare
-    # positional-only param has no such gap, so it's not rejected here; a
-    # defaulted one still hits ``fn_args.defaults`` below.
+    # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
+    # positional-only parameters can't be represented by the positional
+    # ``_udf_param_N`` placeholder scheme: a call site may omit a defaulted
+    # argument, leaving the placeholder referencing a position the call never
+    # bound, and ``_get_parameter_list`` only reads ``args``. Fall back to
+    # interpreted Python rather than emit an invalid plan.
     fn_args = function_ast.args
     if (
         fn_args.defaults
@@ -1862,10 +1853,11 @@ def _analyze_func(
         or fn_args.kwonlyargs
         or fn_args.vararg is not None
         or fn_args.kwarg is not None
+        or fn_args.posonlyargs
     ):
         return None, [
-            "functions with default, variadic, or keyword-only "
-            "arguments are not supported by the transpiler"
+            "functions with default, variadic, keyword-only, or "
+            "positional-only arguments are not supported by the transpiler"
         ]
     params = _get_parameter_list(function_ast)
     # The FunctionDef above was recovered from TEXT, which can describe a
@@ -1925,8 +1917,6 @@ def _analyze_func(
     # the receiver is not named at the call site. Everything downstream indexes
     # off THIS list, so the placeholder numbering needs no offset.
     public_params = params[spoken_for:]
-    posonly_names = {arg.arg for arg in function_ast.args.posonlyargs}
-    positional_only_public_params = [p for p in public_params if p in posonly_names]
     receiver = params[0] if spoken_for else None
     # Warned here rather than while lowering: this depends only on the AST, and
     # ``_build_transpiled`` runs again for every ``judf`` and every read of the
@@ -1944,7 +1934,6 @@ def _analyze_func(
             function_ast=function_ast,
             params=params,
             public_params=public_params,
-            positional_only_public_params=positional_only_public_params,
             receiver=receiver,
             returnType=returnType,
             combos=_param_category_combos(function_ast, public_params),
