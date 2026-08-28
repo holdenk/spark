@@ -18,6 +18,7 @@
 import pandas as pd
 
 from pyspark import pandas as ps
+from pyspark.errors import AnalysisException, ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -268,25 +269,43 @@ class GroupbyAggregateMixin:
         self.assert_eq(agg_pdf, agg_psdf)
 
     def test_aggregate_func_name_validation(self):
-        # SQL expression injection guard: the aggregate function name is
-        # interpolated into a Spark SQL expression, so it must be a plain
-        # function identifier (e.g. "sum") rather than an arbitrary
-        # expression carrying a subquery, alias or comment.
         pdf = pd.DataFrame({"A": [1, 1, 2], "B": [10, 20, 30]})
         psdf = ps.from_pandas(pdf)
-        for bad in [
-            "first((SELECT 1)) as `B` -- ",
-            "count(*) as x",
-            "sum(`B`) + 1",
-            "b`) as `c",
-        ]:
-            with self.assertRaisesRegex(ValueError, "valid identifier"):
-                psdf.groupby("A").agg({"B": bad})
-        # Legitimate aggregate names continue to work.
         self.assert_eq(
             psdf.groupby("A").agg({"B": "sum"}).sort_index(),
             pdf.groupby("A").agg({"B": "sum"}).sort_index(),
         )
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "SUM"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "system.builtin.sum"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "IDENTIFIER('sum')"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+        for bad in [
+            "first((SELECT 1)) as `B` -- ",
+            "(SELECT 1) + min",
+            "sum + 1",
+            "sum;",
+            "",
+            "IDENTIFIER((SELECT 1))",
+        ]:
+            with self.subTest(aggfunc=bad):
+                with self.assertRaises(ParseException):
+                    psdf.groupby("A").agg({"B": bad}).to_pandas()
+
+        with self.assertRaises(AnalysisException):
+            psdf.groupby("A").agg({"B": "`(SELECT 1) + min`"}).to_pandas()
+
+        msg = "If the given function is a list, it should only contains function names as strings."
+        with self.assertRaisesRegex(ValueError, msg):
+            psdf.groupby("A").agg([1])
 
 
 class GroupbyAggregateTests(
