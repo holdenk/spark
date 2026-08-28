@@ -5542,6 +5542,17 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val PYTHON_UDF_MAP_IN_BATCH_LEGACY_ACCEPT_ANY_ITERABLE_ENABLED =
+    buildConf("spark.sql.execution.pythonUDF.mapInBatch.legacy.acceptAnyIterable.enabled")
+      .internal()
+      .doc("When true, mapInPandas and mapInArrow UDFs may return any iterable (e.g. a list) " +
+        "rather than a strict iterator, matching the behavior before 4.3.0. When false, the " +
+        "returned value must be an iterator, matching the declared Iterator[...] signatures.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
+      .booleanConf
+      .createWithDefault(false)
+
   val PYTHON_PLANNER_EXEC_MEMORY =
     buildConf("spark.sql.planner.pythonExecution.memory")
       .doc("Specifies the memory allocation for executing Python code in Spark driver, in MiB. " +
@@ -6654,14 +6665,15 @@ object SQLConf {
     .createWithDefault(false)
 
   val UI_EXPLAIN_MODE = buildConf("spark.sql.ui.explainMode")
-    .doc("Configures the query explain mode used in the Spark SQL UI. The value can be 'simple', " +
-      "'extended', 'codegen', 'cost', or 'formatted'. The default value is 'formatted'.")
+    .doc("Configures the query explain mode used in the Spark SQL UI. The value can be 'none', " +
+      "'simple', 'extended', 'codegen', 'cost', or 'formatted'. The default value is 'formatted'.")
     .version("3.1.0")
     .stringConf
     .transform(_.toUpperCase(Locale.ROOT))
-    .checkValue(mode => Set("SIMPLE", "EXTENDED", "CODEGEN", "COST", "FORMATTED").contains(mode),
-      "Invalid value for 'spark.sql.ui.explainMode'. Valid values are 'simple', 'extended', " +
-      "'codegen', 'cost' and 'formatted'.")
+    .checkValue(mode =>
+      Set("NONE", "SIMPLE", "EXTENDED", "CODEGEN", "COST", "FORMATTED").contains(mode),
+      "Invalid value for 'spark.sql.ui.explainMode'. Valid values are 'none', 'simple', " +
+      "'extended', 'codegen', 'cost' and 'formatted'.")
     .createWithDefault("formatted")
 
   val SOURCES_BINARY_FILE_MAX_LENGTH = buildConf("spark.sql.sources.binaryFile.maxLength")
@@ -6946,6 +6958,18 @@ object SQLConf {
     .doc("When true, enable filter pushdown to Python datasource, at the cost of running " +
       "Python worker one additional time during planning.")
     .version("4.1.0")
+    .booleanConf
+    .createWithDefault(false)
+
+  val PYTHON_LIMIT_PUSHDOWN_ENABLED = buildConf("spark.sql.python.limitPushdown.enabled")
+    .internal()
+    .doc("When true, enable limit pushdown to Python datasource. Pushing a limit runs a Python " +
+      "worker during planning; for a limit-only scan this replaces the worker that plans a " +
+      "plain read, while for a scan that also pushes down filters it runs in addition to " +
+      "filter pushdown. Spark always applies the limit again after the scan, so a pushed limit " +
+      "only lets the data source read less data.")
+    .version("4.4.0")
+    .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
     .booleanConf
     .createWithDefault(false)
 
@@ -9517,6 +9541,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def legacyPandasConversionUDF: Boolean = getConf(PYTHON_UDF_LEGACY_PANDAS_CONVERSION_ENABLED)
 
+  def legacyMapInBatchAcceptAnyIterable: Boolean =
+    getConf(PYTHON_UDF_MAP_IN_BATCH_LEGACY_ACCEPT_ANY_ITERABLE_ENABLED)
+
   def pythonPlannerExecMemory: Option[Long] = getConf(PYTHON_PLANNER_EXEC_MEMORY)
 
   def replaceExceptWithFilter: Boolean = getConf(REPLACE_EXCEPT_WITH_FILTER)
@@ -9654,6 +9681,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def useListFilesFileSystemList: String = getConf(SQLConf.USE_LISTFILES_FILESYSTEM_LIST)
 
   def pythonFilterPushDown: Boolean = getConf(PYTHON_FILTER_PUSHDOWN_ENABLED)
+
+  def pythonLimitPushDown: Boolean = getConf(PYTHON_LIMIT_PUSHDOWN_ENABLED)
 
   def csvFilterPushDown: Boolean = getConf(CSV_FILTER_PUSHDOWN_ENABLED)
 
