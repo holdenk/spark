@@ -58,7 +58,8 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
               val argTypes = t.pythonUDFExpr.children.map(_.dataType)
               val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
                 case (option, categories)
-                    if optionMatchesTypes(categories, argTypes) && option.resolved => option
+                    if optionMatchesTypes(categories, argTypes) && option.resolved =>
+                  option
               }
               t.copy(transpiledOptions = kept, optionInputCategories = Nil)
           }
