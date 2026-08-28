@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
+from pyspark.errors import ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.testing.sqlutils import SQLTestUtils
 
@@ -70,6 +71,21 @@ class PivotTableMixin:
             ).sort_index(),
             almost=True,
         )
+
+    def test_pivot_table_aggfunc_name(self):
+        pdf = pd.DataFrame(
+            {"a": [4, 2, 3, 4], "b": [1, 2, 2, 4], "c": [1, 2, 9, 4], "e": [10, 20, 20, 40]}
+        )
+        psdf = ps.from_pandas(pdf)
+        self.assert_eq(
+            psdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="sum").sort_index(),
+            pdf.pivot_table(index=["c"], columns="a", values="b", aggfunc="sum").sort_index(),
+            almost=True,
+        )
+        with self.assertRaises(ParseException):
+            psdf.pivot_table(
+                index=["c"], columns="a", values="b", aggfunc="first((SELECT 1)) as `b` -- "
+            ).to_pandas()
 
 
 class PivotTableTests(
