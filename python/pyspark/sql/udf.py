@@ -260,6 +260,10 @@ class UserDefinedFunction:
                 value = session.conf.get(key, default)
             return value is not None and value.lower() == "true"
 
+        # Raising NULL checks the kept options still needed. Collected inside the try
+        # below but warned about after it, so warnings-as-errors cannot cost us a
+        # lowering; see the deferral there.
+        pending_guard_warning: list[str] = []
         try:
             transpile_enabled = (
                 deterministic
@@ -296,10 +300,16 @@ class UserDefinedFunction:
                     errors,
                     self._transpiled_param_names,
                     self._transpiled_input_categories,
+                    null_guards,
                 ) = _transpile_func(session, func, self.returnType)
                 if not self.transpiled:
                     detail = f": {errors}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
+                elif null_guards:
+                    # Deferred past the handler below, which clears ``transpiled``:
+                    # under warnings-as-errors, warning here would be caught there and
+                    # cost us a lowering that is perfectly good.
+                    pending_guard_warning = null_guards
         except Exception as e:
             # An inability to transpile must never break a working UDF -- fall
             # back to interpreted Python execution and surface the failure as a
@@ -311,6 +321,23 @@ class UserDefinedFunction:
             self.transpiled = []
             self._transpiled_param_names = []
             self._transpiled_input_categories = []
+        if pending_guard_warning and self.transpiled:
+            # A check that raises makes the expression throwable, and the optimizer
+            # will not move a throwable predicate: a filter on this UDF stays put
+            # instead of being pushed through a join or merged with an adjacent
+            # filter. Worth saying once -- the UDF transpiled and there is nothing
+            # wrong with it -- so no ``stacklevel``: the depth to the user's own frame
+            # differs between ``udf(...)`` and a direct ``UserDefinedFunction(...)``,
+            # and a wrong constant is worse than the default, which at least matches
+            # the two sibling warnings above.
+            warnings.warn(
+                f"Transpiled UDF {func} still checks for NULL in "
+                f"{', '.join(pending_guard_warning)} and raises if it finds one, so "
+                "Spark cannot push a filter on this UDF through a join or combine it "
+                "with an adjacent filter. Guard the parameter (`if x is not None:`) "
+                "or bind a non-nullable column to drop the check.",
+                UserWarning,
+            )
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
