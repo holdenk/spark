@@ -27,6 +27,7 @@ property-based suite lives in ``test_udf_transpile_hypothesis.py``.
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 
 from pyspark.sql import Row
 from pyspark.sql.types import (
@@ -38,7 +39,7 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.udf import UserDefinedFunction
 from pyspark.testing.sqlutils import ReusedSQLTestCase
-from pyspark.util import is_remote_only
+from pyspark.util import JVM_INT_MAX, JVM_INT_MIN, is_remote_only
 
 # Fixtures for the scope-capture tests (SPARK-55207).
 _CAPTURED_INT = 7
@@ -1546,6 +1547,14 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def _eval_python_count(df):
         return df._jdf.queryExecution().executedPlan().toString().count("EvalPython")
 
+    def test_udf_transpile_formats_distinct_fallback_reasons(self):
+        from pyspark.sql.udf import _format_transpile_errors
+
+        self.assertEqual(
+            "first; second; third; and 1 more",
+            _format_transpile_errors(["first", "second", "first", "third", "fourth"]),
+        )
+
     def test_udf_transpile_lowers_operators(self):
         # Operators lower to Catalyst and match Python: modulo sign-parity,
         # non-commutative -/* (parameter order), unary nesting, constant
@@ -2378,46 +2387,24 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self._raises(modulo_zero, "a long", [(5,)], "zero")
 
     def test_udf_transpile_string_operands(self):
-        # Textual `+`/`*` lower to Catalyst string ops and match Python: `str +
-        # str` -> concat, and `str * int` / `int * str` -> repeat (including a
-        # string column times a numeric literal). The transpiler emits a string-
-        # typed variant whose declared categories the JVM matches against the bound
-        # column types (see UserDefinedPythonFunction.builder).
+        # Textual `+` lowers to concat, while repeat requires a literal count.
         S = StringType()
         add = lambda a, b: a + b  # noqa: E731
-        mul = lambda a, b: a * b  # noqa: E731
         mul3 = lambda a: a * 3  # noqa: E731
         concat_right = lambda a: a + "!"  # noqa: E731
         concat_left = lambda a: "pre-" + a  # noqa: E731
-        repeat_lit = lambda x: "ab" * x  # noqa: E731
         # (func, return_type, schema, rows, expected); arg columns come from schema.
         cases = [
             (add, S, "a string, b string", [("x", "y"), ("a", "b")], ["xy", "ab"]),
-            (mul, S, "a string, b long", [("ab", 3)], ["ababab"]),
-            (mul, S, "a long, b string", [(3, "ab")], ["ababab"]),
             (mul3, S, "a string", [("2",), ("ab",)], ["222", "ababab"]),
             (concat_right, S, "a string", [("hi",)], ["hi!"]),
             (concat_left, S, "a string", [("x",)], ["pre-x"]),
-            (repeat_lit, S, "a long", [(3,)], ["ababab"]),
         ]
         for i, (func, rt, schema, rows, expected) in enumerate(cases):
             with self.subTest(case=i):
                 self.assertEqual(self._vals(func, rt, schema, rows), expected, f"case {i}")
 
-    def test_udf_transpile_string_repeat_refuses_a_fractional_literal(self):
-        # `str * n` is only defined in Python for an integral `n`: `"ab" * 2.5`
-        # and even `"ab" * 2.0` are a TypeError. Spark's `repeat` takes any numeric
-        # and would truncate, so lowering a fractional count returns 'abab' where
-        # Python raises -- a wrong answer, not a fallback.
-        #
-        # Capturing is what makes this reachable: before free variables could be
-        # resolved, a count was either a column or a literal already in the body.
-        # A captured `n = 2.5` now bakes to a literal here, so the guard is needed.
-        # A COLUMN count is NOT constrained -- the "numeric" category the JVM matches
-        # on covers DOUBLE as well as LONG -- which is pre-existing behavior, pinned
-        # with its actual values by
-        # ``test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column``
-        # below. Narrowing it is SPARK-58595; see that test for the shapes.
+    def test_udf_transpile_string_repeat_requires_a_known_integer(self):
         S = StringType()
         fraction = 2.5
         whole_float = 2.0
@@ -2431,10 +2418,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def literal_fraction(s):
             return s * 2.5
 
-        # A sign does not change whether a count is whole, but it does change the
-        # node type: these parse as UnaryOp over the Constant, so matching
-        # ast.Constant alone let them lower to repeat(s, cast(-2.5 as int)) --
-        # 'abab' for +2.5 and '' for -2.5, where Python raises TypeError.
         def positive_fraction(s):
             return s * +2.5
 
@@ -2444,11 +2427,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def double_signed_fraction(s):
             return s * --2.5
 
-        # Nor does wrapping it in anything else. These are BinOp / IfExp, not a
-        # Constant at any depth of unary sign, and both lowered to 'abab'. The
-        # transpiler does not evaluate expressions, so it cannot know what a
-        # computed count comes to and fails closed on the fractional value being
-        # present at all.
         def computed_fraction(s):
             return s * (2.5 + 0)
 
@@ -2470,7 +2448,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 pudf, warned, options = self._fallback_warnings(func, S)
                 self.assertEqual([], options, f"{label} must not be lowered")
                 self.assertIn(
-                    "not a whole number",
+                    "not a statically known 32-bit integer",
                     " ".join(str(w.message) for w in warned),
                     f"{label}: expected the repeat-count guard",
                 )
@@ -2480,8 +2458,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         df.select(pudf("s")).collect()
                 self.assertRaises(TypeError, func, "ab")
 
-        # A count built only from whole numbers still lowers, and the option really
-        # is kept -- asserted on the plan, since a fallback would give 'ababab' too.
         whole = 3
 
         def captured_whole(s):
@@ -2491,35 +2467,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             return s * (2 + 1)
 
         with self.sql_conf(_TRANSPILE_ON):
-            for label, func in [("captured 3", captured_whole), ("2 + 1", computed_whole)]:
-                with self.subTest(case=label):
-                    pudf = UserDefinedFunction(func, S)
-                    self.assertTrue(pudf.transpiled, f"{label}: a whole count still lowers")
-                    lowered = self.spark.createDataFrame([("ab",)], "s string").select(pudf("s"))
-                    self.assertEqual("ababab", lowered.collect()[0][0])
-                    self.assertEqual(0, self._eval_python_count(lowered))
+            pudf = UserDefinedFunction(captured_whole, S)
+            self.assertTrue(pudf.transpiled)
+            lowered = self.spark.createDataFrame([("ab",)], "s string").select(pudf("s"))
+            self.assertEqual("ababab", lowered.collect()[0][0])
+            self.assertEqual(0, self._eval_python_count(lowered))
 
-    def test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column(self):
-        # A PINNED KNOWN DIVERGENCE, not behavior we want; the fix is SPARK-58595,
-        # which will make this test fail -- deliberately, see the note at the end.
-        # ``_refuse_fractional_repeat_count`` walks only ``ast.Constant``, so it
-        # refuses a visible non-integral constant and lets through a count whose
-        # fractional part arrives at runtime in a column -- where the ``cast(... as
-        # int)`` the lowering inserts truncates and Python raises TypeError.
-        #
-        # Because the guard turns on the CONSTANTS present, not the node shape, this
-        # covers every shape that reaches either repeat arm: no count operator at all
-        # (``s * n``), a UnaryOp (``s * -n``), a BinOp over whole constants
-        # (``s * (n + 1)``, ``s * (n * 2)``, ``s * (n % 3)``), and both operand
-        # orders -- ``_convert_chunk`` has a separate arm per order, each guarding
-        # its own operand, so a fix applied to one arm must fail here on the other.
-        #
-        # Pinned so the eventual fix trips this test and has to revisit the prose
-        # that describes the divergence: the module docstring, that function's first
-        # consequence bullet, the ``transpilePyUDFs`` conf description, and the
-        # comment in the preceding test. This asserts VALUES, so it cannot catch
-        # those going stale on their own -- it only forces the question when the
-        # behavior changes.
+        _, warned, options = self._fallback_warnings(computed_whole, S)
+        self.assertEqual([], options)
+        self.assertIn(
+            "not a statically known 32-bit integer",
+            " ".join(str(w.message) for w in warned),
+        )
+
+    def test_udf_transpile_string_repeat_refuses_column_counts(self):
         S = StringType()
 
         def bare(s, n):
@@ -2541,48 +2502,61 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             # The ``numeric * string`` arm, which is a separate branch.
             return n * s
 
-        for label, func, schema, row, pyargs, expected in [
-            ("s * n", bare, "s string, n double", ("ab", 2.5), ("ab", 2.5), "abab"),
-            ("s * (n + 1)", plus_one, "s string, n double", ("ab", 2.5), ("ab", 2.5), "ababab"),
-            # A negative count is not merely truncated: ``repeat`` returns ''.
-            ("s * -n", negated, "s string, n double", ("ab", 2.5), ("ab", 2.5), ""),
-            ("s * (n % 3)", modded, "s string, n double", ("ab", 2.5), ("ab", 2.5), "abab"),
+        for label, func, schema, row, pyargs in [
+            ("s * n", bare, "s string, n double", ("ab", 2.5), ("ab", 2.5)),
+            ("s * (n + 1)", plus_one, "s string, n double", ("ab", 2.5), ("ab", 2.5)),
+            ("s * -n", negated, "s string, n double", ("ab", 2.5), ("ab", 2.5)),
+            ("s * (n % 3)", modded, "s string, n double", ("ab", 2.5), ("ab", 2.5)),
             (
                 "s * (n * 2)",
                 mult_inside,
                 "s string, n double",
                 ("ab", 2.5),
                 ("ab", 2.5),
-                "ababababab",
             ),
-            ("n * s", reversed_order, "n double, s string", (2.5, "ab"), (2.5, "ab"), "abab"),
+            ("n * s", reversed_order, "n double, s string", (2.5, "ab"), (2.5, "ab")),
         ]:
             with self.subTest(case=label):
                 self.assertRaises(TypeError, func, *pyargs)
-                # ``_vals`` asserts the option was really USED, not just produced: on
-                # a fallback its plan check fails before it ever collects a row.
-                self.assertEqual(
-                    [expected],
-                    self._vals(func, S, schema, [row]),
-                    f"{label}: divergence changed; revisit the prose named above",
+                pudf, warned, options = self._fallback_warnings(func, S)
+                self.assertEqual([], options)
+                self.assertIn(
+                    "not a statically known 32-bit integer",
+                    " ".join(str(w.message) for w in warned),
                 )
+                with self.sql_conf(_TRANSPILE_ON):
+                    df = self.spark.createDataFrame([row], schema)
+                    with self.assertRaises(Exception):
+                        df.select(pudf(*df.columns)).collect()
 
-        # The case a fix must NOT break, and the reason refusing every column count
-        # is the wrong fix: an integral count column lowers and agrees with Python.
-        self.assertEqual("ababab", bare("ab", 3))
-        self.assertEqual(["ababab"], self._vals(bare, S, "s string, n bigint", [("ab", 3)]))
+        # Refusing the lowering must not change the ANSWER for a count that Python
+        # accepts: the interpreted path still runs and still agrees.
+        with self.sql_conf(_TRANSPILE_ON):
+            pudf = UserDefinedFunction(bare, S)
+            projected = self.spark.createDataFrame([("ab", 3)], "s string, n bigint").select(
+                pudf("s", "n")
+            )
+            self.assertGreater(self._eval_python_count(projected), 0)
+            self.assertEqual("ababab", projected.collect()[0][0])
 
-        # Nor does annotating the count `int` close it -- `int` and `float` share the
-        # single "numeric" category, which matches any non-decimal numeric column.
-        # Pinned because the module docstring recommends annotation for pinning
-        # categories, so this is the shape a user is most likely to think is safe.
+        # Even an `int` annotation cannot prove the bound column is integral.
         def annotated_int(s: str, n: int):
             return s * n
 
-        self.assertRaises(TypeError, annotated_int, "ab", 2.5)
-        self.assertEqual(
-            ["abab"], self._vals(annotated_int, S, "s string, n double", [("ab", 2.5)])
-        )
+        _, _, options = self._fallback_warnings(annotated_int, S)
+        self.assertEqual([], options)
+
+        def make_repeat(count):
+            return lambda s: s * count
+
+        for count in (JVM_INT_MIN, JVM_INT_MAX):
+            with self.subTest(count=count):
+                with self.sql_conf(_TRANSPILE_ON):
+                    self.assertTrue(UserDefinedFunction(make_repeat(count), S).transpiled)
+        for count in (JVM_INT_MIN - 1, JVM_INT_MAX + 1):
+            with self.subTest(count=count):
+                _, _, options = self._fallback_warnings(make_repeat(count), S)
+                self.assertEqual([], options)
 
     def test_udf_transpile_body_literal_value_guards(self):
         # The long-range / non-finite / UTF-8 guards used to live only on the
@@ -3356,16 +3330,27 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     # UDF's lifetime -- see the ``transpiled`` docstring.
                     self.assertNotEqual([], pudf.transpiled, f"{key}=true lowers again")
 
-    def test_udf_transpile_no_return_yields_null_and_warns(self):
-        # Falling off the end of a function returns None in Python, which the
-        # interpreted path surfaces as NULL. Transpile it to a NULL literal and
-        # warn, since it is usually a mistake.
-        import warnings as _warnings
+    def test_udf_transpile_warns_when_a_udf_never_returns(self):
+        def no_return(x):
+            x
 
+        # A lambda has no `return` in its source; the synthesized one must not warn.
+        has_return = lambda x: x + 1  # noqa: E731
+
+        for label, func, expected in [
+            ("no return", no_return, True),
+            ("lambda", has_return, False),
+        ]:
+            with self.subTest(case=label):
+                with self.sql_conf(_TRANSPILE_ON):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        UserDefinedFunction(func, LongType())
+                warned = [w for w in caught if "no return statement" in str(w.message)]
+                self.assertEqual(expected, bool(warned), f"{label}: wrong warning behavior")
+
+    def test_udf_transpile_no_return_yields_null_or_falls_back_safely(self):
         def bare_expression(x):
-            # A bare name evaluates to the column and cannot raise for any input
-            # category, so discarding it is exact. An OPERATOR here would not be
-            # -- see the cross-category cases below.
             x
 
         def just_pass(x):
@@ -3382,34 +3367,26 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             with self.subTest(case=label):
                 self.assertIsNone(func(1), f"{label}: bad test expectation")
                 with self.sql_conf(_TRANSPILE_ON):
-                    with _warnings.catch_warnings(record=True) as caught:
-                        _warnings.simplefilter("always")
-                        pudf = UserDefinedFunction(func, LongType())
+                    pudf = UserDefinedFunction(func, LongType())
                     self.assertTrue(pudf.transpiled, f"{label} should transpile to NULL")
-                    self.assertTrue(
-                        [w for w in caught if "no return statement" in str(w.message)],
-                        f"{label}: expected a no-return warning",
-                    )
                     df = self.spark.createDataFrame([(1,), (2,)], "a long")
                     self.assertEqual([r[0] for r in df.select(pudf("a")).collect()], [None, None])
 
-        # A discarded expression that could raise must NOT be lowered away:
-        # dropping it would turn a Python error into a NULL. It still warns,
-        # because "always returns None or raises" is worth telling the user
-        # regardless of whether we could transpile it.
+        # A generator also ends in a discarded expression, but calling it returns a
+        # generator object rather than None, so it must fall back.
+        def generator_udf(x):
+            yield x
+
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertEqual([], UserDefinedFunction(generator_udf, LongType()).transpiled)
+
+        # Discarding an expression that could raise must fall back.
         def discards_a_raise(x):
             x % 0
 
         with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                pudf = UserDefinedFunction(discards_a_raise, LongType())
+            pudf = UserDefinedFunction(discards_a_raise, LongType())
             self.assertEqual([], pudf.transpiled, "a discarded raising expression must fall back")
-            self.assertTrue(
-                [w for w in caught if "no return statement" in str(w.message)],
-                "expected a no-return warning even though it fell back",
-            )
-            self.assertTrue([w for w in caught if "Unable to transpile" in str(w.message)])
             # Python raises, and falling back means the query raises too.
             self.assertRaises(ZeroDivisionError, discards_a_raise, 1)
             df = self.spark.createDataFrame([(1,)], "a long")
@@ -3443,17 +3420,11 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         ]:
             with self.subTest(case=label):
                 with self.sql_conf(_TRANSPILE_ON):
-                    with _warnings.catch_warnings(record=True) as caught:
-                        _warnings.simplefilter("always")
-                        pudf = UserDefinedFunction(func, LongType())
+                    pudf = UserDefinedFunction(func, LongType())
                     self.assertEqual(
                         [],
                         pudf.transpiled,
                         f"{label}: an operator on a discarded expression must fall back",
-                    )
-                    self.assertTrue(
-                        [w for w in caught if "no return statement" in str(w.message)],
-                        f"{label}: expected a no-return warning even though it fell back",
                     )
 
         # And end to end: `x + 1` on a string column is a TypeError in Python, so
@@ -3485,119 +3456,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             y = x + 1  # noqa: F841
 
         with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                pudf = UserDefinedFunction(trailing_assignment, LongType())
+            pudf = UserDefinedFunction(trailing_assignment, LongType())
             self.assertEqual([], pudf.transpiled, "an unread raising binding must fall back")
-            self.assertTrue(
-                [w for w in caught if "no return statement" in str(w.message)],
-                "expected a no-return warning even though it fell back",
-            )
             self.assertIsNone(trailing_assignment(1))
             df = self.spark.createDataFrame([("7",)], "a string")
             with self.assertRaises(Exception):
                 df.select(pudf("a")).collect()
-
-        # A generator also ends in a discarded expression, but calling it
-        # returns a generator object rather than None -- so it must fall back
-        # WITHOUT claiming the function returns None, which would be untrue.
-        def generator_udf(x):
-            yield x
-
-        with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                pudf = UserDefinedFunction(generator_udf, LongType())
-            self.assertEqual([], pudf.transpiled, "a generator must not transpile")
-            self.assertFalse(
-                [w for w in caught if "no return statement" in str(w.message)],
-                "a generator does not return None; the no-return warning would lie",
-            )
-
-        # The warning is about a MISSING `return`, not about a call that happens
-        # to produce None. Once the author wrote a `return`, a path that falls
-        # past it is far more likely deliberate than forgotten, so these stay
-        # quiet even though each returns None for some input.
-        def conditional_return(x):
-            if x > 0:
-                return 1
-
-        def return_then_trailing_statement(x):
-            if x > 0:
-                return 1
-            y = x  # noqa: F841
-
-        for label, func in [
-            ("conditional return", conditional_return),
-            ("trailing statement after a return", return_then_trailing_statement),
-        ]:
-            with self.subTest(case=label):
-                self.assertIsNone(func(-1), f"{label}: bad test expectation")
-                with self.sql_conf(_TRANSPILE_ON):
-                    with _warnings.catch_warnings(record=True) as caught:
-                        _warnings.simplefilter("always")
-                        UserDefinedFunction(func, LongType())
-                    self.assertFalse(
-                        [w for w in caught if "no return statement" in str(w.message)],
-                        f"{label}: has a `return`, so the no-return warning is noise",
-                    )
-
-        # A `return` in a nested scope is not this function's return, so the
-        # outer function still falls off its end and still warns.
-        def returns_only_from_a_nested_def(x):
-            def inner():
-                return x
-
-            inner()
-
-        with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                UserDefinedFunction(returns_only_from_a_nested_def, LongType())
-            self.assertIsNone(returns_only_from_a_nested_def(1), "bad test expectation")
-            self.assertTrue(
-                [w for w in caught if "no return statement" in str(w.message)],
-                "a nested def's `return` is not the outer function's",
-            )
-
-        # Statements the old last-statement heuristic did not recognize (a loop,
-        # a `with`, ...) return None just the same when nothing returns.
-        def loops_without_returning(x):
-            for _ in range(x):
-                pass
-
-        with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True) as caught:
-                _warnings.simplefilter("always")
-                UserDefinedFunction(loops_without_returning, LongType())
-            self.assertIsNone(loops_without_returning(1), "bad test expectation")
-            self.assertTrue(
-                [w for w in caught if "no return statement" in str(w.message)],
-                "a body that never returns should warn whatever its last statement is",
-            )
-
-        # A lambda has no `return` statement in its source, so a naive "does the
-        # body contain an ast.Return" check would warn about every lambda UDF.
-        # `_get_function_from_ast` synthesizes `body=[Return(<lambda body>)]`, so
-        # the check sees the return the source never spelled out.
-        identity = lambda x: x + 1  # noqa: E731
-
-        def make_adder(n):
-            # `inspect.getsource` yields just this `return` line, so the lambda
-            # arrives through a different unwrapping path than the one above.
-            return lambda x: x + n
-
-        for label, func in [("bound lambda", identity), ("factory lambda", make_adder(3))]:
-            with self.subTest(case=label):
-                self.assertEqual(func(1), 4 if label == "factory lambda" else 2)
-                with self.sql_conf(_TRANSPILE_ON):
-                    with _warnings.catch_warnings(record=True) as caught:
-                        _warnings.simplefilter("always")
-                        UserDefinedFunction(func, LongType())
-                    self.assertFalse(
-                        [w for w in caught if "no return statement" in str(w.message)],
-                        f"{label}: a lambda returns its body; the warning would lie",
-                    )
 
     def test_udf_transpile_skips_docstring(self):
         # A docstring binds nothing and cannot raise, so it is dropped and the
@@ -3645,6 +3509,36 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertEqual([], options, "a mid-body string must not be treated as a docstring")
         self.assertTrue(warned)
 
+    def test_udf_transpile_freezes_captures_for_both_execution_paths(self):
+        from pyspark.sql.udf import _wrap_function
+
+        global _TIMING_VALUE
+        _TIMING_VALUE = 3
+
+        def mutating_wrap(*args, **kwargs):
+            # Rebind BEFORE delegating: cloudpickle snapshots globals eagerly, so a
+            # mutation after this returns cannot reach the payload and the freeze
+            # would go untested.
+            global _TIMING_VALUE
+            _TIMING_VALUE = 100
+            return _wrap_function(*args, **kwargs)
+
+        try:
+            with self.sql_conf(_TRANSPILE_ON):
+                pudf = UserDefinedFunction(_timing_reads_global, LongType())
+                self.assertTrue(pudf.transpiled)
+                with patch("pyspark.sql.udf._wrap_function", side_effect=mutating_wrap):
+                    column = pudf("a")
+                projected = self.spark.createDataFrame([(1,)], "a long").select(column)
+                self.assertEqual(0, self._eval_python_count(projected))
+                self.assertEqual(4, projected.collect()[0][0])
+                with self.sql_conf({"spark.sql.experimental.optimizer.transpilePyUDFs": False}):
+                    interpreted = self.spark.createDataFrame([(1,)], "a long").select(column)
+                    self.assertGreater(self._eval_python_count(interpreted), 0)
+                    self.assertEqual(4, interpreted.collect()[0][0])
+        finally:
+            _TIMING_VALUE = 3
+
     def _timing_probe(self, mutate_at, transpile):
         """Rebind a captured global at one of three points; return both reads.
 
@@ -3678,9 +3572,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def test_udf_transpile_capture_timing_matches_interpreted(self):
         # The interpreted path snapshots captured values when the UDF is first
         # called (cloudpickle captures by value, and the judf is then cached).
-        # The transpiled path bakes its literals at the same moment, so the two
-        # must agree no matter when a captured global is rebound. Without that
-        # alignment, rebinding at P1 gives 4 transpiled and 101 interpreted.
+        # Both paths receive the same frozen capture values.
         for mutate_at in ("P1", "P2", "P3", "none"):
             with self.subTest(mutate_at=mutate_at):
                 transpiled = self._timing_probe(mutate_at, True)

@@ -310,12 +310,8 @@ def negate_truthy(x):
 
 
 def both_positive(x, y):
-    # Exercises ast.BoolOp(And) over Compare operands -- both operands
-    # are statically boolean, so the transpiler should lower to `&`.
-    # Kept as a single-statement body since the transpiler doesn't yet
-    # support multi-statement function bodies; NULL inputs flow through
-    # `>` to NULL on the Spark side and to a raise on the Python side,
-    # so the strategy below skips None.
+    # Exercises boolean `and` over comparison operands. NULL cases verify
+    # agreement between transpiled and interpreted results or exceptions.
     return x > 0 and y > 0
 
 
@@ -464,14 +460,6 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
         interpreted side unconditionally, as this used to, made the whole suite
         blind to "transpiled returned a value where Python raised" -- which is
         what `"ab" * 2.5` -> 'abab' was, and what the dropped-binding NULLs were.
-
-        One divergence this policy would flag is known and deliberate, but no
-        strategy here reaches it today: a text repeat whose count column is
-        fractional truncates rather than raising. The strategies draw only longs and
-        bools, so nothing generates it; a string-times-double strategy added later
-        will fail here, and should be skipped rather than carved out. The shapes are
-        pinned in test_udf_transpile_unit.py, by
-        ``test_udf_transpile_string_repeat_diverges_on_a_fractional_count_column``.
         """
         func_name = getattr(func, "__name__", repr(func))
         kwargs = kwargs or {}

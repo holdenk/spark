@@ -613,26 +613,12 @@ object SQLConf {
   val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
     buildConf("spark.sql.experimental.optimizer.transpilePyUDFs")
     .withBindingPolicy(ConfigBindingPolicy.SESSION)
-    .doc("When true, attempt to transpile Python UDFs to Catalyst expressions. " +
-        "Transpilation also requires ANSI mode (spark.sql.ansi.enabled=true) -- " +
-        "the rewritten expressions target ANSI semantics, so with ANSI off the " +
-        "transpiler falls back to interpreted Python and a warning is logged at " +
-        "UDF construction. Transpiled UDFs attempt to match the Python functionality but " +
-        "may not be 100% equivalent. Some known differences include: overflows from input types " +
-        "(you can precast to decimal to avoid), type coercion on comparison, implicit " +
-        "returns, and a non-integral text repeat count arriving from a column (the " +
-        "cast the transpiler inserts truncates it where Python raises; an `int` " +
-        "annotation does not prevent this, cast the column instead). " +
-        "A UDF that reads a free variable (a closure cell or a module global) " +
-        "may have that value baked into the plan as a literal, read at the same moment " +
-        "the interpreted path pickles the function, so rebinding the name afterwards " +
-        "changes neither. Baking is limited to values cloudpickle would capture by " +
-        "value, and a local assignment is only supported when it binds a literal. A " +
-        "UDF whose free variables, assignments or return type fall outside what the " +
-        "transpiler supports falls back to interpreted Python; see the " +
-        "pyspark.sql.transpile module documentation for the exact rules. " +
-        "This initial version only works with non-Connect Spark; Spark Connect " +
-        "support is to follow. This is an *experimental* feature."
+    .doc("When true, attempts to replace supported scalar Python UDFs with Catalyst " +
+        "expressions. This experimental feature requires ANSI mode and is unavailable " +
+        "in Spark Connect. Unsupported functions fall back to Python execution. Captured " +
+        "values may be baked into the plan only when cloudpickle snapshots them by value " +
+        "and their type is supported. Local assignments must bind literals. See the " +
+        "pyspark.sql.transpile module documentation for limitations."
     )
     .version("4.3.0")
     .booleanConf

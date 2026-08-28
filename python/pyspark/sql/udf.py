@@ -171,6 +171,14 @@ def _transpile_conf_is_true(
     return value is not None and value.lower() == "true"
 
 
+def _format_transpile_errors(errors: list[str]) -> str:
+    """Format distinct fallback reasons without flooding a warning."""
+    unique = list(dict.fromkeys(errors))
+    shown = unique[:3]
+    suffix = f"; and {len(unique) - len(shown)} more" if len(unique) > len(shown) else ""
+    return "; ".join(shown) + suffix
+
+
 class UserDefinedFunction:
     """
     User defined function in Python
@@ -239,22 +247,8 @@ class UserDefinedFunction:
         # ``asNondeterministic()`` and ``spark.udf.register``, and is threaded to the JVM in
         # ``_create_judf`` so ``PythonAggregate`` can plan the two-stage aggregation.
         self.bufferSchema = bufferSchema
-        # Transpilation state. ``_transpile_analysis`` holds everything that does
-        # not depend on captured values; the captures are read only when the
-        # ``judf`` is built, which is also where ``_create_judf`` cloudpickles the
-        # function -- so the baked literals and the snapshot agree exactly. See
-        # the capture-timing note in ``pyspark.sql.transpile``. ``None`` means this
-        # UDF is not a candidate at all -- an unsupported signature or return type,
-        # ``asNondeterministic()``, a JVM that could not answer the conf reads below
-        # (the ``except`` at the end of this method), or -- the common case -- the
-        # transpile confs being off HERE, at construction. Candidacy is decided
-        # once; only the lowering re-reads the confs, so a UDF built while
-        # ``transpilePyUDFs`` was off stays interpreted even if it is turned on
-        # later. It is NOT cleared when a lowering refuses:
-        # that can depend on the captured values, which are re-read every time, so
-        # the same UDF may lower later. The options and their input categories are
-        # not stored either; ``transpiled`` re-lowers, because a baked capture is
-        # only valid for the values current when it ran.
+        # Static eligibility is retained, while value-dependent lowering is
+        # repeated when the JVM UDF is built.
         self._transpile_analysis: Optional["_TranspileAnalysis"] = None
         # When we have a transpiled rewrite, ``__call__`` resolves any
         # user-supplied kwargs against this positional parameter list so
@@ -332,7 +326,7 @@ class UserDefinedFunction:
                     errors = errors + build_errors
                     self._transpile_validated = lowers
                 if not lowers:
-                    detail = f": {errors}" if errors else ""
+                    detail = f": {_format_transpile_errors(errors)}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
         except Exception as e:
             # An inability to transpile must never break a working UDF -- fall
@@ -345,12 +339,12 @@ class UserDefinedFunction:
             self._transpile_analysis = None
             self._transpiled_param_names = []
 
-    def _build_transpiled_options(self, session: Optional["SparkSession"]) -> Tuple[list, list]:
+    def _build_transpiled_options(
+        self, session: Optional["SparkSession"]
+    ) -> Tuple[list, list, Optional[Callable]]:
         """Lower this UDF to Catalyst expressions, reading captured values now.
 
-        Returns ``(options, input_categories)``, parallel lists; the JVM picks
-        the option whose categories match the bound column types and otherwise
-        falls back to the interpreted Python UDF.
+        Returns the options, their input categories, and the callable to serialize.
 
         ``session`` is the session the expressions will be planned against, and
         the one whose confs are consulted while lowering; ``_create_judf`` passes
@@ -367,15 +361,15 @@ class UserDefinedFunction:
         moment it runs. See ``_create_judf`` for why that moment is the right one.
         """
         if self._transpile_analysis is None or session is None:
-            return [], []
+            return [], [], None
         if not _transpile_conf_is_true(
             session, "spark.sql.experimental.optimizer.transpilePyUDFs", "false"
         ) or not _transpile_conf_is_true(session, "spark.sql.ansi.enabled"):
-            return [], []
+            return [], [], None
         from pyspark.sql.transpile import _build_transpiled
 
         try:
-            options, errors, input_categories = _build_transpiled(
+            options, errors, input_categories, serialized_func = _build_transpiled(
                 session, self.func, self._transpile_analysis
             )
             if not options and errors and self._transpile_validated:
@@ -394,12 +388,14 @@ class UserDefinedFunction:
                 # call -- or a call passing a session other than the active one --
                 # change the warning behavior for the UDF's lifetime. Only
                 # construction and ``_create_judf`` set it.
-                warnings.warn(f"Unable to transpile UDF {self.func}: {errors}")
-            return options, input_categories
+                warnings.warn(
+                    f"Unable to transpile UDF {self.func}: {_format_transpile_errors(errors)}"
+                )
+            return options, input_categories, serialized_func
         except Exception as e:
             # Same contract as construction: never break a working UDF.
             warnings.warn(f"Exception transpiling UDF {self.func}: {e}")
-            return [], []
+            return [], [], None
 
     @property
     def transpiled(self) -> list:
@@ -640,38 +636,24 @@ class UserDefinedFunction:
         spark = SparkSession._getActiveSessionOrCreate()
         sc = spark.sparkContext
 
-        wrapped_func = _wrap_function(sc, func, self.returnType)
-        jdt = spark._jsparkSession.parseDataType(self.returnType.json())
-        assert sc._jvm is not None
-        # Lower here rather than at construction so the free variables baked into
-        # these expressions are read as close as possible to the moment
-        # ``_wrap_function`` above cloudpickles the function for the interpreted
-        # path; since this judf is cached by ``_judf``, the two then agree for the
-        # UDF's lifetime. Adjacent, not atomic: pickling runs first, so a captured
-        # object's own ``__reduce__`` could still mutate a global or cell before
-        # the lowering reads it. Closing that would mean deriving the literals
-        # from the pickle payload, which is not worth the coupling.
         if include_transpiled:
-            # ``_wrap_function`` pickled ``func`` while the lowering below reads
-            # ``self.func``; lowering a different function than the one pickled
-            # would be a silent wrong answer, so pin that the profiler call sites
-            # (which pass a wrapper) also pass ``include_transpiled=False``.
-            # Raised (not asserted -- ``python -O`` strips those) rather than
-            # warned-and-fallen-back: this can only fire on an internal caller bug,
-            # where a loud test failure beats a silent wrong answer.
             if func is not self.func:
                 raise PySparkRuntimeError(
                     errorClass="CANNOT_TRANSPILE_MISMATCHED_FUNCTION",
                     messageParameters={"func": getattr(func, "__qualname__", repr(func))},
                 )
-            transpiled, input_categories = self._build_transpiled_options(spark)
-            if transpiled:
-                # This is the lowering that reaches a plan, so it is the one worth
-                # remembering: a later refusal then means the captured values
-                # changed rather than a body that never lowered.
-                self._transpile_validated = True
+            transpiled, input_categories, serialized_func = self._build_transpiled_options(spark)
         else:
-            transpiled, input_categories = [], []
+            transpiled, input_categories, serialized_func = [], [], None
+
+        wrapped_func = _wrap_function(
+            sc, serialized_func if serialized_func is not None else func, self.returnType
+        )
+        if transpiled:
+            self._transpile_validated = True
+
+        jdt = spark._jsparkSession.parseDataType(self.returnType.json())
+        assert sc._jvm is not None
         # Incremental Python aggregators additionally carry the intermediate buffer schema, which
         # the JVM needs at planning time to build the two-stage aggregation (see PythonAggregate).
         # Everyone else passes ``None`` here, which Py4J maps to the JVM ``null`` the ``bufferType``

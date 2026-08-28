@@ -17,100 +17,49 @@
 """
 Experimental tools for transpiling UDFS.
 
-Transpilation is only attempted when both
-``spark.sql.experimental.optimizer.transpilePyUDFs=true`` and
-``spark.sql.ansi.enabled=true``. The generated Catalyst expressions
-target ANSI-mode SQL semantics (overflow raises, divide-by-zero raises,
-etc.); running them under non-ANSI mode would silently diverge from the
-Python interpretation in ways we don't currently track. If you flip
-transpilation on with ANSI off the UDF will fall back to interpreted
-Python execution and a warning is logged at UDF construction time.
+Transpilation requires ``spark.sql.experimental.optimizer.transpilePyUDFs``
+and ANSI mode. Unsupported UDFs fall back to interpreted Python.
 
 Python's ``+`` and ``*`` are overloaded for text (concat / repeat), so an
 untyped parameter is transpiled into one option per input-type category
-(numeric and string) and the JVM picks the one matching the bound column
-types -- falling back to interpreted Python when none fit. Annotating the
-UDF's parameters (e.g. ``def f(a: int, b: str)``) pins each category and
-keeps the option matrix small; prefer doing so. To bound plan growth,
-functions with more than three untyped parameters only emit the
-all-numeric and all-string variants.
-
-Text repeat carries a known divergence. Python's ``s * n`` needs a whole ``n``
-(``"ab" * 2.5`` and ``"ab" * 2.0`` are both a TypeError), while the lowering emits
-``repeat(s, cast(n as int))`` -- and that cast, added here rather than by ``repeat``,
-truncates. The guard can only read the count's SOURCE, so it refuses when a
-non-integral CONSTANT is visible there (a literal, or a captured value) and lowers
-everything else, whatever its shape. A count whose fractional part only arrives at
-runtime, in a column, therefore still diverges: on a ``double`` column holding 2.5,
-``s * n`` gives ``'abab'``, ``s * (n + 1)`` ``'ababab'``, ``s * (n * 2)``
-``'ababababab'`` and ``s * -n`` ``''``, where Python raises every time.
-
-Annotating does NOT close this, despite what annotations do for the option matrix
-above: ``int`` and ``float`` both map to the one "numeric" category, and that
-matches any non-decimal numeric column, so ``def f(s: str, n: int)`` bound to a
-``double`` column lowers and returns ``'abab'``. Tracked as SPARK-58595.
-Casting the COLUMN to an integral
-type does work, but it makes the two paths agree on ``'abab'`` rather than on the
-TypeError -- the only way to get Python's error is to leave the UDF interpreted.
+(numeric and string), and the JVM keeps the options compatible with the bound
+columns. Annotations can reduce this option matrix. String repeat is lowered only
+when its count is a statically known integer; recognizing integral columns is
+tracked by SPARK-58595.
 
 A lambda is lowered only when its source names it directly and alone: bind it to
-a name (``f = lambda x: x + 1``, annotated if you like) or return it from a
-``def`` (``return lambda x: x + n``), on a line of its own. Passed straight to
-``udf(...)``, wrapped in another call, returned by another lambda, or sharing a
-line with a second lambda, nothing in the source read back says which lambda is
-the UDF, so it falls back to interpreted Python rather than risk the wrong body.
+a name or return it from a ``def`` on a line of its own. Ambiguous source falls
+back rather than risk lowering the wrong lambda.
 
 Free variables and literal assignments
 --------------------------------------
 A name that is not a parameter (``lambda a: a + b``) is resolved from the
 function's scope and baked into the plan as a literal. A local assignment is
-supported only when it **binds a literal** -- one written in the body
-(``def f(a): b = 5; return a + b``) or captured from the enclosing scope
-(``b = k``). Anything the assignment would have to compute (``b = a + 1``,
-``b += 1``, or even aliasing a column with ``b = a``) falls back to interpreted
-Python.
-
-That restriction is what keeps this simple. Substituting a literal at a name's
-read sites cannot duplicate work, cannot grow the tree, and cannot move an error:
-a literal has no evaluation to move. Were an arbitrary expression allowed, an
-assignment read only inside an ``if`` branch -- or never read at all -- would
-discard or defer an error Python raises eagerly, and inlining a chain like
-``b = a + a; c = b + b`` would double the plan per link.
-
-Both kinds of rewrite are done by :func:`_normalize_function` before any lowering
-happens, so what reaches the lowering code is indistinguishable from a UDF the
-user wrote with the literal spelled out.
+supported only when it binds a literal written in the body or captured from the
+enclosing scope. Computed assignments fall back.
 
 Baking a value is only sound when the interpreted path would have seen that
-same value, which means matching ``cloudpickle`` exactly: a captured name is
-resolved only when ``cloudpickle`` would snapshot it BY VALUE.
-:func:`_capture_scope` therefore reads ``cloudpickle``'s own helpers rather than
-re-deriving the rule -- private, but vendored, so they move only on a deliberate
-upgrade. ``dumps``/``loads`` will not do: ``loads`` returns a by-reference
-function unchanged, hiding the divergence that must fall back.
-
-Consequences worth knowing as a user:
+same value, so a name is resolved only when ``cloudpickle`` snapshots it by
+value:
 
 * A UDF written as a top-level ``def`` in an importable module is pickled by
-  reference, so the executor re-imports the module and re-reads its globals;
-  such a UDF falls back rather than baking the driver's values. Writing it as
-  a lambda, or registering the module with
-  ``cloudpickle.register_pickle_by_value``, makes it eligible.
+  reference and cannot bake driver globals.
 * Only ``None`` and the basic scalars (``int``, ``float``, ``str``, ``bool``,
-  ``bytes``) are bakeable, and an ``int`` has to fit a 64-bit integer since
-  Python's are unbounded. Anything else falls back. Some values of a bakeable
-  type are refused as well: NaN, whose ordering and equality differ from
-  Python's; the infinities, which no integral cast accepts; and a ``str`` that is
-  not UTF-8 encodable (a lone surrogate), which py4j cannot carry.
+  ``bytes``) are bakeable. Integers must fit in 64 bits; non-finite floats and
+  non-UTF-8 strings are refused.
 * Only closure cells and module globals are read. ``self.<attr>`` on a callable
-  instance is not captured -- resolving it faithfully means reproducing Python's
-  descriptor and MRO lookup and cloudpickle's instance-state rules, which is left
-  to SPARK-59029.
+  instance is not captured (SPARK-59029).
 
-Capture timing: captured values are read when the UDF's ``judf`` is created, the
-same moment ``_wrap_function`` cloudpickles it, so the baked literals and the
-snapshot agree even if a captured global is rebound in between. The two reads are
-adjacent rather than atomic; see ``_create_judf`` in ``udf.py``.
+Captured values are frozen once when the JVM UDF is created and supplied to both
+the interpreted and transpiled paths. Freezing needs a plain function or bound
+method, so a callable instance that reads a captured value falls back.
+
+Known differences
+-----------------
+A transpiled UDF is not always exactly equivalent to the Python one. Overflow
+follows the input types rather than Python's unbounded ``int`` (precast to
+decimal to avoid it), and comparisons apply Catalyst type coercion where Python
+would raise. Tracked by SPARK-55210.
 """
 
 import ast
@@ -155,7 +104,7 @@ from pyspark.sql.types import (
     NumericType,
     StringType,
 )
-from pyspark.util import JVM_LONG_MAX, JVM_LONG_MIN
+from pyspark.util import JVM_INT_MAX, JVM_INT_MIN, JVM_LONG_MAX, JVM_LONG_MIN
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -214,60 +163,6 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
             return True
         case _:
             return False
-
-
-def _refuse_fractional_repeat_count(node: ast.AST) -> None:
-    """Refuse a string repeat (``s * n``) whose count is not a whole number.
-
-    Python's ``str * n`` needs a whole ``n`` -- both ``"ab" * 2.5`` and ``"ab" *
-    2.0`` are a TypeError -- while Spark's ``repeat`` takes any numeric and would
-    truncate, returning a value where Python raises.
-
-    Refuses when a non-integral number appears ANYWHERE in the count expression,
-    not just when the count is itself a fractional constant. Matching one node
-    shape is the wrong altitude here: ``s * -2.5`` is ``UnaryOp`` and
-    ``s * (2.5 + 0)`` is ``BinOp``, and both lowered to
-    ``repeat(s, cast(... as int))`` -- ``''`` and ``'abab'`` where Python raises
-    TypeError. Since this transpiler deliberately does not evaluate expressions, it
-    cannot know what a computed count comes to, so it fails closed on the presence
-    of the value that could only truncate.
-
-    Two consequences, both deliberate:
-
-    * This walk only inspects ``ast.Constant``, so a count holding no non-integral
-      constant lowers whatever its SHAPE -- not just a bare ``s * n``, but equally
-      ``s * -n`` (a ``UnaryOp``) and ``s * (n + 1)`` / ``s * (n * 2)`` (a ``BinOp``
-      over whole constants). Each diverges on a fractional column: ``''``,
-      ``'ababab'``, ``'ababababab'`` for ``('ab', 2.5)``. Pre-existing behavior, and
-      an ``int`` annotation does not help -- ``int`` and ``float`` share the one
-      "numeric" category. Constraining it means splitting that category into
-      integral and fractional on BOTH sides (the precedent is the JVM matcher
-      already excluding DecimalType from "numeric" for the same kind of reason) and
-      assigning categories PER USE, since a category is per public parameter today
-      while "is a repeat count" is per use. Left to SPARK-58595.
-    * A fractional literal somewhere in the expression that cannot reach the count
-      (``s * (a if a > 2.5 else 3)``) is refused too. Over-refusing costs a
-      lowering; under-refusing returns a wrong answer.
-    """
-    for inner in ast.walk(node):
-        if not isinstance(inner, ast.Constant):
-            continue
-        value = inner.value
-        # ``bool`` subclasses ``int`` and `"ab" * True` is legal Python, but a bool
-        # is categorised "bool" and never reaches the repeat arm, so refuse it here
-        # rather than imply support the lowering does not have.
-        if isinstance(value, int) and not isinstance(value, bool):
-            continue
-        if not isinstance(value, (int, float, complex)):
-            # A non-number cannot be a count; whatever it is doing in this
-            # expression, the lowering refuses it on its own terms.
-            continue
-        raise UnsupportedOperationException(
-            f"the count in a string repeat (`s * n`) involves {value!r}, which is "
-            "not a whole number; Python raises TypeError for a fractional count "
-            "while Spark's `repeat` would truncate it, so this falls back to "
-            "interpreted Python"
-        )
 
 
 def _is_definitely_boolean(node: ast.AST) -> bool:
@@ -394,6 +289,22 @@ def _as_literal(node: ast.AST) -> Optional[ast.Constant]:
     return None
 
 
+def _require_integral_repeat_count(node: ast.AST) -> None:
+    """Refuse a string repeat unless its count is a statically known integer."""
+    literal = _as_literal(node)
+    if (
+        literal is None
+        or type(literal.value) is not int
+        or not JVM_INT_MIN <= literal.value <= JVM_INT_MAX
+    ):
+        raise UnsupportedOperationException(
+            "the count in a string repeat (`s * n`) is not a statically known "
+            "32-bit integer; Spark's `repeat` narrows other values where Python "
+            "raises or returns a different result, so this falls back to "
+            "interpreted Python"
+        )
+
+
 def _is_docstring(stmt: ast.stmt) -> bool:
     """Whether ``stmt`` is a bare string expression (a docstring in position 0)."""
     return (
@@ -403,27 +314,19 @@ def _is_docstring(stmt: ast.stmt) -> bool:
     )
 
 
-# Node types that open a new binding scope. Split so each user takes exactly the
-# set it needs, rather than two hand-maintained lists drifting apart: a
-# ``return``/``yield`` search only has to stop at function-ish bodies, while a
-# name-substituting rewrite has to stop at comprehensions too.
+# Node types that open a new binding scope. Split because a return/yield search
+# stops at function-ish bodies while a name-substituting rewrite also stops at
+# comprehensions.
 _FUNCTION_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 _COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
 def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
-    """Every node under ``body`` that belongs to the enclosing function itself.
+    """Every node under ``body`` belonging to the enclosing function itself.
 
-    Nested ``def``/``lambda``/``class`` bodies are skipped, because a ``return``
-    or ``yield`` inside one of them belongs to that scope, not to ours:
-    ``ast.walk`` would descend and report ``def f(x):\\n def g(): return 1``
-    as having a return.
-
-    Comprehensions are NOT skipped even though they open a scope: a ``return``
-    cannot appear in one and a ``yield`` in one is a syntax error, so descending
-    is harmless here. ``_LiteralNormalizer`` does have to skip them -- it cares
-    about name bindings, not returns -- which is why it uses the wider
-    ``_COMPREHENSION_NODES`` on top of these.
+    Nested ``def``/``lambda``/``class`` bodies are skipped: a ``return`` inside one
+    belongs to that scope, not ours. Comprehensions are not, since a ``return``
+    cannot appear in one and a ``yield`` in one is a syntax error.
     """
     stack: List[ast.AST] = list(body)
     while stack:
@@ -434,12 +337,8 @@ def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
 
 
 def _returns_only_none_implicitly(body: List[ast.stmt]) -> bool:
-    """Whether the function has no ``return`` statement at all, so every* call
-    falls off its end and hands back ``None``.
-
-    * Technically could also throw.
-    """
-    # Any one of the three forces False, so stop at the first.
+    """Whether the body has no ``return`` at all, so every call falls off the end
+    and hands back ``None`` (or raises)."""
     return not any(
         isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom)) for n in _own_scope_nodes(body)
     )
@@ -534,6 +433,22 @@ class _CapturedScope:
             f"name {name!r} is not a parameter and could not be resolved from the UDF's scope"
         )
 
+    def snapshot(self) -> Tuple[Tuple[str, Any], ...]:
+        """Return the bakeable values whose mutation could change a lowering.
+
+        The filter matches ``_LiteralNormalizer._bake`` exactly, so no name the
+        lowering can bake is left unfrozen.
+        """
+        values = dict(self._global_values or {})
+        values.update(self._cells)
+        return tuple(
+            sorted(
+                (name, value)
+                for name, value in values.items()
+                if value is None or type(value) in _BAKEABLE_TYPES
+            )
+        )
+
 
 def _capture_scope(func: Callable) -> _CapturedScope:
     """Build the capture table for ``func``, gated on cloudpickle's behaviour."""
@@ -588,6 +503,46 @@ def _capture_scope(func: Callable) -> _CapturedScope:
         cells=cells,
         global_values=global_values,
     )
+
+
+def _freeze_captured_callable(func: Callable, scope: _CapturedScope) -> Callable:
+    """Return a callable whose bakeable globals and closure cells are fixed."""
+    values = dict(scope.snapshot())
+    if not values:
+        return func
+    if not isinstance(func, types.FunctionType) and not inspect.ismethod(func):
+        raise UnsupportedOperationException(
+            "captured values on callable instances cannot be frozen safely; "
+            "falling back to interpreted Python"
+        )
+
+    fn = _underlying_function(func)
+    assert fn is not None
+    cell_names = set(fn.__code__.co_freevars)
+    # A private copy, not the live module dict: that is what makes the pickled
+    # function immune to a rebind between here and ``_wrap_function``. Cell names
+    # are excluded because one can shadow an unrelated module global of the same
+    # name, which this copy would otherwise clobber.
+    frozen_globals = dict(fn.__globals__)
+    frozen_globals.update({n: v for n, v in values.items() if n not in cell_names})
+
+    frozen_closure = tuple(
+        types.CellType(values[name]) if name in values else cell
+        for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ())
+    )
+    frozen = types.FunctionType(
+        fn.__code__,
+        frozen_globals,
+        fn.__name__,
+        fn.__defaults__,
+        frozen_closure or None,
+    )
+    frozen.__kwdefaults__ = fn.__kwdefaults__
+    frozen.__annotations__ = fn.__annotations__
+    frozen.__dict__.update(fn.__dict__)
+    frozen.__module__ = fn.__module__
+    frozen.__qualname__ = fn.__qualname__
+    return types.MethodType(frozen, func.__self__) if inspect.ismethod(func) else frozen
 
 
 class _LiteralNormalizer(ast.NodeTransformer):
@@ -780,6 +735,7 @@ def _normalize_function(
     function_ast: ast.FunctionDef,
     params: List[str],
     receiver: Optional[str],
+    scope: Optional[_CapturedScope] = None,
 ) -> ast.FunctionDef:
     """Resolve scope and literal assignments, yielding a one-statement body.
 
@@ -789,7 +745,7 @@ def _normalize_function(
     Raises :class:`UnsupportedOperationException` when anything cannot be
     resolved soundly, which the caller turns into a fallback.
     """
-    scope = _capture_scope(func)
+    scope = scope or _capture_scope(func)
     normalizer = _LiteralNormalizer(params, scope, receiver)
     # ``ast.NodeTransformer`` rewrites in place, and the caller holds onto
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
@@ -1319,15 +1275,11 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Mult():
                         if lc == "numeric" and rc == "numeric":
                             return left_col.__mul__(right_col)
-                        # Repeat needs a whole count: Python raises TypeError for
-                        # a fractional one, so lowering it would return a value
-                        # where Python raises. See
-                        # ``_refuse_fractional_repeat_count``.
                         if lc == "string" and rc == "numeric":
-                            _refuse_fractional_repeat_count(right)
+                            _require_integral_repeat_count(right)
                             return repeat(left_col, right_col.cast("int"))
                         if lc == "numeric" and rc == "string":
-                            _refuse_fractional_repeat_count(left)
+                            _require_integral_repeat_count(left)
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
                         if lc == rc == "numeric":
@@ -1918,11 +1870,9 @@ def _analyze_func(
     # off THIS list, so the placeholder numbering needs no offset.
     public_params = params[spoken_for:]
     receiver = params[0] if spoken_for else None
-    # Warned here rather than while lowering: this depends only on the AST, and
-    # ``_build_transpiled`` runs again for every ``judf`` and every read of the
-    # ``transpiled`` property, so warning there would repeat for the UDF's life.
-    # Warned even when the LOWERING goes on to fail -- the user still wants to know
-    # the function never returns a value.
+    # Warned here, not while lowering: this depends only on the AST, and lowering
+    # reruns for every judf. Warned even when the lowering then fails -- the user
+    # still wants to know the function never returns a value.
     if _returns_only_none_implicitly(function_ast.body):
         warnings.warn(
             f"UDF {func} has no return statement, so it always returns None "
@@ -1952,7 +1902,7 @@ def _can_transpile(
     and end up in a plan -- lowering every variant just to discard it costs a py4j
     roundtrip per node.
     """
-    options, errors, _ = _build_transpiled(session, func, analysis, first_only=True)
+    options, errors, _, _ = _build_transpiled(session, func, analysis, first_only=True)
     return bool(options), errors
 
 
@@ -1961,7 +1911,12 @@ def _build_transpiled(
     func: Callable[..., Any],
     analysis: _TranspileAnalysis,
     first_only: bool = False,
-) -> Tuple[List[Column], List[str], List[List[str]]]:
+) -> Tuple[
+    List[Column],
+    List[str],
+    List[List[str]],
+    Optional[Callable],
+]:
     """Resolve captured values and lower ``func`` to Catalyst expressions.
 
     Call this at ``judf`` creation time: the captured values it reads are baked
@@ -1975,15 +1930,14 @@ def _build_transpiled(
     """
     errors: List[str] = []
     try:
-        # Resolve free variables and literal assignments once, up front: the
-        # result is value-dependent but category-independent, so it is shared by
-        # every input-type variant below.
+        scope = _capture_scope(func)
         normalized = _normalize_function(
-            func, analysis.function_ast, analysis.params, analysis.receiver
+            func, analysis.function_ast, analysis.params, analysis.receiver, scope
         )
+        serialized_func = _freeze_captured_callable(func, scope)
         transpilers = _get_transpilers(session)
     except Exception as e:
-        return [], [str(e)], []
+        return [], [str(e)], [], None
     transpiled: List[Column] = []
     input_categories: List[List[str]] = []
     # One transpiled option per (backend x input-type variant). Untyped
@@ -2008,7 +1962,14 @@ def _build_transpiled(
                         [combo.get(i, "numeric") for i in range(len(analysis.public_params))]
                     )
                     if first_only:
-                        return transpiled, errors, input_categories
+                        return transpiled, errors, input_categories, serialized_func
             except Exception as e:
                 errors.append(str(e))
-    return transpiled, errors, input_categories
+    # Nothing lowered means no baked literal to agree with, so the interpreted path
+    # keeps the user's own function rather than a reconstructed clone.
+    return (
+        transpiled,
+        list(dict.fromkeys(errors)),
+        input_categories,
+        serialized_func if transpiled else None,
+    )
