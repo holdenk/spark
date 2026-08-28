@@ -18,7 +18,7 @@
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.errors import ParseException
+from pyspark.errors import AnalysisException, ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -211,9 +211,14 @@ class GroupbyAggregateMixin:
             psdf.groupby("A").agg({"B": "system.builtin.sum"}).sort_index(),
             pdf.groupby("A").agg({"B": "sum"}).sort_index(),
         )
+        # IDENTIFIER('...') is Spark's way of writing a name; it still only names a function
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "IDENTIFIER('sum')"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
 
-        # ... but the name is given to Spark as a name, not as a fragment of the aggregate
-        # expression, so a value carrying anything further does not parse as one.
+        # Anything past a name does not parse as one. IDENTIFIER() takes a string literal,
+        # not an expression, so a subquery in that position is a parse error too.
         for aggfunc in [
             "sum(`B`) as `B` -- ",
             "first((SELECT 1)) as `B` -- ",
@@ -222,10 +227,15 @@ class GroupbyAggregateMixin:
             "sum, max",
             "sum;",
             "",
+            "IDENTIFIER((SELECT 1))",
         ]:
             with self.subTest(aggfunc=aggfunc):
                 with self.assertRaises(ParseException):
                     psdf.groupby("A").agg({"B": aggfunc}).to_pandas()
+
+        # A quoted string is still a name: it does not become the body of the aggregate.
+        with self.assertRaises(AnalysisException):
+            psdf.groupby("A").agg({"B": "`(SELECT 1) + min`"}).to_pandas()
 
         # every way of naming the aggregation names it the same way
         aggfunc = "first((SELECT 1)) as `B` -- "

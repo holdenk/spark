@@ -405,9 +405,7 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
                     reordered.append(F.percentile_approx(scol, [0.25, 0.5, 0.75]).alias(data_col))
 
                 else:
-                    # ``aggfunc`` names the function to apply and nothing else:
-                    # ``call_function`` passes it to Spark as a name rather than as a
-                    # fragment of an expression to parse.
+                    # Name, not SQL: call_function parses this as a multipart identifier.
                     reordered.append(F.call_function(aggfunc, scol).alias(data_col))
 
         sdf = psdf._internal.spark_frame.select(groupkey_scols + psdf._internal.data_spark_columns)
