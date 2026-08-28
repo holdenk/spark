@@ -1063,10 +1063,11 @@ object ConvertToCatalyst extends Rule[LogicalPlan] {
           // Walk the full list of transpiled options and pick the first one,
           // falling back to the original Python UDF if none are available.
           // Options whose declared input-type categories don't match the bound
-          // column types are already pruned during analysis by
-          // ResolveTranspiledPythonUDFOptions, so any option that reaches here is
-          // safe to use. If you're plugging in your own transpilation, please add
-          // a separate ConvertToX so you can choose your desired transpiled nodes.
+          // column types, or that fail to resolve, are already pruned during
+          // analysis by ResolveTranspiledPythonUDFOptions, so any option that
+          // reaches here is safe to use. If you're plugging in your own
+          // transpilation, please add a separate ConvertToX so you can choose
+          // your desired transpiled nodes.
           // NOTE: the substituted option is used as-is, with no cast back to the
           // UDF's declared return type. The built-in transpiler guarantees each
           // option's dataType already matches; a custom transpiler MUST do the

@@ -55,9 +55,9 @@ case class UserDefinedPythonFunction(
     // ResolveTranspiledPythonUDFOptions for what each matches and why the numeric ones
     // overlap), parallel to `transpiled` (same length). The analyzer rule
     // ResolveTranspiledPythonUDFOptions later keeps only the options whose
-    // categories match the bound argument types; when none match, the call
-    // falls back to the plain Python UDF. `builder` requires the two lists to
-    // be parallel and skips transpilation otherwise.
+    // categories match the bound argument types and that resolve; when none
+    // remain, the call falls back to the plain Python UDF. `builder` requires
+    // the two lists to be parallel and skips transpilation otherwise.
     transpiledInputTypes: JList[JList[String]] = Nil.asJava,
     // Schema of the intermediate aggregation buffer, set only for the incremental Python
     // aggregator eval types (see [[PythonAggregate]]); `null` otherwise. Nullable rather than
@@ -130,14 +130,16 @@ case class UserDefinedPythonFunction(
     // option plus its declared input-type categories. We can't pick here: this
     // builder runs at call-construction time, before the argument columns are
     // bound, so their types aren't known yet. ResolveTranspiledPythonUDFOptions
-    // prunes the options to those matching the resolved input types (once known,
-    // and before CheckAnalysis), and ConvertToCatalyst picks the survivor.
+    // prunes the options to those matching the resolved input types that also
+    // resolve (once known, and before CheckAnalysis), and ConvertToCatalyst
+    // picks the survivor.
     // Only build the node when every option carries its parallel input-type
     // categories. ResolveTranspiledPythonUDFOptions prunes type-incompatible
-    // options using those categories, but only when they are present (its guard
-    // is `optionInputCategories.nonEmpty`); an empty or mismatched categories
-    // list would leave a type-invalid option to fail CheckAnalysis instead of
-    // falling back. If the two lists don't line up, skip transpilation.
+    // and unresolved options using those categories, but only when they are
+    // present (its guard is `optionInputCategories.nonEmpty`); an empty or
+    // mismatched categories list would leave a type-invalid option to fail
+    // CheckAnalysis instead of falling back. If the two lists don't line up,
+    // skip transpilation.
     // A call-site arity mismatch (user passed more or fewer args than the UDF's
     // parameters) must fall back to the plain Python UDF so the standard runtime
     // TypeError surfaces. Each option's category list has exactly one entry per
