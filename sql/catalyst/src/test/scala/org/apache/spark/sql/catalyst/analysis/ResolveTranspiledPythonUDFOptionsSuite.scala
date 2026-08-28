@@ -18,11 +18,11 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.api.python.PythonEvalType
+import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, AttributeReference, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF}
-import org.apache.spark.sql.catalyst.plans.PlanTest
-import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Project}
-import org.apache.spark.sql.types.{ByteType, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, AttributeReference, Cast, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF}
+import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan, Project}
+import org.apache.spark.sql.types.{ByteType, DataType, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType}
 
 /**
  * Unit tests for [[ResolveTranspiledPythonUDFOptions]], which prunes a
@@ -30,17 +30,26 @@ import org.apache.spark.sql.types.{ByteType, DecimalType, DoubleType, FloatType,
  * resolved argument types and whose expressions resolve. func=null in the leaf PythonUDF is
  * intentional: these structural tests don't execute Python.
  */
-class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
+class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
 
-  private def pyUDF(children: Seq[Expression]): PythonUDF =
-    PythonUDF("udf", null, LongType, children,
+  private def pyUDF(children: Seq[Expression], returnType: DataType = LongType): PythonUDF =
+    PythonUDF("udf", null, returnType, children,
       PythonEvalType.SQL_BATCHED_UDF, udfDeterministic = true)
 
   // Runs the rule on a Project that wraps the node, and returns the (possibly pruned) node.
   private def prune(node: TranspiledPythonUDF, rel: LocalRelation): TranspiledPythonUDF = {
     val rewritten = ResolveTranspiledPythonUDFOptions(Project(Seq(Alias(node, "r")()), rel))
-    rewritten.expressions.flatMap(_.collect { case t: TranspiledPythonUDF => t }).head
+    theNodeIn(rewritten)
   }
+
+  private def analyzeAndPrune(
+      node: TranspiledPythonUDF, rel: LocalRelation): TranspiledPythonUDF = {
+    theNodeIn(getAnalyzer.executeAndCheck(
+      Project(Seq(Alias(node, "r")()), rel), new QueryPlanningTracker))
+  }
+
+  private def theNodeIn(plan: LogicalPlan): TranspiledPythonUDF =
+    plan.expressions.flatMap(_.collect { case t: TranspiledPythonUDF => t }).head
 
   test("keeps the numeric option for numeric columns and drops the string one") {
     val a = $"a".long
@@ -178,23 +187,56 @@ class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
   }
 
   test("drops an option that fails to resolve even when its category matches") {
-    val a = $"a".long
-    val unresolved = UnresolvedAttribute("no_such_col")
-    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(unresolved),
-      List(List("numeric")))
+    val a = $"a".binary
+    val neverResolves = Cast(a, LongType)
+    assert(!neverResolves.resolved)
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(neverResolves),
+      List(List("binary")))
     val pruned = prune(node, LocalRelation(a))
     assert(pruned.transpiledOptions.isEmpty)
     assert(pruned.optionInputCategories.isEmpty)
   }
 
   test("keeps a resolved option and drops a sibling that does not resolve") {
-    val a = $"a".long
-    val good = Add(a, Literal(1L))
-    val bad = UnresolvedAttribute("no_such_col")
-    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(good, bad),
-      List(List("numeric"), List("numeric")))
+    val a = $"a".binary
+    val good = Cast(a, StringType)
+    val bad = Cast(a, LongType)
+    assert(good.resolved && !bad.resolved)
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a), StringType), List(good, bad),
+      List(List("binary"), List("binary")))
     val pruned = prune(node, LocalRelation(a))
     assert(pruned.transpiledOptions == List(good))
     assert(pruned.optionInputCategories.isEmpty)
+  }
+
+  test("full analysis drops an option that can never resolve instead of failing") {
+    val a = $"a".binary
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(Cast(a, LongType)),
+      List(List("binary")))
+    val analyzed = analyzeAndPrune(node, LocalRelation(a))
+    assert(analyzed.transpiledOptions.isEmpty)
+  }
+
+  test("full analysis keeps an option that is only resolved by a later rule") {
+    val a = $"a".string
+    val needsFunctionResolution = Cast(
+      UnresolvedFunction(Seq("concat"), Seq(a, Literal("x")), isDistinct = false), StringType)
+    assert(!needsFunctionResolution.resolved)
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a), StringType),
+      List(needsFunctionResolution), List(List("string")))
+    val analyzed = analyzeAndPrune(node, LocalRelation(a))
+    assert(analyzed.transpiledOptions.length == 1)
+    assert(analyzed.transpiledOptions.head.resolved)
+  }
+
+  test("full analysis keeps an option that is only resolved by type coercion") {
+    val a = $"a".string
+    val needsCoercion = Cast(Concat(Seq(a, Literal(1L))), StringType)
+    assert(!needsCoercion.resolved)
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a), StringType), List(needsCoercion),
+      List(List("string")))
+    val analyzed = analyzeAndPrune(node, LocalRelation(a))
+    assert(analyzed.transpiledOptions.length == 1)
+    assert(analyzed.transpiledOptions.head.resolved)
   }
 }
