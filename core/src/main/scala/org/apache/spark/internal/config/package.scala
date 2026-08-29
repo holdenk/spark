@@ -1817,6 +1817,8 @@ package object config {
       .createWithDefault(false)
 
   private[spark] val MASTER_REST_SERVER_ENABLED = ConfigBuilder("spark.master.rest.enabled")
+    .doc("In Spark version prior to 4.0 rest access is unauthenticated and should not be enabled" +
+      "in a shared environment.")
     .version("1.3.0")
     .booleanConf
     .createWithDefault(false)
