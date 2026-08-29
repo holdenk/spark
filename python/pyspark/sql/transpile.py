@@ -113,10 +113,8 @@ class AbstractTranspiler(object):
         also the list ``param_categories`` is keyed by.
 
         An override that reuses :class:`CatalystTranspiler`'s lowering must call
-        ``_reset_memos()`` after installing ``param_categories``, as that class
-        does. One instance lowers every input-type variant in turn, and its memos
-        cache answers derived under one ``param_categories``; carrying them into
-        the next variant lowers it under the wrong assumption, which analyses
+        ``_reset_memos()`` after installing ``param_categories``: skipping it lowers
+        the next variant under the previous one's memoized answers, which analyses
         cleanly and returns wrong data rather than failing.
         """
         pass
@@ -129,39 +127,24 @@ class CatalystTranspiler(AbstractTranspiler):
 
     def __init__(self) -> None:
         super().__init__()
-        # ``_transpile_from_ast`` sets both of these per variant before anything
-        # reads them, so this is not what makes them correct in production -- it
-        # is so that constructing a transpiler and calling an inference method
-        # directly, as the tests do, does not hit an uninitialised attribute.
+        # Tests construct this and call inference directly.
         self._param_categories: dict = {}
         self._reset_memos()
 
     def _reset_memos(self) -> None:
         """Drop every per-node memo. Called for each input-type variant.
 
-        One transpiler instance lowers every variant in turn against the same AST
-        (see ``_transpile_func``), so nodes -- and therefore memo keys -- are
-        shared across variants. ``_category_memo`` and ``_safe_category_memo``
-        hold answers derived under ``_param_categories``, so they cannot outlive
-        it. ``_boolean_memo`` is different -- its predicate reads only the node's
-        shape, so keeping it across variants would be sound, and would save
-        re-deriving boolean inference once per variant. It is dropped with the
-        rest anyway so there is one lifetime rule rather than two, and so a
-        predicate that later grows a dependency on the assumption cannot go
-        quietly stale.
-
-        Every memo lives here rather than in ``__init__`` so that adding one
-        cannot leave it uncleared, which would be a wrong answer, not a crash.
-
-        A cached category also depends on ``params``, since ``_category`` resolves
-        a parameter name through ``params.index(name)``. That is safe only because
-        ``params`` is threaded unchanged through one lowering; whoever implements
-        SPARK-55207 (assignments, class vars, closures) introduces a second scope
-        and has to key on it or reset per scope.
+        Nodes are shared across variants. ``_category_memo`` and
+        ``_safe_category_memo`` hold answers derived under ``_param_categories``
+        and cannot outlive it; ``_boolean_memo``/``_basic_type_memo`` read only a
+        node's shape and would stay valid, but are dropped too for one lifetime
+        rule instead of two. SPARK-55207 (assignments / closures) has to key or
+        reset per scope.
         """
         self._category_memo: dict[ast.AST, str] = {}
         self._safe_category_memo: dict[ast.AST, Optional[str]] = {}
         self._boolean_memo: dict[ast.AST, bool] = {}
+        self._basic_type_memo: dict[ast.AST, bool] = {}
 
     # TODO (SPARK-55218): handle implicit-None return bodies like
     # ``def f(x): x + x`` -- no return statement means return None;
@@ -182,28 +165,7 @@ class CatalystTranspiler(AbstractTranspiler):
             return lit(None)
         return self._convert_chunk(params, statements[0])
 
-    # ------------------------------------------------------------------
-    # Static inference over the body's AST. ``_category``, ``_safe_category``
-    # and ``_is_definitely_boolean`` memoize per node -- see ``_category`` for
-    # why, and ``_reset_memos`` for how long an entry lives. Two notes:
-    #
-    # * The memo lookup is inlined in each method rather than delegated to from a
-    #   wrapper, and the same goes for anything else that costs a stack frame per
-    #   recursion level -- a nested helper, a generator expression in place of a
-    #   plain ``and``. These recurse once per level of expression nesting, so each
-    #   such frame roughly halves the body size accepted before RecursionError,
-    #   and ``_transpile_func`` catches RecursionError and falls back, so the cost
-    #   is lowering silently lost rather than an error. It only bites where source
-    #   can actually nest that deep: an operand chain or a right-associative
-    #   ternary chain, neither of which needs parentheses. ``BoolOp`` nesting does
-    #   need them and so stops at the tokenizer's ~200 cap first, which is why the
-    #   generator expressions in ``_is_definitely_boolean`` are left alone.
-    # * ``_is_definitely_basic_type`` is deliberately not memoized: the
-    #   ``Compare`` arm is its only caller, and that arm's own memo means each
-    #   comparison is inspected once, so its walk never repeats. Both halves of
-    #   that are asserted by
-    #   ``test_udf_transpile_basic_type_predicate_never_revisits_a_node``.
-    # ------------------------------------------------------------------
+    # Static inference. Memoized per node; lookup is inlined -- see ``_category``.
 
     def _is_definitely_basic_type(self, node: ast.AST) -> bool:
         """
@@ -212,19 +174,23 @@ class CatalystTranspiler(AbstractTranspiler):
         All ast.Name's are treated as basic types for now this will need to be updated
         if/when we add free variables / closures to transpilation.
         """
+        if node in self._basic_type_memo:
+            return self._basic_type_memo[node]
         match node:
             case ast.Constant():
-                return True
+                basic = True
             case ast.BinOp(left=left, right=right):
-                # Bound once only so the plain ``and`` fits the line limit.
-                basic = self._is_definitely_basic_type
-                return basic(left) and basic(right)
+                basic = self._is_definitely_basic_type(left) and self._is_definitely_basic_type(
+                    right
+                )
             case ast.UnaryOp(operand=operand):
-                return self._is_definitely_basic_type(operand)
+                basic = self._is_definitely_basic_type(operand)
             case ast.Name():
-                return True
+                basic = True
             case _:
-                return False
+                basic = False
+        self._basic_type_memo[node] = basic
+        return basic
 
     def _is_definitely_boolean(self, node: ast.AST) -> bool:
         """Return True when ``node`` is statically guaranteed to produce a Python
@@ -452,29 +418,22 @@ class CatalystTranspiler(AbstractTranspiler):
         return when(null_guard, raise_error(err)).otherwise(op(left_col, right_col))
 
     def _category(self, params: List[str], node: ast.AST) -> str:
-        """Infer ``"numeric"`` or ``"string"`` for ``node`` under the current
+        """Infer a column category for ``node`` under the current
         ``self._param_categories`` assumption (set per input-type variant).
 
+        Returns ``"numeric"``, ``"string"``, ``"bool"``, or ``"binary"``.
         Drives operator selection (``+`` -> add vs concat, ``*`` -> multiply vs
         repeat) and raises ``UnsupportedOperationException`` when an operator's
         operands are type-incompatible, so the caller drops that variant and the
         JVM picks another option / falls back to the Python UDF.
 
-        Memoized per AST node: ``_convert_chunk``'s ``BinOp`` arm classifies both
-        operands and then recurses into those same operands, which classify their
-        own children again, so without the memo every level re-walks a subtree an
-        enclosing level already walked -- O(nodes^2) driver-side, per variant.
-
-        The point is the bound, not the constant. Inference calls drop 6x-11x on
-        the bodies that drive each method, which is worth 1.36x of end-to-end
-        ``_transpile_func`` time at a ~975-operator body and ~1.0x at ordinary
-        sizes -- py4j ``Column`` construction in ``_convert_chunk`` dominates and
-        is not memoized. So this is not here to speed up typical UDFs; it is here
-        so a large body costs time proportional to its size rather than to its
-        square, which is what made the pathological end of the range degenerate.
+        Memoized because ``_convert_chunk`` classifies a node and then recurses
+        into it, which would otherwise re-walk every subtree -- O(nodes^2) per
+        variant. The lookup is inlined: a wrapper frame halves the body size
+        accepted before RecursionError, and that exception is a silent fallback.
         """
-        # ``in``, not ``.get() is not None``, matching the other two memos: it
-        # stays correct if a category is ever added that is falsy or None.
+        # ``in``, not ``.get() is not None``: stays correct if a category is
+        # ever added that is falsy or None.
         if node in self._category_memo:
             return self._category_memo[node]
         category: str
@@ -530,11 +489,10 @@ class CatalystTranspiler(AbstractTranspiler):
                 # None-literal branch adopts the other branch's category (NULL
                 # unifies with any type in the lowered CASE WHEN); mismatched or
                 # all-None branches raise so the variant is dropped.
-                # Inline rather than a nested helper: this recurses once per level
-                # of ternary nesting, and a right-associative chain needs no
-                # parentheses, so it is the one recursion path here that a frame
-                # per level really bounds (measured 497 nested ternaries with a
-                # helper, 994 without).
+                # Inline rather than a nested helper: this recurses once per
+                # level of ternary nesting, and a right-associative chain needs
+                # no parentheses, so an extra frame per level halves the
+                # RecursionError ceiling.
                 cats: List[Optional[str]] = []
                 for branch in (if_body, if_orelse):
                     bare_none = isinstance(branch, ast.Constant) and branch.value is None
@@ -839,9 +797,9 @@ class CatalystTranspiler(AbstractTranspiler):
         # Short circuit on nothing to transpile.
         if src == "" or ast_info is None:
             return None
-        # Per-variant input-type assumption ({public_param_index -> category}),
-        # read by ``_category`` to choose str vs numeric operators. The memos
-        # cache answers relative to it, so they go when it changes.
+        # Per-variant input-type assumption ({public_param_index -> category}).
+        # Reset memos with it: one instance lowers every variant against the
+        # same AST.
         self._param_categories = param_categories or {}
         self._reset_memos()
         function_body = function_ast.body

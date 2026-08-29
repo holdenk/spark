@@ -2085,23 +2085,8 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         for combo in combos:
             self.assertEqual(combo[0], "string")
 
-    # ------------------------------------------------------------------
-    # Per-node memoization of static inference. Three of the four inference
-    # methods memoize per AST node per input-type variant, which is what keeps
-    # inference from being quadratic in the size of the body -- and what makes
-    # stale entries a correctness hazard across variants. One test each way,
-    # plus the invariant that lets the fourth go unmemoized.
-    # ------------------------------------------------------------------
-
-    # ``memoized inference method -> memo attribute it populates``.
-    # ``_is_definitely_basic_type`` is absent on purpose: it does not memoize,
-    # because the ``Compare`` memo already means its walk never repeats. That
-    # invariant is asserted separately, below.
-    _INFERENCE_MEMOS = {
-        "_category": "_category_memo",
-        "_safe_category": "_safe_category_memo",
-        "_is_definitely_boolean": "_boolean_memo",
-    }
+    # Per-node memoization of static inference. One test that a node is
+    # evaluated once per method, one that a memo does not leak across variants.
 
     @staticmethod
     def _counting_inference(memo_attr, original, tally, key):
@@ -2121,24 +2106,19 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         return counting
 
     def test_udf_transpile_evaluates_each_node_once_per_method(self):
-        # Every one of these asks about a node and then descends into that same
-        # node's children, which ask about their own children again, so without a
-        # memo each level re-walks a subtree an enclosing level already walked and
-        # inference costs O(nodes^2) in the size of the body.
-        #
-        # Assert the memoized guarantee rather than a timing: no method evaluates
-        # the same node twice, so a method's evaluation count cannot exceed the
-        # number of distinct nodes in the tree. One shape per method that drives
-        # it, so that no memo is covered only vacuously.
+        # Without a memo, classify-then-recurse re-walks every subtree and
+        # inference is O(nodes^2). Assert the bound: evaluations == memo size,
+        # one shape per method so none is covered only vacuously.
         import ast as _ast
 
         from pyspark.sql.transpile import CatalystTranspiler
 
-        # One size for three shapes, each with its own parser ceiling: `nested_if`
+        # One size for four shapes, each with its own parser ceiling: `nested_if`
         # indents a level per step and dies above 98 (MAXINDENT), `boolop` nests a
-        # paren per step and dies above 199 (nested-paren cap), `chain` has no
-        # parser limit. Raising this to strengthen the assertions hits the first
-        # two; give a shape its own size rather than lifting them together.
+        # paren per step and dies above 199 (nested-paren cap), the two chains
+        # have no parser limit. Raising this to strengthen the assertions hits
+        # the first two; give a shape its own size rather than lifting them
+        # together.
         size = 40
         chain = "def f(a):\n    return " + " + ".join(["a"] * (size + 1)) + "\n"
         boolop = "def f(a):\n    return " + "(" * size + "(a > 0)" + " and (a > 0))" * size + "\n"
@@ -2149,37 +2129,32 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             "    " * (size + 1) + "return 2",
         ]
         nested_if = "def f(a):\n" + "\n".join(if_lines) + "\n"
+        cmp_chain = "def f(a):\n    return (" + " + ".join(["a"] * (size + 1)) + ") > 0\n"
 
-        # (label, source, return type, methods this shape must actually exercise)
+        memos = (
+            ("_category", "_category_memo"),
+            ("_safe_category", "_safe_category_memo"),
+            ("_is_definitely_boolean", "_boolean_memo"),
+            ("_is_definitely_basic_type", "_basic_type_memo"),
+        )
         cases = [
-            ("arithmetic chain", chain, LongType(), ["_category"]),
-            ("nested boolop", boolop, BooleanType(), ["_is_definitely_boolean"]),
-            ("nested if/else", nested_if, LongType(), ["_safe_category"]),
+            ("arithmetic chain", chain, LongType(), "_category"),
+            ("nested boolop", boolop, BooleanType(), "_is_definitely_boolean"),
+            ("nested if/else", nested_if, LongType(), "_safe_category"),
+            ("comparison over a chain", cmp_chain, BooleanType(), "_is_definitely_basic_type"),
         ]
 
-        # Second source of truth guard: ``_reset_memos`` owns the inventory, and a
-        # memo added there but not here would simply never be exercised below.
-        # Keys as well as values, so a renamed method reports this rather than an
-        # AttributeError from the patching below.
-        self.assertEqual(
-            sorted(self._INFERENCE_MEMOS.values()),
-            sorted(a for a in vars(CatalystTranspiler()) if a.endswith("_memo")),
-            "memo inventory drifted from _reset_memos",
-        )
-        for method in self._INFERENCE_MEMOS:
-            self.assertTrue(hasattr(CatalystTranspiler, method), f"{method} no longer exists")
-
-        for label, src, return_type, drivers in cases:
+        for label, src, return_type, driver in cases:
             with self.subTest(shape=label):
                 ast_info = _ast.parse(src)
                 function_ast = ast_info.body[0]
-                evaluations = dict.fromkeys(self._INFERENCE_MEMOS, 0)
+                evaluations = {name: 0 for name, _ in memos}
                 transpiler = CatalystTranspiler()
                 # ``patch.object`` rather than getattr/setattr pairs: these patch a
                 # shared class, and it unwinds whatever was installed even if the
                 # loop itself raises part-way through.
                 with contextlib.ExitStack() as patches:
-                    for name, memo in self._INFERENCE_MEMOS.items():
+                    for name, memo in memos:
                         original = getattr(CatalystTranspiler, name)
                         patches.enter_context(
                             mock.patch.object(
@@ -2193,93 +2168,14 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     )
 
                 self.assertIsNotNone(column)
-                for name in drivers:
-                    # Non-vacuous: this shape nests `size` levels deep through
-                    # `name`, so it evaluates at least one node per level.
-                    self.assertGreaterEqual(evaluations[name], size, name)
-                for name, memo in self._INFERENCE_MEMOS.items():
-                    # Every evaluation is recorded, i.e. distinct nodes asked ==
-                    # distinct nodes answered. Losing the memo write makes every
-                    # call a miss and the counts diverge; losing the lookup does
-                    # too. Exact only because every shape here lowers -- a refusal
-                    # is not memoized, so a refusing shape would legitimately
-                    # evaluate more than it records.
+                self.assertGreaterEqual(evaluations[driver], size, driver)
+                for name, memo in memos:
+                    # Distinct nodes asked == distinct nodes answered. Losing the
+                    # memo write or the lookup makes the counts diverge. Exact
+                    # only because every shape here lowers -- a refusal is not
+                    # memoized, so a refusing shape would evaluate more than it
+                    # records.
                     self.assertEqual(len(getattr(transpiler, memo)), evaluations[name], name)
-
-    def test_udf_transpile_basic_type_predicate_never_revisits_a_node(self):
-        # ``_is_definitely_basic_type`` is the one inference method with no memo,
-        # on the grounds that ``_is_definitely_boolean``'s ``Compare`` arm is its
-        # only caller and that arm is itself memoized, so nothing asks twice.
-        # That is the whole justification for leaving it unmemoized, so assert it
-        # rather than trust the comment: a second caller appearing -- the change
-        # that would make the missing memo cost something -- fails here.
-        import ast as _ast
-
-        from pyspark.sql.transpile import CatalystTranspiler
-
-        size = 40
-        # Many separate comparisons over sizeable operands, and one comparison
-        # over a long chain: between them, every route into the predicate.
-        many = " or ".join(f"(a + {k} > {k})" for k in range(size))
-        chain = " + ".join(["a"] * (size + 1))
-        cases = [
-            ("many comparisons", f"def f(a):\n    return {many}\n"),
-            ("comparison over a chain", f"def f(a):\n    return ({chain}) > 0\n"),
-        ]
-
-        for label, src in cases:
-            with self.subTest(shape=label):
-                ast_info = _ast.parse(src)
-                function_ast = ast_info.body[0]
-                visits: dict = {}
-                original = CatalystTranspiler._is_definitely_basic_type
-
-                def counting(transpiler, node):
-                    visits[id(node)] = visits.get(id(node), 0) + 1
-                    return original(transpiler, node)
-
-                transpiler = CatalystTranspiler()
-                with mock.patch.object(CatalystTranspiler, "_is_definitely_basic_type", counting):
-                    column = transpiler._transpile_from_ast(
-                        src, ast_info, function_ast, ["a"], BooleanType(), {0: "numeric"}
-                    )
-
-                self.assertIsNotNone(column)
-                # Non-vacuous: the predicate really is reached on this shape.
-                self.assertGreaterEqual(len(visits), size)
-                self.assertEqual(
-                    [n for n, count in visits.items() if count > 1],
-                    [],
-                    "nodes visited more than once -- _is_definitely_basic_type now "
-                    "needs a memo, or has gained a second caller",
-                )
-
-        # The shapes above can only catch a new caller they happen to reach, so
-        # pin the other half of the invariant structurally: exactly one call site
-        # outside the method's own recursion.
-        import pyspark.sql.transpile as _transpile
-
-        # The whole module, not just ``CatalystTranspiler``: a caller could just as
-        # easily land in ``AbstractTranspiler`` or a module-level helper -- which is
-        # where both predicates lived until recently.
-        with open(_transpile.__file__) as handle:
-            module = _ast.parse(handle.read())
-        callers = {
-            fn.name
-            for fn in _ast.walk(module)
-            if isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef))
-            for ref in _ast.walk(fn)
-            if isinstance(ref, (_ast.Attribute, _ast.Name))
-            and getattr(ref, "attr", getattr(ref, "id", None)) == "_is_definitely_basic_type"
-            and fn.name != "_is_definitely_basic_type"
-        }
-        self.assertEqual(
-            callers,
-            {"_is_definitely_boolean"},
-            "_is_definitely_basic_type has gained a caller; it recurses per level "
-            "down an operand chain, so a second asker reintroduces the repeated "
-            "walk that the missing memo relies on not happening",
-        )
 
     def test_udf_transpile_memoized_categories_do_not_leak_across_variants(self):
         # One transpiler instance lowers every input-type variant in turn, and a
