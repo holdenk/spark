@@ -421,13 +421,33 @@ private[client] object GrpcExceptionConverter {
   }
 
   /**
+   * Upper bound on the length of a reconstructed cause chain. The indices come from a
+   * (potentially untrusted) server response, so the walk must terminate for arbitrary input.
+   */
+  private val MAX_ERROR_CHAIN_DEPTH = 64
+
+  /**
    * errorsToThrowable reconstructs the exception based on a list of protobuf messages
    * FetchErrorDetailsResponse.Error with un-truncated error messages and server-side stacktrace
    * (if set).
    */
   private[client] def errorsToThrowable(
       errorIdx: Int,
-      errors: Seq[FetchErrorDetailsResponse.Error]): Throwable = {
+      errors: Seq[FetchErrorDetailsResponse.Error]): Throwable =
+    errorsToThrowable(errorIdx, errors, visited = Set.empty)
+
+  private def errorsToThrowable(
+      errorIdx: Int,
+      errors: Seq[FetchErrorDetailsResponse.Error],
+      visited: Set[Int]): Throwable = {
+
+    // The index comes from server-supplied data; validate it instead of trusting it so a
+    // hostile or buggy server cannot crash the client with a cyclic or out-of-range
+    // cause_idx (unbounded recursion => StackOverflowError).
+    if (errorIdx < 0 || errorIdx >= errors.size) {
+      return new SparkException(
+        s"Invalid error index: $errorIdx (server returned ${errors.size} errors)")
+    }
 
     val error = errors(errorIdx)
     val classHierarchy = error.getErrorTypeHierarchyList.asScala
@@ -441,8 +461,17 @@ private[client] object GrpcExceptionConverter {
             .get(classOf[SparkException].getName)
             .get(params.copy(message = s"${classHierarchy.head}: ${params.message}")))
 
+    // Only follow a cause index that is in range, not yet visited (cycle guard) and within
+    // the chain-depth bound; otherwise drop the cause and keep the reconstructed exception.
+    val visitedWithCurrent = visited + errorIdx
     val causeOpt =
-      if (error.hasCauseIdx) Some(errorsToThrowable(error.getCauseIdx, errors)) else None
+      if (error.hasCauseIdx && error.getCauseIdx >= 0 && error.getCauseIdx < errors.size &&
+          !visitedWithCurrent.contains(error.getCauseIdx) &&
+          visitedWithCurrent.size < MAX_ERROR_CHAIN_DEPTH) {
+        Some(errorsToThrowable(error.getCauseIdx, errors, visitedWithCurrent))
+      } else {
+        None
+      }
 
     val errorClass = if (error.hasSparkThrowable && error.getSparkThrowable.hasErrorClass) {
       Some(error.getSparkThrowable.getErrorClass)

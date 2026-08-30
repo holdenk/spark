@@ -394,6 +394,40 @@ class SparkConnectClientSuite extends ConnectFunSuite {
     }
   }
 
+  test("errorsToThrowable terminates on cyclic or out-of-range cause_idx") {
+    def err(message: String, causeIdx: Option[Int]): proto.FetchErrorDetailsResponse.Error = {
+      val builder = proto.FetchErrorDetailsResponse.Error
+        .newBuilder()
+        .setMessage(message)
+        .addErrorTypeHierarchy("java.lang.RuntimeException")
+      causeIdx.foreach(builder.setCauseIdx)
+      builder.build()
+    }
+
+    // Self-referencing cause: the cycle is cut instead of recursing until StackOverflowError.
+    val selfCycle = GrpcExceptionConverter.errorsToThrowable(0, Seq(err("self", Some(0))))
+    assert(selfCycle.getMessage.contains("self"))
+    assert(selfCycle.getCause == null)
+
+    // Mutual cycle: each error is materialized at most once.
+    val mutual = GrpcExceptionConverter.errorsToThrowable(
+      0,
+      Seq(err("first", Some(1)), err("second", Some(0))))
+    assert(mutual.getMessage.contains("first"))
+    assert(mutual.getCause != null)
+    assert(mutual.getCause.getMessage.contains("second"))
+    assert(mutual.getCause.getCause == null)
+
+    // An out-of-range cause index is dropped instead of throwing.
+    val dangling = GrpcExceptionConverter.errorsToThrowable(0, Seq(err("dangling", Some(42))))
+    assert(dangling.getMessage.contains("dangling"))
+    assert(dangling.getCause == null)
+
+    // An out-of-range root index yields a flat exception instead of an uncontrolled failure.
+    val invalidRoot = GrpcExceptionConverter.errorsToThrowable(7, Seq(err("x", None)))
+    assert(invalidRoot.isInstanceOf[SparkException])
+  }
+
   private case class TestPackURI(
       connectionString: String,
       isCorrect: Boolean,
