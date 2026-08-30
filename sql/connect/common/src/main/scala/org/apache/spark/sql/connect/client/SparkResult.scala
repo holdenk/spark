@@ -430,7 +430,9 @@ private[sql] object SparkResult {
     if (metric.hasRootErrorIdx) {
       Failure(
         GrpcExceptionConverter
-          .errorsToThrowable(metric.getRootErrorIdx, metric.getErrorsList.asScala.toSeq))
+          // toIndexedSeq: errorsToThrowable indexes into this by errorIdx and causeIdx at
+          // every level of the (server-bounded) cause chain, same as the other call site.
+          .errorsToThrowable(metric.getRootErrorIdx, metric.getErrorsList.asScala.toIndexedSeq))
     } else {
       assert(metric.getKeysCount == metric.getValuesCount)
       var schema = new StructType()

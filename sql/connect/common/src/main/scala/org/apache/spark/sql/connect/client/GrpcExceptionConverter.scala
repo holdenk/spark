@@ -142,7 +142,9 @@ private[client] class GrpcExceptionConverter(
       Some(
         errorsToThrowable(
           errorDetailsResponse.getRootErrorIdx,
-          errorDetailsResponse.getErrorsList.asScala.toSeq))
+          // IndexedSeq, not toSeq's List: errorsToThrowable indexes into this by errorIdx and
+          // causeIdx at every level of the (server-bounded) cause chain.
+          errorDetailsResponse.getErrorsList.asScala.toIndexedSeq))
     } catch {
       case e: StatusRuntimeException =>
         logWarning("Unable to fetch enriched error", e)
@@ -421,8 +423,11 @@ private[client] object GrpcExceptionConverter {
   }
 
   /**
-   * Upper bound on the length of a reconstructed cause chain. The indices come from a
-   * (potentially untrusted) server response, so the walk must terminate for arbitrary input.
+   * Upper bound on the length of a reconstructed cause chain. The cycle guard (visited set)
+   * already bounds recursion to at most errors.size levels; this cap additionally bounds stack
+   * depth well below that when a server sends a very long acyclic chain. Independent of, and a
+   * safe superset of, the server-side cap at ErrorUtils.MAX_ERROR_CHAIN_LENGTH -- not the same
+   * constant, so the two can drift.
    */
   private val MAX_ERROR_CHAIN_DEPTH = 64
 
@@ -445,8 +450,23 @@ private[client] object GrpcExceptionConverter {
     // hostile or buggy server cannot crash the client with a cyclic or out-of-range
     // cause_idx (unbounded recursion => StackOverflowError).
     if (errorIdx < 0 || errorIdx >= errors.size) {
+      // Routed through resolveParams like every other exception this converter builds, so
+      // this path also gets the guaranteed XXKCM/errorClass fallback instead of nulls.
+      val params = resolveParams(
+        ErrorParams(
+          message = s"Invalid error index: $errorIdx (server returned ${errors.size} errors)",
+          cause = None,
+          errorClass = None,
+          messageParameters = Map.empty,
+          queryContext = Array.empty,
+          sqlState = None))
       return new SparkException(
-        s"Invalid error index: $errorIdx (server returned ${errors.size} errors)")
+        message = params.message,
+        cause = null,
+        errorClass = params.errorClass,
+        messageParameters = Map.empty,
+        context = Array.empty,
+        sqlState = params.sqlState)
     }
 
     val error = errors(errorIdx)
@@ -456,10 +476,12 @@ private[client] object GrpcExceptionConverter {
       classHierarchy
         .flatMap(errorFactory.get)
         .headOption
-        .getOrElse((params: ErrorParams) =>
+        .getOrElse((params: ErrorParams) => {
+          val declaredClass = classHierarchy.headOption.getOrElse("<unknown>")
           errorFactory
             .get(classOf[SparkException].getName)
-            .get(params.copy(message = s"${classHierarchy.head}: ${params.message}")))
+            .get(params.copy(message = s"$declaredClass: ${params.message}"))
+        })
 
     // Only follow a cause index that is in range, not yet visited (cycle guard) and within
     // the chain-depth bound; otherwise drop the cause and keep the reconstructed exception.

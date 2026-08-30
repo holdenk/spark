@@ -426,6 +426,16 @@ class SparkConnectClientSuite extends ConnectFunSuite {
     // An out-of-range root index yields a flat exception instead of an uncontrolled failure.
     val invalidRoot = GrpcExceptionConverter.errorsToThrowable(7, Seq(err("x", None)))
     assert(invalidRoot.isInstanceOf[SparkException])
+    assert(invalidRoot.getMessage.contains("Invalid error index"))
+
+    // An error with no declared type hierarchy falls back cleanly, not NoSuchElementException.
+    val noHierarchy = proto.FetchErrorDetailsResponse.Error
+      .newBuilder()
+      .setMessage("untyped")
+      .build()
+    val untyped = GrpcExceptionConverter.errorsToThrowable(0, Seq(noHierarchy))
+    assert(untyped.isInstanceOf[SparkException])
+    assert(untyped.getMessage.contains("untyped"))
   }
 
   private case class TestPackURI(
