@@ -57,6 +57,7 @@ private[spark] class SecurityManager(
 
   private val authOn = sparkConf.get(NETWORK_AUTH_ENABLED)
   private var aclsOn = sparkConf.get(ACLS_ENABLE)
+  private val allowNullUserInAcls = sparkConf.get(ACLS_ALLOW_NULL_USER)
 
   // admin acls should be set before view or modify acls
   private var adminAcls: Set[String] = sparkConf.get(ADMIN_ACLS).toSet
@@ -229,9 +230,9 @@ private[spark] class SecurityManager(
   /**
    * Checks the given user against the view acl and groups list to see if they have
    * authorization to view the UI. If the UI acls are disabled
-   * via spark.acls.enable, all users have view access. If the user is null
-   * it is assumed authentication is off and all users have access. Also if any one of the
-   * UI acls or groups specify the WILDCARD(*) then all users have view access.
+   * via spark.acls.enable, all users have view access. If the user is null and acls are
+   * enabled, access is denied unless spark.acls.allowNullUser is set. Also if any one of the
+   * UI acls or groups specify the WILDCARD(*) then all authenticated users have view access.
    *
    * @param user to see if is authorized
    * @return true is the user has permission, otherwise false
@@ -245,9 +246,10 @@ private[spark] class SecurityManager(
   /**
    * Checks the given user against the modify acl and groups list to see if they have
    * authorization to modify the application. If the modify acls are disabled
-   * via spark.acls.enable, all users have modify access. If the user is null
-   * it is assumed authentication isn't turned on and all users have access. Also if any one
-   * of the modify acls or groups specify the WILDCARD(*) then all users have modify access.
+   * via spark.acls.enable, all users have modify access. If the user is null and acls are
+   * enabled, access is denied unless spark.acls.allowNullUser is set. Also if any one
+   * of the modify acls or groups specify the WILDCARD(*) then all authenticated users have
+   * modify access.
    *
    * @param user to see if is authorized
    * @return true is the user has permission, otherwise false
@@ -375,8 +377,17 @@ private[spark] class SecurityManager(
       user: String,
       aclUsers: Set[String],
       aclGroups: Set[String]): Boolean = {
-    if (user == null ||
-        !aclsEnabled ||
+    if (user == null) {
+      // A null user means no authentication filter established an identity for the request.
+      // Deny such requests when ACLs are enabled, unless the legacy behavior is restored.
+      if (aclsEnabled() && !allowNullUserInAcls) {
+        logDebug("ACLs are enabled and the request has no authenticated user; denying access. " +
+          s"Set ${ACLS_ALLOW_NULL_USER.key}=true to allow requests without a user.")
+        false
+      } else {
+        true
+      }
+    } else if (!aclsEnabled() ||
         aclUsers.contains(WILDCARD_ACL) ||
         aclUsers.contains(user) ||
         aclGroups.contains(WILDCARD_ACL)) {
