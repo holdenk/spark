@@ -180,7 +180,7 @@ $(document).ready(function() {
       var conf = {
         "data": array,
         "columns": [
-          {name: 'version', data: 'version' },
+          {name: 'version', data: 'version', render: (version) => escapeHtml(version) },
           {
             name: 'appId',
             type: "appid-numeric",
