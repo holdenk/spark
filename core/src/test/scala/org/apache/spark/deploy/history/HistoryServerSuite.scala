@@ -639,8 +639,8 @@ abstract class HistoryServerSuite extends SparkFunSuite with BeforeAndAfter with
       (owner, HttpServletResponse.SC_OK),
       (admin, HttpServletResponse.SC_OK),
       (other, HttpServletResponse.SC_FORBIDDEN),
-      // When the remote user is null, the code behaves as if auth were disabled.
-      (null, HttpServletResponse.SC_OK))
+      // Requests without an authenticated user are denied when ACLs are enabled.
+      (null, HttpServletResponse.SC_FORBIDDEN))
 
     val port = server.boundPort
     val testUrls = Seq(
