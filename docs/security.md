@@ -334,8 +334,8 @@ ACLs can be configured for either users or groups. Configuration entries accept 
 lists as input, meaning multiple users or groups can be given the desired privileges. This can be
 used if you run on a shared cluster and have a set of administrators or developers who need to
 monitor applications they may not have started themselves. A wildcard (`*`) added to specific ACL
-means that all users will have the respective privilege. By default, only the user submitting the
-application is added to the ACLs.
+means that all authenticated users will have the respective privilege. By default, only the user
+submitting the application is added to the ACLs.
 
 Group membership is established by using a configurable group mapping provider. The mapper is
 configured using the <code>spark.user.groups.mapping</code> config option, described in the table
@@ -362,7 +362,9 @@ The following options control the authentication of Web UIs:
   <td>None</td>
   <td>
     Spark supports HTTP <code>Authorization</code> header with a cryptographically signed
-    JSON Web Token via <code>org.apache.spark.ui.JWSFilter</code>. <br />
+    JSON Web Token via <code>org.apache.spark.ui.JWSFilter</code>. If the verified token
+    carries a <code>sub</code> (subject) claim, it is exposed as the request's remote user
+    for downstream authorization. <br />
     See the <a href="configuration.html#spark-ui">Spark UI</a> configuration for how to configure
     filters.
   </td>
@@ -374,9 +376,20 @@ The following options control the authentication of Web UIs:
   <td>
     Whether UI ACLs should be enabled. If enabled, this checks to see if the user has access
     permissions to view or modify the application. Note this requires the user to be authenticated,
-    so if no authentication filter is installed, this option does not do anything.
+    so an authentication filter that establishes the remote user should be installed; requests
+    that carry no authenticated user are denied unless <code>spark.acls.allowNullUser</code>
+    is set to true.
   </td>
   <td>1.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.acls.allowNullUser</code></td>
+  <td>false</td>
+  <td>
+    Whether to authorize requests that carry no authenticated user identity (a null remote
+    user) when ACLs are enabled. Set to true to restore the behavior of earlier releases.
+  </td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.admin.acls</code></td>
