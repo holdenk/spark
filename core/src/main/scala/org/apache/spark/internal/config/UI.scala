@@ -221,6 +221,14 @@ private[spark] object UI {
     .booleanConf
     .createWithDefault(false)
 
+  val ACLS_ALLOW_NULL_USER = ConfigBuilder("spark.acls.allowNullUser")
+    .doc("Whether to authorize requests that carry no authenticated user identity (a null " +
+      "remote user) when ACLs are enabled. When false, such requests are denied. Set to " +
+      "true to restore the behavior of earlier releases.")
+    .version("4.4.0")
+    .booleanConf
+    .createWithDefault(false)
+
   val UI_VIEW_ACLS = ConfigBuilder("spark.ui.view.acls")
     .version("1.0.0")
     .stringConf
