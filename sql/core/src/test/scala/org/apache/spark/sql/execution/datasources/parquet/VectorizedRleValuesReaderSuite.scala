@@ -17,12 +17,14 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.PrimitiveIterator
 
 import scala.jdk.CollectionConverters._
 
 import org.apache.parquet.bytes.ByteBufferInputStream
+import org.apache.parquet.io.ParquetDecodingException
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.execution.datasources.parquet.VectorizedRleValuesReaderTestUtils._
@@ -185,9 +187,84 @@ class VectorizedRleValuesReaderSuite extends SparkFunSuite {
       produced += toRead
     }
   }
+
+  test("invalid PACKED header: overflowing value count is rejected") {
+    // numGroups = 2^28 overflows `numGroups * 8` to a negative Int currentCount, which
+    // would send readBatch's leftInPage accounting backwards. Assert on the message:
+    // without the validation this also throws, but as a wrapped end-of-stream failure.
+    val e = intercept[ParquetDecodingException] {
+      packedPageReader(numGroups = 1 << 28, pageValueCount = 1024).readInteger()
+    }
+    assert(e.getMessage.contains("Invalid bit-packed run"))
+  }
+
+  test("invalid PACKED header: count beyond the page byte budget is rejected pre-allocation") {
+    // numGroups = 2^27 would allocate a ~4GB int buffer for a page with only a handful
+    // of bytes left.
+    val e = intercept[ParquetDecodingException] {
+      packedPageReader(numGroups = 1 << 27, pageValueCount = 1024).readInteger()
+    }
+    assert(e.getMessage.contains("Invalid bit-packed run"))
+  }
+
+  test("invalid RLE header: run longer than the page's value count is rejected") {
+    val out = new ByteArrayOutputStream()
+    writeUnsignedVarInt(out, 1L << 21) // RLE header (LSB 0): run of 2^20 values
+    out.write(1) // the repeated value (bitWidth 1 -> one byte)
+    val reader = new VectorizedRleValuesReader(1, false)
+    reader.initFromPage(1024, ByteBufferInputStream.wrap(ByteBuffer.wrap(out.toByteArray)))
+    intercept[ParquetDecodingException] {
+      reader.readInteger()
+    }
+  }
+
+  test("PACKED: value count not a multiple of 8 (final group is zero-padded)") {
+    // The last bit-packed group is padded to a multiple of 8 values, so a page of 1023
+    // values legitimately carries a run counting 1024 -- the validation's +7 allowance.
+    val defLevels = Array.tabulate(1023)(i => i & 1)
+    runAndAssert(defLevels, maxDef = 1, batchSize = 1023, withDefLevels = false)
+  }
+
+  test("truncated varint header is rejected") {
+    // A lone continuation byte: read() returns -1 at end of input, whose set 0x80 bit
+    // would otherwise keep the varint continuation loop alive.
+    val out = new ByteArrayOutputStream()
+    out.write(0x80)
+    val reader = new VectorizedRleValuesReader(1, false)
+    reader.initFromPage(1024, ByteBufferInputStream.wrap(ByteBuffer.wrap(out.toByteArray)))
+    intercept[ParquetDecodingException] {
+      reader.readInteger()
+    }
+  }
 }
 
 private object VectorizedRleValuesReaderSuite {
+
+  /**
+   * Builds a reader over a page whose body starts with a PACKED header (LSB 1) declaring
+   * `numGroups` bit-packed groups of 8 values each, followed by far fewer bytes than the
+   * numGroups * bitWidth the run requires.
+   */
+  private def packedPageReader(
+      numGroups: Int,
+      pageValueCount: Int): VectorizedRleValuesReader = {
+    val out = new ByteArrayOutputStream()
+    writeUnsignedVarInt(out, (numGroups.toLong << 1) | 1L)
+    out.write(Array[Byte](0, 0, 0, 0))
+    val reader = new VectorizedRleValuesReader(1, false)
+    reader.initFromPage(
+      pageValueCount, ByteBufferInputStream.wrap(ByteBuffer.wrap(out.toByteArray)))
+    reader
+  }
+
+  private def writeUnsignedVarInt(out: ByteArrayOutputStream, value: Long): Unit = {
+    var v = value
+    while ((v & ~0x7fL) != 0) {
+      out.write(((v & 0x7f) | 0x80).toInt)
+      v >>>= 7
+    }
+    out.write(v.toInt)
+  }
 
   /**
    * Runs readBatch end-to-end and asserts null-bits, non-null values, and def levels.
