@@ -260,8 +260,12 @@ private[spark] object RDDOperationGraph extends Logging {
       case DeterministicLevel.UNORDERED => " [Unordered]"
       case _ => ""
     }
+    // This label is declared with labelType="html" below and rendered as HTML in the
+    // browser, so the name and callsite must be HTML-escaped; escapeJava does NOT escape
+    // HTML metacharacters. Only the <br> separator is intentional markup.
+    val escapedName = Utility.escape(node.name)
     val escapedCallsite = Utility.escape(node.callsite)
-    val label = s"${node.name} [${node.id}]$isCached$isBarrier$outputDeterministicLevel" +
+    val label = s"$escapedName [${node.id}]$isCached$isBarrier$outputDeterministicLevel" +
       s"<br>${escapedCallsite}"
     s"""${node.id} [labelType="html" label="${StringEscapeUtils.escapeJava(label)}"]"""
   }
