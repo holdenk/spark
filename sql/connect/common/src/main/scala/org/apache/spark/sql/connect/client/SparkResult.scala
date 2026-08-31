@@ -430,8 +430,8 @@ private[sql] object SparkResult {
     if (metric.hasRootErrorIdx) {
       Failure(
         GrpcExceptionConverter
-          // toIndexedSeq: errorsToThrowable indexes into this by errorIdx and causeIdx at
-          // every level of the (server-bounded) cause chain, same as the other call site.
+          // toIndexedSeq, not toSeq: errorsToThrowable does errors(idx) by errorIdx and
+          // causeIdx, and errors.size is attacker-controlled -- a List makes each lookup O(n).
           .errorsToThrowable(metric.getRootErrorIdx, metric.getErrorsList.asScala.toIndexedSeq))
     } else {
       assert(metric.getKeysCount == metric.getValuesCount)

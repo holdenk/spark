@@ -405,26 +405,27 @@ class SparkConnectClientSuite extends ConnectFunSuite {
     }
 
     // Self-referencing cause: the cycle is cut instead of recursing until StackOverflowError.
-    val selfCycle = GrpcExceptionConverter.errorsToThrowable(0, Seq(err("self", Some(0))))
+    val selfCycle = GrpcExceptionConverter.errorsToThrowable(0, IndexedSeq(err("self", Some(0))))
     assert(selfCycle.getMessage.contains("self"))
     assert(selfCycle.getCause == null)
 
     // Mutual cycle: each error is materialized at most once.
     val mutual = GrpcExceptionConverter.errorsToThrowable(
       0,
-      Seq(err("first", Some(1)), err("second", Some(0))))
+      IndexedSeq(err("first", Some(1)), err("second", Some(0))))
     assert(mutual.getMessage.contains("first"))
     assert(mutual.getCause != null)
     assert(mutual.getCause.getMessage.contains("second"))
     assert(mutual.getCause.getCause == null)
 
     // An out-of-range cause index is dropped instead of throwing.
-    val dangling = GrpcExceptionConverter.errorsToThrowable(0, Seq(err("dangling", Some(42))))
+    val dangling =
+      GrpcExceptionConverter.errorsToThrowable(0, IndexedSeq(err("dangling", Some(42))))
     assert(dangling.getMessage.contains("dangling"))
     assert(dangling.getCause == null)
 
     // An out-of-range root index yields a flat exception instead of an uncontrolled failure.
-    val invalidRoot = GrpcExceptionConverter.errorsToThrowable(7, Seq(err("x", None)))
+    val invalidRoot = GrpcExceptionConverter.errorsToThrowable(7, IndexedSeq(err("x", None)))
     assert(invalidRoot.isInstanceOf[SparkException])
     assert(invalidRoot.getMessage.contains("Invalid error index"))
 
@@ -433,9 +434,36 @@ class SparkConnectClientSuite extends ConnectFunSuite {
       .newBuilder()
       .setMessage("untyped")
       .build()
-    val untyped = GrpcExceptionConverter.errorsToThrowable(0, Seq(noHierarchy))
+    val untyped = GrpcExceptionConverter.errorsToThrowable(0, IndexedSeq(noHierarchy))
     assert(untyped.isInstanceOf[SparkException])
     assert(untyped.getMessage.contains("untyped"))
+  }
+
+  test("errorsToThrowable caps chain depth on a long acyclic chain") {
+    def err(message: String, causeIdx: Option[Int]): proto.FetchErrorDetailsResponse.Error = {
+      val builder = proto.FetchErrorDetailsResponse.Error
+        .newBuilder()
+        .setMessage(message)
+        .addErrorTypeHierarchy("java.lang.RuntimeException")
+      causeIdx.foreach(builder.setCauseIdx)
+      builder.build()
+    }
+
+    // Every error's cause is the next one, no repeats -- the cycle guard never trips, only
+    // the separate MAX_ERROR_CHAIN_DEPTH cap does.
+    val chainLength = 1000
+    val errors = (0 until chainLength).map { i =>
+      val causeIdx = if (i == chainLength - 1) None else Some(i + 1)
+      err(s"level-$i", causeIdx)
+    }.toIndexedSeq
+
+    var depth = 0
+    var cause: Throwable = GrpcExceptionConverter.errorsToThrowable(0, errors)
+    while (cause != null) {
+      depth += 1
+      cause = cause.getCause
+    }
+    assert(depth < chainLength)
   }
 
   private case class TestPackURI(

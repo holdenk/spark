@@ -142,8 +142,6 @@ private[client] class GrpcExceptionConverter(
       Some(
         errorsToThrowable(
           errorDetailsResponse.getRootErrorIdx,
-          // IndexedSeq, not toSeq's List: errorsToThrowable indexes into this by errorIdx and
-          // causeIdx at every level of the (server-bounded) cause chain.
           errorDetailsResponse.getErrorsList.asScala.toIndexedSeq))
     } catch {
       case e: StatusRuntimeException =>
@@ -436,14 +434,16 @@ private[client] object GrpcExceptionConverter {
    * FetchErrorDetailsResponse.Error with un-truncated error messages and server-side stacktrace
    * (if set).
    */
+  // IndexedSeq, not Seq: every level of the walk below does errors(idx) by errorIdx and
+  // causeIdx, and errors.size is attacker-controlled -- a List makes each lookup O(n).
   private[client] def errorsToThrowable(
       errorIdx: Int,
-      errors: Seq[FetchErrorDetailsResponse.Error]): Throwable =
+      errors: IndexedSeq[FetchErrorDetailsResponse.Error]): Throwable =
     errorsToThrowable(errorIdx, errors, visited = Set.empty)
 
   private def errorsToThrowable(
       errorIdx: Int,
-      errors: Seq[FetchErrorDetailsResponse.Error],
+      errors: IndexedSeq[FetchErrorDetailsResponse.Error],
       visited: Set[Int]): Throwable = {
 
     // The index comes from server-supplied data; validate it instead of trusting it so a
@@ -464,8 +464,8 @@ private[client] object GrpcExceptionConverter {
         message = params.message,
         cause = null,
         errorClass = params.errorClass,
-        messageParameters = Map.empty,
-        context = Array.empty,
+        messageParameters = params.messageParameters,
+        context = params.queryContext,
         sqlState = params.sqlState)
     }
 
@@ -474,8 +474,7 @@ private[client] object GrpcExceptionConverter {
 
     val constructor =
       classHierarchy
-        .flatMap(errorFactory.get)
-        .headOption
+        .collectFirst(errorFactory)
         .getOrElse((params: ErrorParams) => {
           val declaredClass = classHierarchy.headOption.getOrElse("<unknown>")
           errorFactory
@@ -485,6 +484,8 @@ private[client] object GrpcExceptionConverter {
 
     // Only follow a cause index that is in range, not yet visited (cycle guard) and within
     // the chain-depth bound; otherwise drop the cause and keep the reconstructed exception.
+    // A drop here is silent by design: on a compliant server it never happens (the server's
+    // own chain is short and acyclic), so logging it would only add noise to the common path.
     val visitedWithCurrent = visited + errorIdx
     val causeOpt =
       if (error.hasCauseIdx && error.getCauseIdx >= 0 && error.getCauseIdx < errors.size &&
@@ -577,7 +578,7 @@ private[client] object GrpcExceptionConverter {
       builder.setSparkThrowable(sparkThrowableBuilder.build())
     }
 
-    errorsToThrowable(0, Seq(builder.build()))
+    errorsToThrowable(0, IndexedSeq(builder.build()))
   }
 
   /**
