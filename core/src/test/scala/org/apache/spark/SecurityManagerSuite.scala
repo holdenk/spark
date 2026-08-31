@@ -91,8 +91,33 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
 
     val securityManager3 = new SecurityManager(conf3)
     // BogusServiceProvider cannot be loaded and an error is logged returning an empty group set
-    assert(securityManager3.checkUIViewPermissions("user1") === false)
-    assert(securityManager3.checkUIViewPermissions("user2") === false)
+    assert(!securityManager3.checkUIViewPermissions("user1"))
+    assert(!securityManager3.checkUIViewPermissions("user2"))
+  }
+
+  test("ACLs deny requests without an authenticated user by default") {
+    val conf = new SparkConf
+    conf.set(ACLS_ENABLE, true)
+    conf.set(UI_VIEW_ACLS, Seq("user1"))
+    conf.set(MODIFY_ACLS, Seq("user1"))
+    val securityManager = new SecurityManager(conf)
+    assert(securityManager.checkUIViewPermissions(null) === false)
+    assert(securityManager.checkModifyPermissions(null) === false)
+    assert(securityManager.checkAdminPermissions(null) === false)
+
+    // With ACLs disabled a null user is still allowed: authorization is off entirely.
+    val confAclsOff = new SparkConf
+    val securityManagerAclsOff = new SecurityManager(confAclsOff)
+    assert(securityManagerAclsOff.checkUIViewPermissions(null))
+    assert(securityManagerAclsOff.checkModifyPermissions(null))
+
+    // The opt-out config restores the previous null-user behavior.
+    val legacyConf = new SparkConf
+    legacyConf.set(ACLS_ENABLE, true)
+    legacyConf.set(UI_VIEW_ACLS, Seq("user1"))
+    legacyConf.set(ACLS_ALLOW_NULL_USER, true)
+    val legacySecurityManager = new SecurityManager(legacyConf)
+    assert(legacySecurityManager.checkUIViewPermissions(null))
   }
 
   test("set security with api") {
@@ -115,7 +140,7 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkUIViewPermissions("user6"))
     assert(securityManager.checkUIViewPermissions("user7"))
     assert(securityManager.checkUIViewPermissions("user8") === false)
-    assert(securityManager.checkUIViewPermissions(null))
+    assert(securityManager.checkUIViewPermissions(null) === false)
   }
 
   test("set security with api for groups") {
@@ -173,7 +198,7 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkModifyPermissions("user6"))
     assert(securityManager.checkModifyPermissions("user7"))
     assert(securityManager.checkModifyPermissions("user8") === false)
-    assert(securityManager.checkModifyPermissions(null))
+    assert(securityManager.checkModifyPermissions(null) === false)
   }
 
   test("set security modify acls for groups") {
@@ -215,13 +240,13 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkModifyPermissions("user4"))
     assert(securityManager.checkModifyPermissions("user3") === false)
     assert(securityManager.checkModifyPermissions("user5") === false)
-    assert(securityManager.checkModifyPermissions(null))
+    assert(securityManager.checkModifyPermissions(null) === false)
     assert(securityManager.checkUIViewPermissions("user1"))
     assert(securityManager.checkUIViewPermissions("user2"))
     assert(securityManager.checkUIViewPermissions("user3"))
     assert(securityManager.checkUIViewPermissions("user4") === false)
     assert(securityManager.checkUIViewPermissions("user5") === false)
-    assert(securityManager.checkUIViewPermissions(null))
+    assert(securityManager.checkUIViewPermissions(null) === false)
 
     securityManager.setAdminAcls(Seq("user6"))
     securityManager.setViewAcls(Set[String]("user8"), Seq("user9"))
@@ -233,13 +258,13 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkModifyPermissions("user9"))
     assert(securityManager.checkModifyPermissions("user1") === false)
     assert(securityManager.checkModifyPermissions("user4") === false)
-    assert(securityManager.checkModifyPermissions(null))
+    assert(securityManager.checkModifyPermissions(null) === false)
     assert(securityManager.checkUIViewPermissions("user6"))
     assert(securityManager.checkUIViewPermissions("user8"))
     assert(securityManager.checkUIViewPermissions("user9"))
     assert(securityManager.checkUIViewPermissions("user1") === false)
     assert(securityManager.checkUIViewPermissions("user3") === false)
-    assert(securityManager.checkUIViewPermissions(null))
+    assert(securityManager.checkUIViewPermissions(null) === false)
   }
 
   test("set security admin acls for groups") {
@@ -300,6 +325,8 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkUIViewPermissions("user1"))
     assert(securityManager.checkUIViewPermissions("user5"))
     assert(securityManager.checkUIViewPermissions("user6"))
+    // the wildcard does not cover requests without an authenticated user
+    assert(securityManager.checkUIViewPermissions(null) === false)
     assert(securityManager.checkModifyPermissions("user4"))
     assert(securityManager.checkModifyPermissions("user7") === false)
     assert(securityManager.checkModifyPermissions("user8") === false)
