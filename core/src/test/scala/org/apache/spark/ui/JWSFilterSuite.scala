@@ -21,8 +21,12 @@ import java.util.{Base64, HashMap => JHashMap}
 
 import scala.jdk.CollectionConverters._
 
-import jakarta.servlet.{FilterChain, FilterConfig, ServletContext}
+import io.jsonwebtoken.Jwts
+import io.jsonwebtoken.io.Decoders
+import io.jsonwebtoken.security.Keys
+import jakarta.servlet.{FilterChain, FilterConfig, ServletContext, ServletRequest}
 import jakarta.servlet.http.{HttpServletRequest, HttpServletResponse}
+import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.{any, eq => meq}
 import org.mockito.Mockito.{mock, times, verify, when}
 
@@ -91,6 +95,50 @@ class JWSFilterSuite extends SparkFunSuite {
     when(req.getHeader("Authorization")).thenReturn(s"Bearer $TOKEN")
     filter.doFilter(req, res, chain)
     verify(chain, times(1)).doFilter(any(), any())
+  }
+
+  test("Should expose the JWT subject as the remote user") {
+    val req = mockRequest()
+    val res = mock(classOf[HttpServletResponse])
+    val chain = mock(classOf[FilterChain])
+
+    val filter = new JWSFilter()
+    val params = new JHashMap[String, String]
+    params.put("secretKey", TEST_KEY)
+    filter.init(new DummyFilterConfig(params))
+
+    val key = Keys.hmacShaKeyFor(Decoders.BASE64URL.decode(TEST_KEY))
+    val token = Jwts.builder().subject("user1").signWith(key).compact()
+    when(req.getHeader("Authorization")).thenReturn(s"Bearer $token")
+
+    val captor = ArgumentCaptor.forClass(classOf[ServletRequest])
+    filter.doFilter(req, res, chain)
+    verify(chain, times(1)).doFilter(captor.capture(), meq(res))
+    val forwarded = captor.getValue.asInstanceOf[HttpServletRequest]
+    assert(forwarded.getRemoteUser === "user1")
+    assert(forwarded.getUserPrincipal.getName === "user1")
+  }
+
+  test("Should keep a null remote user when the JWT has no subject") {
+    val req = mockRequest()
+    val res = mock(classOf[HttpServletResponse])
+    val chain = mock(classOf[FilterChain])
+
+    val filter = new JWSFilter()
+    val params = new JHashMap[String, String]
+    params.put("secretKey", TEST_KEY)
+    filter.init(new DummyFilterConfig(params))
+
+    // TOKEN has an empty payload ({}), so no subject claim is present.
+    when(req.getHeader("Authorization")).thenReturn(s"Bearer $TOKEN")
+
+    val captor = ArgumentCaptor.forClass(classOf[ServletRequest])
+    filter.doFilter(req, res, chain)
+    verify(chain, times(1)).doFilter(captor.capture(), meq(res))
+    // without a subject the request is forwarded unwrapped, with no identity attached
+    assert(captor.getValue eq req)
+    val forwarded = captor.getValue.asInstanceOf[HttpServletRequest]
+    assert(forwarded.getRemoteUser === null)
   }
 
   private def mockRequest(params: Map[String, Array[String]] = Map()): HttpServletRequest = {
