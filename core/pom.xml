@@ -61,6 +61,18 @@
       <groupId>com.twitter</groupId>
       <artifactId>chill-java</artifactId>
     </dependency>
+    <!--
+      SPARK-51806: Declare objenesis explicitly (version managed in the parent POM) so it
+      is reliably present on the runtime classpath. It is otherwise only pulled in
+      transitively via kryo-shaded, whose version (2.5.1) differs from the one Spark
+      resolves through Maven (3.3); the SBT/coursier build can drop it from the assembled
+      jars directory, which breaks Kryo (used by SparkR vignette rendering during the
+      release docs build).
+      -->
+    <dependency>
+      <groupId>org.objenesis</groupId>
+      <artifactId>objenesis</artifactId>
+    </dependency>
     <dependency>
       <groupId>com.github.jnr</groupId>
       <artifactId>jnr-posix</artifactId>
