@@ -846,7 +846,7 @@ class JsonProtocolSuite extends SparkFunSuite {
     }
     assert(e.getMessage.contains("Unknown event type"))
     assert(!JsonProtocolStaticInitProbeFlag.triggered,
-      "static initializer of a non-SparkListenerEvent class must not run during replay")
+      "static initializer of a non-SparkListenerEvent class must not run")
   }
 
   test("SPARK-42204: spark.eventLog.includeTaskMetricsAccumulators config") {
@@ -3261,9 +3261,9 @@ private[util] object JsonProtocolStaticInitProbeFlag {
 }
 
 /**
- * Probe used to verify that JsonProtocol does not run static initializers of classes named in
- * untrusted event log content. Only ever referenced by (string) name, so that initialization is
- * observable exclusively through [[JsonProtocolStaticInitProbeFlag]].
+ * Probe used to verify that JsonProtocol does not run static initializers of classes named by
+ * the Event field. Only ever referenced by (string) name, so that initialization is observable
+ * exclusively through [[JsonProtocolStaticInitProbeFlag]].
  */
 private[util] object JsonProtocolStaticInitProbe {
   JsonProtocolStaticInitProbeFlag.triggered = true
