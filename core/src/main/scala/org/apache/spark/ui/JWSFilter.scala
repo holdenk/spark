@@ -17,13 +17,15 @@
 
 package org.apache.spark.ui
 
+import java.security.Principal
+
 import javax.crypto.SecretKey
 
 import io.jsonwebtoken.{JwtException, Jwts}
 import io.jsonwebtoken.io.Decoders
 import io.jsonwebtoken.security.Keys
 import jakarta.servlet.{Filter, FilterChain, FilterConfig, ServletRequest, ServletResponse}
-import jakarta.servlet.http.{HttpServletRequest, HttpServletResponse}
+import jakarta.servlet.http.{HttpServletRequest, HttpServletRequestWrapper, HttpServletResponse}
 
 /**
  * A servlet filter that requires JWS, a cryptographically signed JSON Web Token, in the header.
@@ -40,6 +42,11 @@ import jakarta.servlet.http.{HttpServletRequest, HttpServletResponse}
  *   - <payload> is a base64url-encoded string of fully-user-defined content.
  *   - <signature> is a signature based on '<header>.<payload>' and a user-provided key parameter.
  * }}}
+ *
+ * If the verified token carries a 'sub' (subject) claim, it is exposed to the rest of the
+ * filter chain as the request's remote user and user principal, so that downstream
+ * authorization (e.g. Spark UI ACLs, which key on getRemoteUser) sees the authenticated
+ * identity.
  */
 private class JWSFilter extends Filter {
   private val AUTHORIZATION = "Authorization"
@@ -67,7 +74,18 @@ private class JWSFilter extends Filter {
           hres.sendError(HttpServletResponse.SC_FORBIDDEN, s"${AUTHORIZATION} header is missing.")
         case s"Bearer $token" =>
           val claims = Jwts.parser().verifyWith(key).build().parseSignedClaims(token)
-          chain.doFilter(req, res)
+          val subject = claims.getPayload().getSubject()
+          if (subject != null && subject.nonEmpty) {
+            val wrapped = new HttpServletRequestWrapper(hreq) {
+              override def getRemoteUser(): String = subject
+              override def getUserPrincipal(): Principal = new Principal {
+                override def getName(): String = subject
+              }
+            }
+            chain.doFilter(wrapped, res)
+          } else {
+            chain.doFilter(req, res)
+          }
         case _ =>
           hres.sendError(HttpServletResponse.SC_FORBIDDEN, s"Malformed ${AUTHORIZATION} header.")
       }
