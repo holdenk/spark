@@ -32,6 +32,7 @@ import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 import org.apache.spark.network.shuffle.ExternalShuffleBlockResolver.AppExecId;
 import org.junit.AfterClass;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -103,6 +104,47 @@ public class ExternalShuffleBlockResolverSuite {
       String blocks =
         CharStreams.toString(new InputStreamReader(blocksStream, StandardCharsets.UTF_8));
       assertEquals(sortBlock0 + sortBlock1, blocks);
+    }
+  }
+
+  @Test
+  public void testBlockFileResolvingOutsideLocalDirsRejected() throws IOException {
+    // A registered executor's directories can be modified after registration. The resolver
+    // must refuse to serve a block whose resolved path escapes the registered local dirs.
+    File outsideFile = File.createTempFile("outside", ".txt");
+    TestShuffleDataContext context = new TestShuffleDataContext(2, 5);
+    context.create();
+    try {
+      context.insertSortShuffleData(1, 0, new byte[][] {
+        "AAAA".getBytes(StandardCharsets.UTF_8),
+        "BBBB".getBytes(StandardCharsets.UTF_8)});
+      ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
+      resolver.registerExecutor("app1", "exec0", context.createExecutorInfo(SORT_MANAGER));
+
+      // Sanity check: the block is served normally before the file is replaced.
+      try (InputStream in = resolver.getBlockData("app1", "exec0", 1, 0, 0)
+          .createInputStream()) {
+        assertEquals("AAAA",
+          CharStreams.toString(new InputStreamReader(in, StandardCharsets.UTF_8)));
+      }
+
+      // Point the data file at a path outside the registered local dirs.
+      File dataFile = new File(ExecutorDiskUtils.getFilePath(
+        context.localDirs, context.subDirsPerLocalDir, "shuffle_1_0_0.data"));
+      assertTrue(dataFile.delete());
+      try {
+        Files.createSymbolicLink(dataFile.toPath(), outsideFile.toPath());
+      } catch (UnsupportedOperationException | IOException e) {
+        // Filesystems without symlink support cannot exercise this case.
+        Assume.assumeTrue("symlinks unsupported on this filesystem", false);
+      }
+
+      RuntimeException e = assertThrows(RuntimeException.class,
+        () -> resolver.getBlockData("app1", "exec0", 1, 0, 0));
+      assertTrue("Bad error message: " + e, e.getMessage().contains("resolves outside"));
+    } finally {
+      context.cleanup();
+      outsideFile.delete();
     }
   }
 
