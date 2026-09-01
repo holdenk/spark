@@ -307,6 +307,13 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
                 )
 
         else:
+            if isinstance(func_or_funcs, list) and not all(
+                isinstance(f, str) for f in func_or_funcs
+            ):
+                raise ValueError(
+                    "If the given function is a list, it "
+                    "should only contains function names as strings."
+                )
             agg_cols = [col.name for col in self._agg_columns]
             func_or_funcs = {col: func_or_funcs for col in agg_cols}
 
@@ -381,26 +388,17 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
                 data_col = name_like_string(column_label)
                 data_columns.append(data_col)
 
-                col_name = psdf._internal.spark_column_name_for(label)
+                scol = F.col("`{}`".format(psdf._internal.spark_column_name_for(label)))
                 if aggfunc == "nunique":
-                    reordered.append(
-                        F.expr("count(DISTINCT `{0}`) as `{1}`".format(col_name, data_col))
-                    )
+                    reordered.append(F.count_distinct(scol).alias(data_col))
 
                 # Implement "quartiles" aggregate function for ``describe``.
                 elif aggfunc == "quartiles":
-                    reordered.append(
-                        F.expr(
-                            "percentile_approx(`{0}`, array(0.25, 0.5, 0.75)) as `{1}`".format(
-                                col_name, data_col
-                            )
-                        )
-                    )
+                    reordered.append(F.percentile_approx(scol, [0.25, 0.5, 0.75]).alias(data_col))
 
                 else:
-                    reordered.append(
-                        F.expr("{1}(`{0}`) as `{2}`".format(col_name, aggfunc, data_col))
-                    )
+                    # Name, not SQL: call_function parses this as a multipart identifier.
+                    reordered.append(F.call_function(aggfunc, scol).alias(data_col))
 
         sdf = psdf._internal.spark_frame.select(groupkey_scols + psdf._internal.data_spark_columns)
         sdf = sdf.groupby(*groupkey_names).agg(*reordered)
