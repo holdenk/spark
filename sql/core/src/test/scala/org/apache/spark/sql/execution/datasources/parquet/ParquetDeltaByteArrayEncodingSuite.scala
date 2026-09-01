@@ -16,9 +16,13 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet
 
-import org.apache.parquet.bytes.DirectByteBufferAllocator
+import org.apache.parquet.bytes.{ByteBufferInputStream, BytesInput, DirectByteBufferAllocator}
 import org.apache.parquet.column.values.Utils
+import org.apache.parquet.column.values.delta.DeltaBinaryPackingValuesWriterForInteger
+import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter
 import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter
+import org.apache.parquet.io.ParquetDecodingException
+import org.apache.parquet.io.api.Binary
 
 import org.apache.spark.sql.execution.vectorized.{OnHeapColumnVector, WritableColumnVector}
 import org.apache.spark.sql.test.SharedSparkSession
@@ -139,5 +143,39 @@ class ParquetDeltaByteArrayEncodingSuite extends ParquetCompatibilityTest with S
       reader.skipBinary(skipCount)
       i += skipCount + 1
     }
+  }
+
+  test("prefix length larger than the previous value is rejected") {
+    // Craft a page by hand: a benign 2-byte first value, then a value whose prefix length
+    // claims 65536 bytes of a 2-byte previous value.
+    val is = craftPage(prefixLengths = Array(0, 65536), suffixes = Array("ab", ""))
+    reader.initFromPage(2, is)
+    writableColumnVector = new OnHeapColumnVector(2, StringType)
+    val e = intercept[ParquetDecodingException] {
+      reader.readBinary(2, writableColumnVector, 0)
+    }
+    assert(e.getMessage.contains("prefix length 65536"))
+  }
+
+  test("negative prefix length is rejected") {
+    val is = craftPage(prefixLengths = Array(0, -1), suffixes = Array("ab", "cd"))
+    reader.initFromPage(2, is)
+    writableColumnVector = new OnHeapColumnVector(2, StringType)
+    val e = intercept[ParquetDecodingException] {
+      reader.readBinary(2, writableColumnVector, 0)
+    }
+    assert(e.getMessage.contains("negative prefix length"))
+  }
+
+  private def craftPage(
+      prefixLengths: Array[Int],
+      suffixes: Array[String]): ByteBufferInputStream = {
+    val allocator = new DirectByteBufferAllocator
+    val prefixWriter =
+      new DeltaBinaryPackingValuesWriterForInteger(128, 4, 64 * 1024, 64 * 1024, allocator)
+    val suffixWriter = new DeltaLengthByteArrayValuesWriter(64 * 1024, 64 * 1024, allocator)
+    prefixLengths.foreach(prefixWriter.writeInteger)
+    suffixes.foreach(s => suffixWriter.writeBytes(Binary.fromString(s)))
+    BytesInput.concat(prefixWriter.getBytes, suffixWriter.getBytes).toInputStream
   }
 }
