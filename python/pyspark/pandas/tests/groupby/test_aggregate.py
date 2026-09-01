@@ -320,10 +320,7 @@ class GroupbyAggregateMixin:
         with self.assertRaises(AnalysisException):
             psdf.groupby("A").agg({"B": "`(SELECT 1) + min`"}).to_pandas()
 
-        msg = (
-            "If the given function is a list, it "
-            "should only contains function names as strings."
-        )
+        msg = "If the given function is a list, it should only contains function names as strings."
         with self.assertRaisesRegex(ValueError, msg):
             psdf.groupby("A").agg([1])
 

@@ -359,9 +359,7 @@ class GroupBy(Generic[FrameLike], metaclass=ABCMeta):
 
                 # Implement "quartiles" aggregate function for ``describe``.
                 elif aggfunc == "quartiles":
-                    reordered.append(
-                        F.percentile_approx(scol, [0.25, 0.5, 0.75]).alias(data_col)
-                    )
+                    reordered.append(F.percentile_approx(scol, [0.25, 0.5, 0.75]).alias(data_col))
 
                 else:
                     # Name, not SQL: call_function parses this as a multipart identifier.

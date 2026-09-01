@@ -345,8 +345,6 @@ class FramePivotMixin:
         with self.assertRaisesRegex(TypeError, msg):
             psdf.pivot_table(index=["C"], columns="A", values="B", aggfunc={"B": "mean"})
 
-
-
     def test_pivot_table_aggfunc_name(self):
         pdf = pd.DataFrame(
             {"a": [4, 2, 3, 4], "b": [1, 2, 2, 4], "c": [1, 2, 9, 4], "e": [10, 20, 20, 40]}
@@ -361,6 +359,7 @@ class FramePivotMixin:
             psdf.pivot_table(
                 index=["c"], columns="a", values="b", aggfunc="first((SELECT 1)) as `b` -- "
             ).to_pandas()
+
 
 class FramePivotTests(FramePivotMixin, ComparisonTestBase, SQLTestUtils):
     pass
