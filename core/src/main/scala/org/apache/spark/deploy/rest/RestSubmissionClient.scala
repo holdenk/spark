@@ -421,7 +421,7 @@ private[spark] object RestSubmissionClient {
   /**
    * Filter non-spark environment variables from any environment.
    */
-  private[rest] def filterSystemEnvironment(env: Map[String, String]): Map[String, String] = {
+  private[spark] def filterSystemEnvironment(env: Map[String, String]): Map[String, String] = {
     env.filterKeys { k =>
       (k.startsWith("SPARK_") && !EXCLUDED_SPARK_ENV_VARS.contains(k)) || k.startsWith("MESOS_")
     }.toMap
