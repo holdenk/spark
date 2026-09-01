@@ -38,6 +38,8 @@ import org.apache.hive.service.cli.operation.OperationManager;
 import org.apache.hive.service.rpc.thrift.TProtocolVersion;
 import org.apache.hive.service.server.HiveServer2;
 import org.apache.hive.service.server.ThreadFactoryWithGarbageCleanup;
+
+import org.apache.spark.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -129,6 +131,12 @@ public class SessionManager extends CompositeService {
     }
 
     if (isOperationLogEnabled) {
+      // Keep the operation log root directory owner-only, matching the
+      // permissions used for Spark's other local directories.
+      if (!Utils.chmod700(operationLogRootDir)) {
+        LOG.warn("Unable to change permissions of operation log root directory: " +
+            operationLogRootDir.getAbsolutePath());
+      }
       LOG.info("Operation log root directory is created: " + operationLogRootDir.getAbsolutePath());
       try {
         FileUtils.forceDeleteOnExit(operationLogRootDir);
