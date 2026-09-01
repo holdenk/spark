@@ -235,6 +235,34 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
     }
   }
 
+  test("a second event log with the same appId does not replace the listed attempt") {
+    val provider = new FsHistoryProvider(createTestConf())
+
+    val existingLog = newLogFile("app1", None, inProgress = false)
+    writeFile(existingLog, None,
+      SparkListenerApplicationStart("app1", Some("app1"), 1L, "user1", None),
+      SparkListenerApplicationEnd(2L)
+    )
+    updateAndCheck(provider) { list =>
+      list.size should be (1)
+      list.head.attempts.head.sparkUser should be ("user1")
+    }
+    val existingPath = provider.getAttempt("app1", None).logPath
+
+    // A second log file, written by a different user, declares the same appId and attemptId.
+    val conflictingLog = newLogFile("other", None, inProgress = false)
+    writeFile(conflictingLog, None,
+      SparkListenerApplicationStart("app1", Some("app1"), 3L, "user2", None),
+      SparkListenerApplicationEnd(4L)
+    )
+    updateAndCheck(provider) { list =>
+      list.size should be (1)
+      // The attempt listed first keeps the entry.
+      provider.getAttempt("app1", None).logPath should be (existingPath)
+      list.head.attempts.head.sparkUser should be ("user1")
+    }
+  }
+
   test("SPARK-39439: Check final file if in-progress event log file does not exist") {
     withTempDir { dir =>
       val conf = createTestConf()

@@ -1209,6 +1209,17 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
   }
 
   /**
+   * Whether a newly parsed attempt comes from the same log location as the attempt already
+   * listed for the same (appId, attemptId).
+   */
+  private def isSameLogLocation(
+      existing: AttemptInfoWrapper,
+      incoming: AttemptInfoWrapper): Boolean = {
+    existing.logPath == incoming.logPath ||
+      existing.logPath == incoming.logPath + EventLogFileWriter.IN_PROGRESS
+  }
+
+  /**
    * Write the app's information to the given store. Serialized to avoid the (notedly rare) case
    * where two threads are processing separate attempts of the same application.
    */
@@ -1220,6 +1231,19 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     } catch {
       case _: NoSuchElementException =>
         app
+    }
+
+    // The listing is keyed on the application ID declared inside the event log's content, so
+    // two different log files in the same directory can declare the same key.
+    if (!(oldApp eq app)) {
+      val conflicting = oldApp.attempts.find(_.info.attemptId == attempt.info.attemptId)
+        .filterNot(existing => isSameLogLocation(existing, attempt))
+      if (conflicting.isDefined) {
+        logWarning(s"Ignoring event log ${attempt.logPath} for application ${app.id} " +
+          s"attempt ${attempt.info.attemptId}: this attempt is already listed from " +
+          s"${conflicting.get.logPath}")
+        return
+      }
     }
 
     def compareAttemptInfo(a1: AttemptInfoWrapper, a2: AttemptInfoWrapper): Boolean = {
