@@ -18,7 +18,6 @@
 package org.apache.spark.ui
 
 import java.security.Principal
-
 import javax.crypto.SecretKey
 
 import io.jsonwebtoken.{JwtException, Jwts}

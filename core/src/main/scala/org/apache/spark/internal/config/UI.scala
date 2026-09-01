@@ -178,6 +178,7 @@ private[spark] object UI {
       "remote user) when ACLs are enabled. When false, such requests are denied. Set to " +
       "true to restore the behavior of earlier releases.")
     .version("4.4.0")
+    .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
     .booleanConf
     .createWithDefault(false)
 
