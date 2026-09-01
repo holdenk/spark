@@ -17,6 +17,9 @@
 
 package org.apache.hive.service.auth;
 
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.AccessControlContext;
 import java.security.AccessController;
 import java.security.PrivilegedExceptionAction;
@@ -90,10 +93,13 @@ public final class HttpAuthUtils {
    * @return An unsigned cookie token generated from input parameters.
    * The final cookie generated is of the following format :
    * {@code cu=<username>&rn=<randomNumber>&s=<cookieSignature>}
+   * The user name is percent-encoded so that '&' or '=' characters in it are
+   * not interpreted as cookie attribute delimiters.
    */
   public static String createCookieToken(String clientUserName) {
     StringBuffer sb = new StringBuffer();
-    sb.append(COOKIE_CLIENT_USER_NAME).append(COOKIE_KEY_VALUE_SEPARATOR).append(clientUserName)
+    sb.append(COOKIE_CLIENT_USER_NAME).append(COOKIE_KEY_VALUE_SEPARATOR)
+      .append(URLEncoder.encode(clientUserName, StandardCharsets.UTF_8))
       .append(COOKIE_ATTR_SEPARATOR);
     sb.append(COOKIE_CLIENT_RAND_NUMBER).append(COOKIE_KEY_VALUE_SEPARATOR)
       .append(random.nextLong());
@@ -108,11 +114,16 @@ public final class HttpAuthUtils {
   public static String getUserNameFromCookieToken(String tokenStr) {
     Map<String, String> map = splitCookieToken(tokenStr);
 
-    if (!map.keySet().equals(COOKIE_ATTRIBUTES)) {
+    if (map == null || !map.keySet().equals(COOKIE_ATTRIBUTES)) {
       LOG.error("Invalid token with missing attributes " + tokenStr);
       return null;
     }
-    return map.get(COOKIE_CLIENT_USER_NAME);
+    try {
+      return URLDecoder.decode(map.get(COOKIE_CLIENT_USER_NAME), StandardCharsets.UTF_8);
+    } catch (IllegalArgumentException e) {
+      LOG.error("Invalid encoding of user name in token " + tokenStr);
+      return null;
+    }
   }
 
   /**
@@ -134,7 +145,10 @@ public final class HttpAuthUtils {
       }
       String key = part.substring(0, separator);
       String value = part.substring(separator + 1);
-      map.put(key, value);
+      if (map.put(key, value) != null) {
+        LOG.error("Duplicate attribute in token string " + tokenStr);
+        return null;
+      }
     }
     return map;
   }
