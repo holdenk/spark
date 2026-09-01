@@ -126,7 +126,13 @@ def manager() -> None:
             os.environ["PYTHON_WORKER_FACTORY_SOCK_DIR"], f".{uuid.uuid4()}.sock"
         )
         listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listen_sock.bind(socket_path)
+        # Socket files inherit the process umask; bind under a restrictive umask so this
+        # one is owner-only regardless of the inherited value.
+        old_umask = os.umask(0o077)
+        try:
+            listen_sock.bind(socket_path)
+        finally:
+            os.umask(old_umask)
         listen_sock.listen(max(1024, SOMAXCONN))
         listen_port = socket_path
     elif os.environ.get("SPARK_PREFER_IPV6", "false").lower() == "true":
