@@ -246,32 +246,31 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
     }
   }
 
-  test("a different event log claiming an existing appId does not overwite existing") {
+  test("a second event log with the same appId does not replace the listed attempt") {
     val provider = new FsHistoryProvider(createTestConf())
 
-    val victimLog = newLogFile("app1", None, inProgress = false)
-    writeFile(victimLog, None,
-      SparkListenerApplicationStart("app1", Some("app1"), 1L, "alice", None),
+    val existingLog = newLogFile("app1", None, inProgress = false)
+    writeFile(existingLog, None,
+      SparkListenerApplicationStart("app1", Some("app1"), 1L, "user1", None),
       SparkListenerApplicationEnd(2L)
     )
     updateAndCheck(provider) { list =>
       list.size should be (1)
-      list.head.attempts.head.sparkUser should be ("alice")
+      list.head.attempts.head.sparkUser should be ("user1")
     }
-    val victimPath = provider.getAttempt("app1", None).logPath
+    val existingPath = provider.getAttempt("app1", None).logPath
 
-    // A different log file - e.g. one written by another user into a shared, sticky-bit
-    // event-log directory - declares the same appId/attemptId under another identity.
-    val forgedLog = newLogFile("forged", None, inProgress = false)
-    writeFile(forgedLog, None,
-      SparkListenerApplicationStart("app1", Some("app1"), 3L, "mallory", None),
+    // A second log file, written by a different user, declares the same appId and attemptId.
+    val conflictingLog = newLogFile("other", None, inProgress = false)
+    writeFile(conflictingLog, None,
+      SparkListenerApplicationStart("app1", Some("app1"), 3L, "user2", None),
       SparkListenerApplicationEnd(4L)
     )
     updateAndCheck(provider) { list =>
       list.size should be (1)
-      // The attempt listed first keeps the entry; the forged log must not take it over.
-      provider.getAttempt("app1", None).logPath should be (victimPath)
-      list.head.attempts.head.sparkUser should be ("alice")
+      // The attempt listed first keeps the entry.
+      provider.getAttempt("app1", None).logPath should be (existingPath)
+      list.head.attempts.head.sparkUser should be ("user1")
     }
   }
 
