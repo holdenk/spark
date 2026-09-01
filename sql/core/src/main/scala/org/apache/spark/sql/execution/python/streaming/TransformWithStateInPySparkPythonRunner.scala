@@ -398,8 +398,9 @@ trait TransformWithStateInPySparkPythonRunnerUtils extends Logging {
             .getOrElse(System.getProperty("java.io.tmpdir")),
           s".${UUID.randomUUID()}.sock")
         stateServerSocket = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-        stateServerSocket.bind(UnixDomainSocketAddress.of(sockPath.getPath), 1)
         sockPath.deleteOnExit()
+        stateServerSocket.bind(UnixDomainSocketAddress.of(sockPath.getPath), 1)
+        SocketAuthHelper.restrictSocketToOwner(sockPath)
         stateServerSocketPath = sockPath.getPath
       } else {
         stateServerSocket = ServerSocketChannel.open()

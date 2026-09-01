@@ -59,6 +59,7 @@ private[spark] abstract class SocketAuthServer[T](
       val serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
       sockPath.deleteOnExit()
       serverChannel.bind(address)
+      SocketAuthHelper.restrictSocketToOwner(sockPath)
       (serverChannel, address)
     } else {
       val address = InetAddress.getLoopbackAddress()
