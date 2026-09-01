@@ -74,8 +74,8 @@ object QuotingUtils {
   }
 
   /**
-   * Escapes a string so that it can be emitted inside a single-quoted SQL string literal
-   * and parsed back to the original value by the default string literal parser.
+   * Escapes a string so that it can be emitted inside a single-quoted SQL string literal and
+   * parsed back to the original value by the default string literal parser.
    */
   def escapeSingleQuotedString(str: String): String = {
     val builder = new StringBuilder
