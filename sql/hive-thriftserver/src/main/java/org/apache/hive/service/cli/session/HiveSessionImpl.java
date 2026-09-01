@@ -69,6 +69,8 @@ import org.apache.hive.service.rpc.thrift.TProtocolVersion;
 import org.apache.hive.service.rpc.thrift.TRowSet;
 import org.apache.hive.service.rpc.thrift.TTableSchema;
 import org.apache.hive.service.server.ThreadWithGarbageCleanup;
+
+import org.apache.spark.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -302,6 +304,9 @@ public class HiveSessionImpl implements HiveSession {
       if (!operationLogRootDir.mkdirs()) {
         LOG.warn("Unable to create operation log root directory: " +
             operationLogRootDir.getAbsolutePath());
+      } else if (!Utils.chmod700(operationLogRootDir)) {
+        LOG.warn("Unable to change permissions of operation log root directory: " +
+            operationLogRootDir.getAbsolutePath());
       }
     }
     if (!operationLogRootDir.canWrite()) {
@@ -318,6 +323,10 @@ public class HiveSessionImpl implements HiveSession {
       }
     }
     if (isOperationLogEnabled) {
+      if (!Utils.chmod700(sessionLogDir)) {
+        LOG.warn("Unable to change permissions of operation log session directory: " +
+            sessionLogDir.getAbsolutePath());
+      }
       LOG.info("Operation log session directory is created: " + sessionLogDir.getAbsolutePath());
     }
   }
