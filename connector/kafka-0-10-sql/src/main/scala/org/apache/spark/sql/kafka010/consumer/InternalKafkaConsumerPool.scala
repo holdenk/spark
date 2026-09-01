@@ -26,6 +26,7 @@ import org.apache.commons.pool2.impl.{BaseObjectPoolConfig, DefaultEvictionPolic
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
+import org.apache.spark.kafka010.KafkaRedactionUtil
 import org.apache.spark.sql.kafka010._
 import org.apache.spark.sql.kafka010.consumer.InternalKafkaConsumerPool._
 import org.apache.spark.sql.kafka010.consumer.KafkaDataConsumer.CacheKey
@@ -97,6 +98,10 @@ private[consumer] class InternalKafkaConsumerPool(
 
   /** Invalidates all idle consumers for the key */
   def invalidateKey(key: CacheKey): Unit = {
+    // Drop the cached params as well, so a later borrow with legitimately-changed params
+    // (e.g. after a credential rotation) is not rejected; params re-register on next borrow.
+    // A borrow racing this removal can transiently fail to find the params; the task retries.
+    objectFactory.keyToKafkaParams.remove(key)
     pool.clear(key)
   }
 
@@ -143,12 +148,18 @@ private[consumer] class InternalKafkaConsumerPool(
   //   as a part of key), but there might be the case kafkaParams could be different -
   //   cache key should be differentiated for both kafkaParams.
   private def updateKafkaParamForKey(key: CacheKey, kafkaParams: ju.Map[String, Object]): Unit = {
+    import scala.jdk.CollectionConverters._
+
     // We can assume that kafkaParam should not be different for same cache key,
     // otherwise we can't reuse the cached object and cache key should contain kafkaParam.
     // So it should be safe to put the key/value pair only when the key doesn't exist.
     val oldKafkaParams = objectFactory.keyToKafkaParams.putIfAbsent(key, kafkaParams)
-    require(oldKafkaParams == null || kafkaParams == oldKafkaParams, "Kafka parameters for same " +
-      s"cache key should be equal. old parameters: $oldKafkaParams new parameters: $kafkaParams")
+    // Print both param maps redacted, consistent with the other param-printing sites in
+    // this module.
+    require(oldKafkaParams == null || kafkaParams == oldKafkaParams,
+      "Kafka parameters for same cache key should be equal. old parameters: " +
+        s"${KafkaRedactionUtil.redactParams(oldKafkaParams.asScala.toSeq)} new parameters: " +
+        s"${KafkaRedactionUtil.redactParams(kafkaParams.asScala.toSeq)}")
   }
 
   private def extractCacheKey(consumer: InternalKafkaConsumer): CacheKey = {

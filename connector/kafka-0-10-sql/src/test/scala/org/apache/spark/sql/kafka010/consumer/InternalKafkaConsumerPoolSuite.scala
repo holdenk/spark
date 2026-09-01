@@ -23,12 +23,14 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.kafka.clients.consumer.ConsumerConfig._
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.config.SaslConfigs
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.kafka010.{CONSUMER_CACHE_CAPACITY, CONSUMER_CACHE_EVICTOR_THREAD_RUN_INTERVAL, CONSUMER_CACHE_TIMEOUT}
 import org.apache.spark.sql.kafka010.consumer.KafkaDataConsumer.CacheKey
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.Utils
 
 class InternalKafkaConsumerPoolSuite extends SharedSparkSession {
 
@@ -192,6 +194,54 @@ class InternalKafkaConsumerPoolSuite extends SharedSparkSession {
     }
 
     pool.close()
+  }
+
+  test("params-consistency failure message redacts kafka params") {
+    val pool = new InternalKafkaConsumerPool(new SparkConf())
+    try {
+      val topicPartition = new TopicPartition("topic", 0)
+      val secret = "very-secret-password"
+      val rotatedSecret = "rotated-secret-password"
+      val jaas = "org.apache.kafka.common.security.scram.ScramLoginModule required " +
+        s"""username="user" password="$secret";"""
+      val kafkaParams = new ju.HashMap[String, Object](getTestKafkaParams)
+      kafkaParams.put(SaslConfigs.SASL_JAAS_CONFIG, jaas)
+      val key = new CacheKey(topicPartition, kafkaParams)
+      val consumer = pool.borrowObject(key, kafkaParams)
+      pool.returnObject(consumer)
+
+      val rotatedParams = new ju.HashMap[String, Object](kafkaParams)
+      rotatedParams.put(SaslConfigs.SASL_JAAS_CONFIG, jaas.replace(secret, rotatedSecret))
+      val e = intercept[IllegalArgumentException] {
+        pool.borrowObject(key, rotatedParams)
+      }
+      assert(!e.getMessage.contains(secret))
+      assert(!e.getMessage.contains(rotatedSecret))
+      assert(e.getMessage.contains(Utils.REDACTION_REPLACEMENT_TEXT))
+    } finally {
+      pool.close()
+    }
+  }
+
+  test("invalidateKey allows borrowing with changed params for the same key") {
+    val pool = new InternalKafkaConsumerPool(new SparkConf())
+    try {
+      val topicPartition = new TopicPartition("topic", 0)
+      val kafkaParams = getTestKafkaParams
+      val key = new CacheKey(topicPartition, kafkaParams)
+      val consumer = pool.borrowObject(key, kafkaParams)
+      pool.returnObject(consumer)
+      pool.invalidateKey(key)
+
+      // e.g. an operator rotated credentials / changed a setting and restarted the query
+      val newParams = new ju.HashMap[String, Object](kafkaParams)
+      newParams.put(MAX_POLL_RECORDS_CONFIG, "42")
+      val consumer2 = pool.borrowObject(key, newParams)
+      assertPooledObject(consumer2, topicPartition, newParams)
+      pool.returnObject(consumer2)
+    } finally {
+      pool.close()
+    }
   }
 
   private def createTopicPartitions(
