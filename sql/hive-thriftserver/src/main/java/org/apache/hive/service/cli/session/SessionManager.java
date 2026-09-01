@@ -135,6 +135,12 @@ public class SessionManager extends CompositeService {
     }
 
     if (isOperationLogEnabled) {
+      // Keep the operation log root directory owner-only, matching the
+      // permissions used for Spark's other local directories.
+      if (!Utils.chmod700(operationLogRootDir)) {
+        LOG.warn("Unable to change permissions of operation log root directory: {}",
+          MDC.of(LogKeys.PATH, operationLogRootDir.getAbsolutePath()));
+      }
       LOG.info("Operation log root directory is created: {}",
         MDC.of(LogKeys.PATH, operationLogRootDir.getAbsolutePath()));
       try {

@@ -331,6 +331,9 @@ public class HiveSessionImpl implements HiveSession {
       if (!Utils.createDirectory(operationLogRootDir)) {
         LOG.warn("Unable to create operation log root directory: {}",
           MDC.of(LogKeys.PATH, operationLogRootDir.getAbsolutePath()));
+      } else if (!Utils.chmod700(operationLogRootDir)) {
+        LOG.warn("Unable to change permissions of operation log root directory: {}",
+          MDC.of(LogKeys.PATH, operationLogRootDir.getAbsolutePath()));
       }
     }
     if (!operationLogRootDir.canWrite()) {
@@ -347,6 +350,10 @@ public class HiveSessionImpl implements HiveSession {
       }
     }
     if (isOperationLogEnabled) {
+      if (!Utils.chmod700(sessionLogDir)) {
+        LOG.warn("Unable to change permissions of operation log session directory: {}",
+          MDC.of(LogKeys.PATH, sessionLogDir.getAbsolutePath()));
+      }
       LOG.info("Operation log session directory is created: {}",
         MDC.of(LogKeys.PATH, sessionLogDir.getAbsolutePath()));
     }

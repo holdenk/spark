@@ -226,6 +226,14 @@ public abstract class Operation {
             return;
           }
         }
+        // Keep the log file readable and writable only by the owner.
+        if (!(operationLogFile.setReadable(false, false)
+            && operationLogFile.setWritable(false, false)
+            && operationLogFile.setReadable(true, true)
+            && operationLogFile.setWritable(true, true))) {
+          LOG.warn("Unable to change permissions of operation log file: {}",
+            MDC.of(LogKeys.PATH, operationLogFile.getAbsolutePath()));
+        }
       } catch (Exception e) {
         LOG.warn("Unable to create operation log file: {}", e,
           MDC.of(LogKeys.PATH, operationLogFile.getAbsolutePath()));
