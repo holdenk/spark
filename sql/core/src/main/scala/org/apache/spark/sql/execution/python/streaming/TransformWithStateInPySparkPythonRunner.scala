@@ -31,6 +31,7 @@ import org.apache.spark.{SparkEnv, SparkException, TaskContext}
 import org.apache.spark.api.python.{BasePythonRunner, ChainedPythonFunctions, PythonFunction, PythonRDD, PythonWorkerUtils, StreamingPythonRunner}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED}
+import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.python.{BasicPythonArrowOutput, PythonArrowInput, PythonUDFRunner}
@@ -359,8 +360,9 @@ trait TransformWithStateInPySparkPythonRunnerUtils extends Logging {
             .getOrElse(System.getProperty("java.io.tmpdir")),
           s".${UUID.randomUUID()}.sock")
         stateServerSocket = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
-        stateServerSocket.bind(UnixDomainSocketAddress.of(sockPath.getPath), 1)
         sockPath.deleteOnExit()
+        stateServerSocket.bind(UnixDomainSocketAddress.of(sockPath.getPath), 1)
+        SocketAuthHelper.restrictSocketToOwner(sockPath)
         stateServerSocketPath = sockPath.getPath
       } else {
         stateServerSocket = ServerSocketChannel.open()

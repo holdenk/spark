@@ -17,10 +17,13 @@
 
 package org.apache.spark.security
 
-import java.io.{DataInputStream, DataOutputStream}
+import java.io.{DataInputStream, DataOutputStream, File}
 import java.net.Socket
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
+import java.util.EnumSet
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED}
@@ -124,5 +127,25 @@ private[spark] class SocketAuthHelper(val conf: SparkConf) {
     dout.writeInt(bytes.length)
     dout.write(bytes, 0, bytes.length)
     dout.flush()
+  }
+}
+
+private[spark] object SocketAuthHelper {
+
+  /**
+   * Restricts a freshly-bound Unix domain socket file to its owner (0600).
+   *
+   * The JVM has no per-thread umask, so permissions must be set after `bind()`; invoke this
+   * immediately after `bind()` and before handing the socket path to the peer, since the
+   * file briefly carries umask-derived permissions.
+   *
+   * Unix domain sockets in this mode are only supported on POSIX filesystems; on a
+   * filesystem that cannot restrict permissions this throws rather than silently keeping
+   * umask-derived permissions.
+   */
+  def restrictSocketToOwner(sockPath: File): Unit = {
+    Files.setPosixFilePermissions(
+      sockPath.toPath,
+      EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))
   }
 }
