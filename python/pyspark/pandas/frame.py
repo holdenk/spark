@@ -6847,7 +6847,7 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
             if not isinstance(self._internal.spark_type_for(values), NumericType):
                 raise TypeError("values should be a numeric type.")
 
-        def agg_col(func_name: str, label) -> PySparkColumn:
+        def agg_col(func_name: str, label: Label) -> PySparkColumn:
             name = self._internal.spark_column_name_for(label)
             return F.call_function(func_name, F.col("`{}`".format(name))).alias(name)
 

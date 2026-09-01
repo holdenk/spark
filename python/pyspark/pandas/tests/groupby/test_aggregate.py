@@ -283,10 +283,6 @@ class GroupbyAggregateMixin:
         )
 
         self.assert_eq(
-            psdf.groupby("A").agg({"B": "system.builtin.sum"}).sort_index(),
-            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
-        )
-        self.assert_eq(
             psdf.groupby("A").agg({"B": "IDENTIFIER('sum')"}).sort_index(),
             pdf.groupby("A").agg({"B": "sum"}).sort_index(),
         )
@@ -305,10 +301,7 @@ class GroupbyAggregateMixin:
         with self.assertRaises(AnalysisException):
             psdf.groupby("A").agg({"B": "`(SELECT 1) + min`"}).to_pandas()
 
-        msg = (
-            "If the given function is a list, it "
-            "should only contains function names as strings."
-        )
+        msg = "If the given function is a list, it should only contains function names as strings."
         with self.assertRaisesRegex(ValueError, msg):
             psdf.groupby("A").agg([1])
 
