@@ -60,12 +60,16 @@ private[spark] class JavaSerializationStream(
   def close(): Unit = { objOut.close() }
 }
 
-private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoader)
+private[spark] class JavaDeserializationStream(
+    in: InputStream,
+    loader: ClassLoader,
+    classFilter: Option[ClassNameFilter] = None)
     extends DeserializationStream {
 
   private val objIn = new ObjectInputStream(in) {
 
-    override def resolveClass(desc: ObjectStreamClass): Class[_] =
+    override def resolveClass(desc: ObjectStreamClass): Class[_] = {
+      checkAllowed(desc.getName)
       try {
         // scalastyle:off classforname
         Class.forName(desc.getName, false, loader)
@@ -74,14 +78,30 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
         case e: ClassNotFoundException =>
           JavaDeserializationStream.primitiveMappings.getOrElse(desc.getName, throw e)
       }
+    }
 
     override def resolveProxyClass(ifaces: Array[String]): Class[_] = {
+      ifaces.foreach(checkAllowed)
       // scalastyle:off classforname
       val resolved = ifaces.map(iface => Class.forName(iface, false, loader))
       // scalastyle:on classforname
       java.lang.reflect.Proxy.getProxyClass(loader, resolved: _*)
     }
 
+  }
+
+  /**
+   * Rejects a class the caller's filter does not allow, before it is resolved.
+   *
+   * This is the pre-JEP-290 hook, used because `java.io.ObjectInputFilter` needs Java 9 and
+   * this branch still supports Java 8. `InvalidClassException` is what `ObjectInputStream`
+   * raises for a filter rejection, so callers can treat the two the same way.
+   */
+  private def checkAllowed(className: String): Unit = classFilter.foreach { filter =>
+    if (!filter.allows(className)) {
+      throw new InvalidClassException(className, "class is not allowed by the serialization " +
+        "filter configured for this stream")
+    }
   }
 
   def readObject[T: ClassTag](): T = objIn.readObject().asInstanceOf[T]

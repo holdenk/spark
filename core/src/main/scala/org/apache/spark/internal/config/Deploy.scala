@@ -33,6 +33,21 @@ private[spark] object Deploy {
     .stringConf
     .createWithDefault("")
 
+  val RECOVERY_SERIALIZATION_FILTER =
+    ConfigBuilder("spark.deploy.recoverySerializationFilter")
+      .doc("Serialization filter pattern applied when the master deserializes recovery " +
+        "state written by the built-in JavaSerializer (currently enforced for the ZOOKEEPER " +
+        "recovery mode). The default allows only JDK, Scala and Spark classes, which covers " +
+        "everything the master persists (ApplicationInfo, DriverInfo, WorkerInfo and their " +
+        "fields); znodes containing anything else are treated as corrupt and dropped during " +
+        "recovery. Set to '*' to disable filtering. Only the class-name patterns of the " +
+        "java.io.ObjectInputFilter syntax are supported here, because that class requires " +
+        "Java 9 and this branch supports Java 8; an unsupported pattern is rejected rather " +
+        "than partially applied.")
+      .version("3.5.10")
+      .stringConf
+      .createWithDefault("java.**;scala.**;org.apache.spark.**;!*")
+
   val ZOOKEEPER_URL = ConfigBuilder("spark.deploy.zookeeper.url")
     .doc(s"When `${RECOVERY_MODE.key}` is set to ZOOKEEPER, this " +
       "configuration is used to set the zookeeper URL to connect to.")
