@@ -413,6 +413,7 @@ private[spark] abstract class BasePythonRunner[IN, OUT](
             serverSocketChannel = Some(ServerSocketChannel.open(StandardProtocolFamily.UNIX))
             sockPath.deleteOnExit()
             serverSocketChannel.get.bind(UnixDomainSocketAddress.of(sockPath.getPath))
+            SocketAuthHelper.restrictSocketToOwner(sockPath)
           } else {
             serverSocketChannel = Some(ServerSocketChannel.open())
             serverSocketChannel.foreach(_.bind(

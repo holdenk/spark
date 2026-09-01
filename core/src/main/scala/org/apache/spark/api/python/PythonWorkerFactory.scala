@@ -215,6 +215,7 @@ private[spark] class PythonWorkerFactory(
         serverSocketChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
         sockPath.deleteOnExit()
         serverSocketChannel.bind(UnixDomainSocketAddress.of(sockPath.getPath))
+        SocketAuthHelper.restrictSocketToOwner(sockPath)
       } else {
         serverSocketChannel = ServerSocketChannel.open()
         serverSocketChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 1)
