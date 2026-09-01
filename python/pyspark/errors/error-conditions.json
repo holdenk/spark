@@ -149,6 +149,11 @@
       "returnType can not be specified when `<arg_name>` is a user-defined function, but got <return_type>."
     ]
   },
+  "CANNOT_TRANSPILE_MISMATCHED_FUNCTION": {
+    "message": [
+      "Cannot transpile <func>: it is not the function this UDF was defined with."
+    ]
+  },
   "CANNOT_WITHOUT": {
     "message": [
       "Cannot <condition1> without <condition2>."

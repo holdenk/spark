@@ -662,10 +662,9 @@ jobs:
       BRANCH: ${{ inputs.branch }}
       PYSPARK_TEST_TIMEOUT: 450
       RUN_HYPOTHESIS: ${{ fromJson(needs.precondition.outputs.required).transpile }}
-      # Each generated example runs two full Spark jobs (transpiled vs. interpreted
-      # differential), so the local default of 1000 blows past PYSPARK_TEST_TIMEOUT.
-      # Cap CI fuzz volume; the explicit @example edge seeds still always run.
-      RUN_HYPOTHESIS_MAX_EXAMPLES: 50
+      # Each generated example runs two Spark jobs. Cap CI fuzzing to stay within
+      # the module timeout; explicit @example cases always run.
+      RUN_HYPOTHESIS_MAX_EXAMPLES: 20
     steps:
     - name: Bootstrap composite actions
       uses: actions/checkout@v6

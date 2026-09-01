@@ -17,42 +17,70 @@
 """
 Experimental tools for transpiling UDFS.
 
-Transpilation is only attempted when both
-``spark.sql.experimental.optimizer.transpilePyUDFs=true`` and
-``spark.sql.ansi.enabled=true``. The generated Catalyst expressions
-target ANSI-mode SQL semantics (overflow raises, divide-by-zero raises,
-etc.); running them under non-ANSI mode would silently diverge from the
-Python interpretation in ways we don't currently track. If you flip
-transpilation on with ANSI off the UDF will fall back to interpreted
-Python execution and a warning is logged at UDF construction time.
+Transpilation requires ``spark.sql.experimental.optimizer.transpilePyUDFs``
+and ANSI mode. Unsupported UDFs fall back to interpreted Python.
 
 Python's ``+`` and ``*`` are overloaded for text (concat / repeat), so an
 untyped parameter is transpiled into one option per input-type category
-(numeric and string) and the JVM picks the one matching the bound column
-types -- falling back to interpreted Python when none fit. Annotating the
-UDF's parameters (e.g. ``def f(a: int, b: str)``) pins each category and
-keeps the option matrix small; prefer doing so. To bound plan growth,
-functions with more than three untyped parameters only emit the
-all-numeric and all-string variants.
+(numeric and string), and the JVM keeps the options compatible with the bound
+columns. Annotations can reduce this option matrix. String repeat is lowered only
+when its count is a statically known integer; recognizing integral columns is
+tracked by SPARK-58595.
 
-A lambda is lowered only when its source names it directly and alone: bind it
-to a name (``f = lambda x: x + 1``, annotated if you like) and give it a line
-of its own. Passed straight to ``udf(...)``, wrapped in another call, returned
-by another lambda, or sharing a line with a second lambda, nothing in the
-source read back says which lambda is the UDF, so it falls back to interpreted
-Python rather than risk the wrong body.
+A lambda is lowered only when its source names it directly and alone: bind it to
+a name or return it from a ``def`` on a line of its own. Ambiguous source falls
+back rather than risk lowering the wrong lambda.
+
+Free variables and literal assignments
+--------------------------------------
+A name that is not a parameter (``lambda a: a + b``) is resolved from the
+function's scope and baked into the plan as a literal. A local assignment is
+supported only when it binds a literal written in the body or captured from the
+enclosing scope. Computed assignments fall back.
+
+Baking a value is only sound when the interpreted path would have seen that
+same value, so a name is resolved only when ``cloudpickle`` snapshots it by
+value:
+
+* A UDF written as a top-level ``def`` in an importable module is pickled by
+  reference and cannot bake driver globals.
+* Only ``None`` and the basic scalars (``int``, ``float``, ``str``, ``bool``,
+  ``bytes``) are bakeable. Integers must fit in 64 bits; non-finite floats and
+  non-UTF-8 strings are refused.
+* Only closure cells and module globals are read. ``self.<attr>`` on a callable
+  instance is not captured (SPARK-59029).
+
+Captured values are frozen once when the JVM UDF is created and supplied to both
+the interpreted and transpiled paths. Freezing needs a plain function or bound
+method, so a callable instance that reads a captured value falls back.
+
+Known differences
+-----------------
+A transpiled UDF is not always exactly equivalent to the Python one. Overflow
+follows the input types rather than Python's unbounded ``int`` (precast to
+decimal to avoid it), and comparisons apply Catalyst type coercion where Python
+would raise. Tracked by SPARK-55210.
 """
 
 import ast
 import contextlib
+import copy
 import inspect
 import itertools
+import math
 import sys
 import textwrap
 import threading
+import types
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
+from pyspark.cloudpickle.cloudpickle import (
+    _empty_cell_value,
+    _extract_code_globals,
+    _get_cell_contents,
+    _should_pickle_by_reference,
+)
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
 from pyspark.sql.functions import (
@@ -76,6 +104,7 @@ from pyspark.sql.types import (
     NumericType,
     StringType,
 )
+from pyspark.util import JVM_INT_MAX, JVM_INT_MIN, JVM_LONG_MAX, JVM_LONG_MIN
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -96,8 +125,6 @@ class AbstractTranspiler(object):
 
     def _transpile_from_ast(
         self,
-        src: Optional[str],
-        ast_info: ast.AST,
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
@@ -119,8 +146,11 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
     """
     Return True when ``node`` is statically guaranteed to produce a Python
     basic/builtin type (int, float, str, bool, None, lists, etc.).
-    All ast.Name's are treated as basic types for now this will need to be updated
-    if/when we add free variables / closures to transpilation.
+    All ast.Name's are treated as basic types. That is sound because
+    ``_normalize_function`` runs first and rewrites every non-parameter name
+    into an ``ast.Constant`` (or refuses), so the only ``ast.Name`` nodes the
+    lowering code can still see are UDF parameters, which are bound to columns
+    of basic types.
     """
     match node:
         case ast.Constant():
@@ -163,15 +193,585 @@ def _is_definitely_boolean(node: ast.AST) -> bool:
             return False
 
 
+# Only these can be baked into the plan as literals: they are immutable, they
+# map onto a Spark column category, and ``cloudpickle`` snapshots them by value.
+# Matched by EXACT type, not ``isinstance``: a subclass may override an operator
+# (``int.__radd__``, ``str.__radd__``, ...) that Catalyst would then apply with
+# base-type semantics, and ``bool`` is only safe here because it is listed.
+_BAKEABLE_TYPES = (int, float, str, bool, bytes)
+
+
+def _refuse_unrepresentable_value(description: str, value: Any) -> None:
+    """Refuse a bakeable-TYPE value whose VALUE has no faithful column equivalent.
+
+    Called wherever a Python value becomes a ``lit()`` -- both for a captured name
+    (:meth:`_LiteralNormalizer._bake`) and for a literal written in the body
+    (``_convert_chunk``'s ``ast.Constant`` arm). Keeping one copy matters because
+    the two paths converge: a literal assignment (``b = 1e400``) is substituted by
+    the normalizer and then lowered as a body constant, so a check on only one side
+    is a check that can be walked around.
+    """
+    # Python ints are unbounded, so a value can exceed what LongType holds. Refuse
+    # explicitly rather than letting ``lit`` throw a Java stack trace -- and were
+    # ``lit`` ever to accept such a value (a decimal, say), it would still classify
+    # as "numeric" and then fail CheckAnalysis against a bigint column, killing the
+    # query instead of falling back. ``bool`` is excluded: it subclasses int but is
+    # 0/1.
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not JVM_LONG_MIN <= value <= JVM_LONG_MAX
+    ):
+        raise UnsupportedOperationException(
+            f"{description} is {value}, which is outside the range of a 64-bit "
+            "integer; Python integers are unbounded but Spark's LongType is not, "
+            "so the transpiler falls back to interpreted Python"
+        )
+    # NaN compares false against everything in Python, but Spark orders it above
+    # every other double and treats it as equal to itself, so a baked NaN silently
+    # flips `a < nan` and `a == nan`. A NaN COLUMN value can only be documented
+    # (the type says nothing about it), but one that is known here can be refused.
+    #
+    # The infinities go with it: the trailing cast to an integral return type
+    # raises CAST_OVERFLOW where the interpreted path returns NULL -- breaking a
+    # query rather than falling back, which is what every guard here exists to
+    # avoid. ``1e400`` is an ordinary-looking literal that evaluates to one.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise UnsupportedOperationException(
+            f"{description} is the non-finite float {value}, which has no faithful "
+            "column equivalent: Python compares NaN as false against everything "
+            "while Spark orders it above all other doubles, and an infinity cannot "
+            "be cast to an integral type. The transpiler falls back to interpreted "
+            "Python"
+        )
+    # A lone surrogate is a legal Python str but not encodable, and py4j encodes
+    # every command as UTF-8. This one must be refused BEFORE reaching ``lit``:
+    # the UnicodeEncodeError happens inside the socket write, which drops the
+    # gateway connection rather than falling back, damaging the whole session.
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise UnsupportedOperationException(
+                f"{description} is a string that is not UTF-8 encodable, which "
+                "cannot be sent to the JVM, so the transpiler falls back to "
+                "interpreted Python"
+            )
+
+
+def _as_literal(node: ast.AST) -> Optional[ast.Constant]:
+    """The constant ``node`` already is, or ``None`` when it is not one.
+
+    This is the single place the "assignments bind literals" rule is enforced. It
+    runs on an ALREADY-VISITED expression, so a captured name has become an
+    ``ast.Constant`` by the time it arrives; what reaches here as something else is
+    genuinely computed (``a + 1``, a call, a comparison) or is a column reference,
+    and either way this transpiler will not evaluate it.
+
+    The one concession is a unary ``-``/``+`` on a numeric constant: Python parses
+    ``-5`` as ``UnaryOp(USub, Constant(5))``, never ``Constant(-5)``, so without
+    folding it a negative literal would be refused as "computed" -- a confusing
+    answer for something spelled exactly like a literal. Folding is exact for
+    ``int`` and ``float`` and is not applied to anything else (``-"ab"`` is a
+    Python TypeError, and ``-True`` would silently become ``-1``).
+    """
+    if isinstance(node, ast.Constant):
+        return node
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = node.operand
+        if (
+            isinstance(operand, ast.Constant)
+            and isinstance(operand.value, (int, float))
+            and not isinstance(operand.value, bool)
+        ):
+            value = -operand.value if isinstance(node.op, ast.USub) else +operand.value
+            return ast.Constant(value=value)
+    return None
+
+
+def _require_integral_repeat_count(node: ast.AST) -> None:
+    """Refuse a string repeat unless its count is a statically known integer."""
+    literal = _as_literal(node)
+    if (
+        literal is None
+        or type(literal.value) is not int
+        or not JVM_INT_MIN <= literal.value <= JVM_INT_MAX
+    ):
+        raise UnsupportedOperationException(
+            "the count in a string repeat (`s * n`) is not a statically known "
+            "32-bit integer; Spark's `repeat` narrows other values where Python "
+            "raises or returns a different result, so this falls back to "
+            "interpreted Python"
+        )
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    """Whether ``stmt`` is a bare string expression (a docstring in position 0)."""
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+# Node types that open a new binding scope. Split because a return/yield search
+# stops at function-ish bodies while a name-substituting rewrite also stops at
+# comprehensions.
+_FUNCTION_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_COMPREHENSION_NODES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _own_scope_nodes(body: List[ast.stmt]) -> Iterator[ast.AST]:
+    """Every node under ``body`` belonging to the enclosing function itself.
+
+    Nested ``def``/``lambda``/``class`` bodies are skipped: a ``return`` inside one
+    belongs to that scope, not ours. Comprehensions are not, since a ``return``
+    cannot appear in one and a ``yield`` in one is a syntax error.
+    """
+    stack: List[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, _FUNCTION_SCOPE_NODES):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _returns_only_none_implicitly(body: List[ast.stmt]) -> bool:
+    """Whether the body has no ``return`` at all, so every call falls off the end
+    and hands back ``None`` (or raises)."""
+    return not any(
+        isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom)) for n in _own_scope_nodes(body)
+    )
+
+
+def _underlying_function(func: Callable) -> Optional[types.FunctionType]:
+    """The plain function whose code object describes ``func``'s body.
+
+    ``func`` may be a function, a bound method, or an instance of a callable
+    class; the latter two carry their body on ``__func__`` / the class's
+    ``__call__``.
+
+    The ``__call__`` lookup goes through :func:`_call_dunder` / :func:`_call_impl`
+    so this reads the same function :func:`_held_code` does -- resolving the two
+    differently would let the scope be captured from one body while the source was
+    validated against another.
+    """
+    if isinstance(func, types.FunctionType):
+        return func
+    if inspect.ismethod(func):
+        inner = func.__func__
+        return inner if isinstance(inner, types.FunctionType) else None
+    call = _call_impl(_call_dunder(func))
+    if inspect.ismethod(call):
+        call = call.__func__
+    return call if isinstance(call, types.FunctionType) else None
+
+
+def _pickled_by_value(obj: Any) -> bool:
+    """Whether ``cloudpickle`` snapshots ``obj`` rather than re-importing it.
+
+    A by-reference object is re-imported on the executor, so anything reached
+    through it is whatever that process holds -- not what the driver saw.
+    """
+    return not _should_pickle_by_reference(obj)
+
+
+class _CapturedScope:
+    """The values a UDF body may safely read from its enclosing scope.
+
+    Resolution is deliberately narrower than Python's own name lookup: a name is
+    only resolvable when ``cloudpickle`` would have snapshotted the same value
+    for the interpreted path (see this module's docstring).
+    """
+
+    def __init__(
+        self,
+        local_names: Set[str],
+        cells: Dict[str, Any],
+        global_values: Optional[Dict[str, Any]],
+    ) -> None:
+        self._local_names = local_names
+        self._cells = cells
+        # ``None`` == pickled by reference, so no global is readable.
+        self._global_values = global_values
+
+    def lookup_name(self, name: str) -> Any:
+        if name in self._local_names:
+            # The compiler put this name in ``co_varnames``, so it is assigned
+            # somewhere in the body and is therefore local for the WHOLE body:
+            # reading it before that assignment raises UnboundLocalError, and
+            # resolving it from an enclosing scope would return a value where the
+            # UDF actually fails. A body-local that a nested scope closes over
+            # lands in ``co_cellvars`` instead and refuses below as unresolvable;
+            # what keeps that true is ``_analyze_func``'s ``global``/``nonlocal``
+            # refusal -- see the note there.
+            raise UnsupportedOperationException(
+                f"{name!r} is a local variable that is read before it is "
+                "assigned; Python raises UnboundLocalError here, so the "
+                "transpiler falls back to interpreted Python"
+            )
+        if name in self._cells:
+            value = self._cells[name]
+            if value is _empty_cell_value:
+                raise UnsupportedOperationException(
+                    f"closure cell for {name!r} has not been assigned yet; "
+                    "falling back to interpreted Python"
+                )
+            return value
+        if self._global_values is not None and name in self._global_values:
+            return self._global_values[name]
+        if self._global_values is None:
+            # ``None`` means the driver's snapshot does not travel, which empties the
+            # cell table too -- so this covers a closure cell as well as a global.
+            raise UnsupportedOperationException(
+                f"cannot capture {name!r}: this UDF is pickled by reference, so the "
+                "executor re-imports its module and re-reads whatever the closure "
+                "cell or module global holds there. Baking the driver's value could "
+                "silently disagree, so the transpiler falls back to interpreted Python"
+            )
+        raise UnsupportedOperationException(
+            f"name {name!r} is not a parameter and could not be resolved from the UDF's scope"
+        )
+
+    def snapshot(self) -> Tuple[Tuple[str, Any], ...]:
+        """Return the bakeable values whose mutation could change a lowering.
+
+        The filter matches ``_LiteralNormalizer._bake`` exactly, so no name the
+        lowering can bake is left unfrozen.
+        """
+        values = dict(self._global_values or {})
+        values.update(self._cells)
+        return tuple(
+            sorted(
+                (name, value)
+                for name, value in values.items()
+                if value is None or type(value) in _BAKEABLE_TYPES
+            )
+        )
+
+
+def _capture_scope(func: Callable) -> _CapturedScope:
+    """Build the capture table for ``func``, gated on cloudpickle's behaviour."""
+    fn = _underlying_function(func)
+    if fn is None:
+        raise UnsupportedOperationException(
+            "could not determine the UDF's code object, so its scope cannot be resolved"
+        )
+    code = fn.__code__
+    # Does the DRIVER's snapshot of this function reach the executor at all, or does
+    # the executor re-import and build its own? Everything below is gated on this,
+    # cells as much as globals: a re-imported class re-executes its own body, so a
+    # ``__call__`` that was built by a factory gets a FRESH closure over whatever
+    # that import produces. Baking the driver's cell there is exactly as wrong as
+    # baking its globals -- ``E.__call__ = _mk(7)`` on an importable class lowered
+    # to ``x + 99`` for a driver holding 99 while the executor computed ``x + 7``.
+    #
+    # It follows the function that CARRIES the code: ``_method_reduce`` reduces a
+    # bound method to its ``__func__``, so gating on the instance's class would bake
+    # for a method inherited from a by-reference base.
+    snapshot_travels = _pickled_by_value(fn)
+    is_callable_instance = not isinstance(func, types.FunctionType) and not inspect.ismethod(func)
+    if snapshot_travels and is_callable_instance:
+        # A callable instance reaches its code through ``type(func).__call__``,
+        # which cloudpickle ships only when BOTH the class owning ``__call__`` and
+        # the receiver's own class are by value. A by-reference class anywhere on
+        # that path is re-imported with its original ``__call__``, however the
+        # driver's was patched, so the carrying function alone is not enough.
+        owner = next((k for k in type(func).__mro__ if "__call__" in k.__dict__), None)
+        snapshot_travels = (
+            owner is not None and _pickled_by_value(owner) and _pickled_by_value(type(func))
+        )
+    # cloudpickle's own sentinel, so an unassigned cell is the object the
+    # executor would receive.
+    cells = (
+        dict(zip(code.co_freevars, map(_get_cell_contents, fn.__closure__ or ())))
+        if snapshot_travels
+        else {}
+    )
+    # Mirror ``_function_getstate``: only the globals the code references ship.
+    global_values = (
+        {
+            name: fn.__globals__[name]
+            for name in _extract_code_globals(code)
+            if name in fn.__globals__
+        }
+        if snapshot_travels
+        else None
+    )
+    return _CapturedScope(
+        local_names=set(code.co_varnames),
+        cells=cells,
+        global_values=global_values,
+    )
+
+
+def _freeze_captured_callable(func: Callable, scope: _CapturedScope) -> Callable:
+    """Return a callable whose bakeable globals and closure cells are fixed."""
+    values = dict(scope.snapshot())
+    if not values:
+        return func
+    if not isinstance(func, types.FunctionType) and not inspect.ismethod(func):
+        raise UnsupportedOperationException(
+            "captured values on callable instances cannot be frozen safely; "
+            "falling back to interpreted Python"
+        )
+
+    fn = _underlying_function(func)
+    assert fn is not None
+    cell_names = set(fn.__code__.co_freevars)
+    # A private copy, not the live module dict: that is what makes the pickled
+    # function immune to a rebind between here and ``_wrap_function``. Cell names
+    # are excluded because one can shadow an unrelated module global of the same
+    # name, which this copy would otherwise clobber.
+    frozen_globals = dict(fn.__globals__)
+    frozen_globals.update({n: v for n, v in values.items() if n not in cell_names})
+
+    frozen_closure = tuple(
+        types.CellType(values[name]) if name in values else cell
+        for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ())
+    )
+    frozen = types.FunctionType(
+        fn.__code__,
+        frozen_globals,
+        fn.__name__,
+        fn.__defaults__,
+        frozen_closure or None,
+    )
+    frozen.__kwdefaults__ = fn.__kwdefaults__
+    frozen.__annotations__ = fn.__annotations__
+    frozen.__dict__.update(fn.__dict__)
+    frozen.__module__ = fn.__module__
+    frozen.__qualname__ = fn.__qualname__
+    return types.MethodType(frozen, func.__self__) if inspect.ismethod(func) else frozen
+
+
+class _LiteralNormalizer(ast.NodeTransformer):
+    """Rewrite captured names into constants and substitute literal-valued locals.
+
+    After this runs, the only ``ast.Name`` nodes left are UDF parameters, so the
+    lowering code in :class:`CatalystTranspiler` needs no knowledge of scopes.
+
+    Every binding in ``_env`` is an ``ast.Constant``, which is what keeps this a
+    plain substitution: a literal has no evaluation to duplicate, defer, or
+    discard, so unlike inlining an arbitrary expression there is nothing to track
+    about where -- or whether -- the name is read.
+    """
+
+    def __init__(self, params: List[str], scope: _CapturedScope, self_param: Optional[str]) -> None:
+        self._params = set(params)
+        self._scope = scope
+        self._self_param = self_param
+        # name -> the literal it is bound to, as of the statement being visited
+        self._env: Dict[str, ast.Constant] = {}
+
+    @staticmethod
+    def _bake(description: str, value: Any) -> ast.expr:
+        if value is None or type(value) in _BAKEABLE_TYPES:
+            _refuse_unrepresentable_value(description, value)
+            return ast.Constant(value=value)
+        raise UnsupportedOperationException(
+            f"{description} holds a {type(value).__name__}, which has no column "
+            "equivalent; only None and basic scalars (int, float, str, bool, "
+            "bytes) can be transpiled, so this falls back to interpreted Python"
+        )
+
+    def _visit_nested_scope(self, node: ast.AST) -> ast.AST:
+        """Leave a nested scope untouched: its own bindings shadow ours.
+
+        A lambda parameter or comprehension target rebinds a name, so
+        substituting our literal at those read sites would be a wrong rewrite
+        (``b = 5; return [b for b in [a]]`` must not become ``[5 for b in [a]]``).
+        Nothing here is lowerable today -- ``_convert_chunk`` has no arm for any
+        of these nodes -- so leaving the names in place refuses cleanly instead.
+        """
+        return node
+
+    # One alias per node type in ``_FUNCTION_SCOPE_NODES + _COMPREHENSION_NODES``.
+    # Spelled out rather than registered in a loop, because ``ast.NodeVisitor``
+    # dispatches on attribute name and a generated one is invisible to readers and
+    # to grep; ``test_udf_transpile_normalizer_skips_every_scope_node`` fails if
+    # this list and those tuples drift apart.
+    visit_Lambda = _visit_nested_scope
+    visit_FunctionDef = _visit_nested_scope
+    visit_AsyncFunctionDef = _visit_nested_scope
+    visit_ClassDef = _visit_nested_scope
+    visit_ListComp = _visit_nested_scope
+    visit_SetComp = _visit_nested_scope
+    visit_DictComp = _visit_nested_scope
+    visit_GeneratorExp = _visit_nested_scope
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if not isinstance(node.ctx, ast.Load):
+            return node
+        # The local binding table is consulted BEFORE the parameter list: a
+        # parameter is an ordinary local and may be rebound to a literal, in which
+        # case every later read must see that literal rather than the column.
+        # Checking parameters first would turn `def f(a): a = 5; return a * 2`
+        # into `a * 2`.
+        if node.id in self._env:
+            # Fresh node per use so the tree stays free of shared nodes. The
+            # wrapped value is always an immutable scalar (see ``_bake``), so
+            # rewrapping is enough -- no deep copy needed.
+            return ast.Constant(value=self._env[node.id].value)
+        if node.id == self._self_param:
+            # A body that references the receiver itself (`return self`) has no
+            # column equivalent: it is not bound at the call site. Refused here,
+            # where the receiver's name is known, so the lowering only ever sees
+            # names the caller actually supplies.
+            raise UnsupportedOperationException(
+                f"references to the receiver {node.id!r} in a callable's body "
+                "are not supported by the transpiler; falling back to "
+                "interpreted Python"
+            )
+        if node.id in self._params:
+            return node
+        return self._bake(f"captured name {node.id!r}", self._scope.lookup_name(node.id))
+
+    def _assignment_targets(self, stmt: ast.stmt) -> Tuple[List[str], ast.expr]:
+        """The names ``stmt`` binds and the expression it binds them to.
+
+        ``ast.AugAssign`` (``b += 1``) is refused outright rather than desugared to
+        ``b = b + 1``: the result is an arithmetic expression, which this
+        transpiler does not evaluate. See ``_as_literal``.
+        """
+        if isinstance(stmt, ast.AugAssign):
+            raise UnsupportedOperationException(
+                "augmented assignment (`b += ...`) computes a value rather than "
+                "binding a literal, which the transpiler does not support; "
+                "falling back to interpreted Python"
+            )
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is None:
+                raise UnsupportedOperationException(
+                    "a bare annotation binds no value and is not supported"
+                )
+            if not isinstance(stmt.target, ast.Name):
+                raise UnsupportedOperationException(
+                    f"annotated assignment to {type(stmt.target).__name__} is "
+                    "not supported by the transpiler"
+                )
+            return [stmt.target.id], stmt.value
+        assert isinstance(stmt, ast.Assign)
+        names: List[str] = []
+        for target in stmt.targets:
+            if not isinstance(target, ast.Name):
+                raise UnsupportedOperationException(
+                    f"assignment to {type(target).__name__} (tuple unpacking, "
+                    "subscript, attribute, ...) is not supported by the "
+                    "transpiler"
+                )
+            names.append(target.id)
+        return names, stmt.value
+
+    def normalize_body(self, body: List[ast.stmt]) -> ast.stmt:
+        """Collapse ``body`` to a single statement, refusing what cannot be bound.
+
+        Assignments are consumed here: each binds its name(s) to a literal in
+        ``_env``, and later reads of those names substitute it (see
+        ``visit_Name``). Only the final statement survives as the returned one.
+        """
+        # Python treats a leading string expression as the docstring: it binds
+        # nothing and cannot raise, so drop it and normalize what follows. Only
+        # the first statement is a docstring, and only when something follows it
+        # -- a body that is nothing but a docstring returns None, which the
+        # trailing-expression case below already handles.
+        if len(body) > 1 and _is_docstring(body[0]):
+            body = body[1:]
+        for index, stmt in enumerate(body):
+            is_last = index == len(body) - 1
+            if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                names, value = self._assignment_targets(stmt)
+                # Resolve against the env as it stands BEFORE this statement, then
+                # bind. Visiting first is what makes `b = 1` then `b = b` legal
+                # while keeping each binding's value the one in scope at the time.
+                resolved = self.visit(value)
+                literal = _as_literal(resolved)
+                if literal is None:
+                    raise UnsupportedOperationException(
+                        f"the assignment to {', '.join(map(repr, names))} does not "
+                        "bind a literal; the transpiler only supports assignments "
+                        "whose value is a constant or a captured scalar, not one it "
+                        "would have to compute, so this falls back to interpreted "
+                        "Python"
+                    )
+                for name in names:
+                    self._env[name] = literal
+                if is_last:
+                    # An assignment evaluates nothing beyond a literal and yields
+                    # no value, so a body ending in one returns None.
+                    return ast.Return(value=None)
+                continue
+            if isinstance(stmt, ast.Pass) and is_last:
+                # ``pass`` evaluates nothing, so returning NULL is exact.
+                return ast.Return(value=None)
+            if isinstance(stmt, ast.Expr) and is_last:
+                # A trailing bare expression discards its value, so the function
+                # returns None. Only drop it when evaluating it could not have
+                # raised: discarding `x % 0` would turn Python's ZeroDivisionError
+                # into a NULL, and `x + "abc"` a TypeError. After visiting, a
+                # literal or a bare column read is all that is safe to discard.
+                discarded = self.visit(stmt.value)
+                safe = _as_literal(discarded) is not None or (
+                    isinstance(discarded, ast.Name) and discarded.id in self._params
+                )
+                if not safe:
+                    raise UnsupportedOperationException(
+                        "this function returns None but its final expression "
+                        "could raise when evaluated, so discarding it would "
+                        "hide the error; falling back to interpreted Python"
+                    )
+                return ast.Return(value=None)
+            if not is_last:
+                raise UnsupportedOperationException(
+                    f"{type(stmt).__name__} statements are only supported as the "
+                    "function's final statement; assignments may precede it"
+                )
+            return self.visit(stmt)
+        raise UnsupportedOperationException("the function body is empty")
+
+
+def _normalize_function(
+    func: Callable,
+    function_ast: ast.FunctionDef,
+    params: List[str],
+    receiver: Optional[str],
+    scope: Optional[_CapturedScope] = None,
+) -> ast.FunctionDef:
+    """Resolve scope and literal assignments, yielding a one-statement body.
+
+    ``receiver`` is the name of the implicit first parameter, or ``None`` when the
+    call site supplies every parameter.
+
+    Raises :class:`UnsupportedOperationException` when anything cannot be
+    resolved soundly, which the caller turns into a fallback.
+    """
+    scope = scope or _capture_scope(func)
+    normalizer = _LiteralNormalizer(params, scope, receiver)
+    # ``ast.NodeTransformer`` rewrites in place, and the caller holds onto
+    # ``function_ast`` across builds (a UDF is lowered once to validate it at
+    # construction and again when its judf is created). Normalizing the original
+    # would let a rebound capture leak between builds, so work on a copy.
+    #
+    # No depth or size guard is needed. Substituting literals cannot grow the tree,
+    # and a body nested deeply enough to exhaust the stack in ``deepcopy`` raises
+    # RecursionError, which ``_build_transpiled``'s ``except Exception`` turns into
+    # an ordinary fallback -- the same way an over-deep body behaves without any of
+    # this rewriting.
+    source = copy.deepcopy(function_ast)
+    statement = normalizer.normalize_body(source.body)
+    # Replace the copy's body rather than constructing a fresh ``ast.FunctionDef``.
+    # Every other field (notably ``type_params``, which exists only on 3.12+)
+    # carries over untouched, so this needs no per-version handling -- and it
+    # avoids omitting constructor fields, which 3.13 deprecates and 3.15 rejects.
+    source.body = [ast.fix_missing_locations(statement)]
+    return source
+
+
 class CatalystTranspiler(AbstractTranspiler):
     """Transpiler that attempts to convert a Python UDF into native Spark SQL expressions."""
 
     variety = "catalyst"
 
-    # TODO (SPARK-55218): handle implicit-None return bodies like
-    # ``def f(x): x + x`` -- no return statement means return None;
-    # we should lower to lit(None) and optionally warn since it's
-    # likely a mistake.
     def _convert_branch(self, params: List[str], statements: List[ast.stmt], slot: str) -> Column:
         """Lower a single-statement if-body / if-else block.
 
@@ -404,7 +1004,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 )
             case ast.Name(id=name) if name in params:
                 # ``params`` is the caller-facing list, so its indexes are already
-                # the ``_udf_param_N`` / category indexes -- see ``_transpile_func``.
+                # the ``_udf_param_N`` / category indexes -- see ``_analyze_func``.
                 return self._param_categories.get(params.index(name), "numeric")
             case ast.BinOp(left=left, op=op, right=right):
                 lc = self._category(params, left)
@@ -464,6 +1064,15 @@ class CatalystTranspiler(AbstractTranspiler):
                 return "numeric"
 
     def _convert_chunk(self, params: List[str], body: ast.AST | None) -> Column:
+        """Lower one expression / statement to a Column.
+
+        Adding an arm for a node that OPENS A SCOPE (``Lambda``, ``FunctionDef``,
+        a comprehension) requires teaching ``_LiteralNormalizer`` to rename or
+        refuse first: it deliberately does not descend into those, so their inner
+        names still refer to their own bindings, and lowering one today would
+        turn ``b = 5; return [b for b in [a]]`` into ``[5 for b in [a]]``. See
+        ``_LiteralNormalizer._visit_nested_scope``.
+        """
         match body:
             case None:
                 # Special case literal None, the implicit return None
@@ -667,8 +1276,10 @@ class CatalystTranspiler(AbstractTranspiler):
                         if lc == "numeric" and rc == "numeric":
                             return left_col.__mul__(right_col)
                         if lc == "string" and rc == "numeric":
+                            _require_integral_repeat_count(right)
                             return repeat(left_col, right_col.cast("int"))
                         if lc == "numeric" and rc == "string":
+                            _require_integral_repeat_count(left)
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
                         if lc == rc == "numeric":
@@ -702,22 +1313,30 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.Return(value=value):
                 return self._convert_chunk(params, value)
             case ast.Constant(value=value):
-                # Avoid circular import issue.
+                # Every literal that reaches a plan passes through here -- one the
+                # user wrote, one ``_LiteralNormalizer`` substituted for a captured
+                # name, and one it folded out of a literal assignment -- so this is
+                # where the value domain has to be checked. Guarding only the
+                # capture path let ``b = 1e400`` and ``t = "\ud800"`` straight
+                # through, and the surrogate takes the gateway down with it.
+                _refuse_unrepresentable_value(f"the literal {value!r}", value)
                 return lit(value)
             case ast.Name(id=name, ctx=ast.Load()):
                 # Insert columns referencing the param indexes for children
                 if name in params:
-                    # ``params`` excludes any bound receiver (see ``_transpile_func``),
-                    # so its indexes ARE the placeholder indexes. A body referencing
-                    # the receiver (``return self``) is not in this list and so takes
-                    # the branch below, which refuses -- there is no column for it.
+                    # ``params`` excludes any bound receiver (see ``_analyze_func``),
+                    # so its indexes ARE the placeholder indexes. A reference to the
+                    # receiver never reaches here: ``_normalize_function`` refuses it
+                    # earlier, where the receiver's real name is known.
                     return col(f"_udf_param_{params.index(name)}")
                 else:
-                    # TODO (SPARK-55207): Handle assignments, class vars, and closures
-                    # via scope evaluation.
+                    # ``_normalize_function`` rewrites every resolvable
+                    # non-parameter name into a constant before lowering runs,
+                    # so reaching here means it could not be resolved soundly
+                    # (or a transpiler variety skipped normalization).
                     raise UnsupportedOperationException(
-                        f"name {name!r} is not in the UDF's parameter list "
-                        "and free variables / closures are not supported"
+                        f"name {name!r} is not in the UDF's parameter list and "
+                        "was not resolved from the UDF's scope"
                     )
             case _:
                 raise UnsupportedOperationException(
@@ -727,16 +1346,11 @@ class CatalystTranspiler(AbstractTranspiler):
 
     def _transpile_from_ast(
         self,
-        src: Optional[str],
-        ast_info: ast.AST,
         function_ast: ast.FunctionDef,
         params: List[str],
         returnType: "DataTypeOrString",
         param_categories: Optional[dict] = None,
     ) -> Optional[Column]:
-        # Short circuit on nothing to transpile.
-        if src == "" or ast_info is None:
-            return None
         # Per-variant input-type assumption ({public_param_index -> category}),
         # read by ``_category`` to choose str vs numeric operators.
         self._param_categories = param_categories or {}
@@ -805,6 +1419,12 @@ CatalystTranspiler.register()
 
 def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     """Get the transpilers we should try."""
+    # Deliberately no client-side default: ``RuntimeConfig.get`` returns the
+    # default INSTEAD of the driver's registered one, so passing "catalyst" here
+    # would shadow ``SQLConf.PYTHON_UDF_TRANSPILERS`` and keep transpiling even
+    # for a driver that set it to "". A driver too old to know the conf raises,
+    # which ``_build_transpiled`` turns into an ordinary fallback. Same reasoning
+    # as ``_transpile_conf_is_true`` in ``udf.py``.
     configured_transpilers = session.conf.get("spark.sql.experimental.optimizer.pyTranspilers")
     if not configured_transpilers:
         return []
@@ -945,7 +1565,7 @@ def _syntax_warnings_suppressed() -> Iterator[None]:
             yield
 
 
-def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.AST]]:
+def _get_ast_from_func(func: Callable) -> Optional[ast.AST]:
     """Try and get the AST from a given callable
 
     KNOWN LIMITATION: this is the source on disk NOW, not necessarily the source
@@ -964,22 +1584,16 @@ def _get_src_ast_from_func(func: Callable) -> Tuple[Optional[str], Optional[ast.
     # repl, but does for those in files or in ipython.
     # It also fails when we give it an instance of a callable class.
     try:
-        src = inspect.getsource(func)
-        src = textwrap.dedent(src).strip()
         with _syntax_warnings_suppressed():
-            ast_info = ast.parse(src)
+            return ast.parse(textwrap.dedent(inspect.getsource(func)).strip())
     except Exception:
         try:
-            src = inspect.getsource(_call_dunder(func))
-            src = textwrap.dedent(src).strip()
             with _syntax_warnings_suppressed():
-                ast_info = ast.parse(src)
+                return ast.parse(textwrap.dedent(inspect.getsource(_call_dunder(func))).strip())
         except Exception:
             # No usable source (REPL/stdin definition, builtin, ...) --
-            # return cleanly so the caller reports "cannot transpile"
-            # instead of surfacing an UnboundLocalError as the reason.
-            return None, None
-    return src, ast_info
+            # return cleanly so the caller reports "cannot transpile".
+            return None
 
 
 def _get_parameter_list(node: ast.FunctionDef) -> list[str]:
@@ -995,6 +1609,8 @@ def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.
     Handles the following source patterns (in order):
 
     * ``f = lambda x: x + 1`` -- lambda bound to a name, annotated or not
+    * ``return lambda x: x + 1`` -- lambda returned from a factory function,
+      which is what ``inspect.getsource`` yields for ``make_adder(3)``
     * ``lambda x: x + 1`` -- bare expression (getsource on a raw lambda)
     * ``def f(x): ... return x + 1``
     * a class with a ``__call__`` method
@@ -1016,6 +1632,12 @@ def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.
     if isinstance(stmt, ast.Assign):
         stmt = stmt.value
     elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        stmt = stmt.value
+
+    # ``inspect.getsource`` on a lambda built by a factory function returns just
+    # the ``return`` line, so unwrap that too -- otherwise the single most
+    # natural way to write a closure-capturing UDF cannot be transpiled.
+    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Lambda):
         stmt = stmt.value
 
     # Bare ``lambda x: ...`` (when ``inspect.getsource`` returns a raw
@@ -1080,182 +1702,274 @@ def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.
     )
 
 
-def _transpile_func(
+class _TranspileAnalysis:
+    """Everything about a UDF the transpiler can determine without reading the
+    values it captures from its enclosing scope.
+
+    Split out from the lowering so the captured values can be read later, at
+    ``judf`` creation time, together with the ``cloudpickle`` snapshot the
+    interpreted path uses -- see this module's docstring on capture timing.
+    """
+
+    def __init__(
+        self,
+        function_ast: ast.FunctionDef,
+        params: List[str],
+        public_params: List[str],
+        receiver: Optional[str],
+        returnType: "DataTypeOrString",
+        combos: List[dict],
+    ) -> None:
+        self.function_ast = function_ast
+        self.params = params
+        self.public_params = public_params
+        # Name of the implicit first parameter (``self`` / ``cls`` / whatever the
+        # author called it), or ``None`` when the call site supplies every one.
+        self.receiver = receiver
+        self.returnType = returnType
+        self.combos = combos
+
+
+def _analyze_func(
+    func: Callable[..., Any], returnType: "DataTypeOrString"
+) -> Tuple[Optional[_TranspileAnalysis], List[str]]:
+    """Decide whether ``func`` is a transpilation candidate at all.
+
+    Performs every check that does not depend on captured values, so an
+    unsupported UDF can be reported when it is defined rather than when it is
+    first used. Returns ``(None, errors)`` when transpilation cannot proceed.
+    """
+    # The transpiler lowers to atomic (numeric/string/boolean/binary)
+    # expressions and casts the result to the declared return type. For a
+    # return type no lowering can even category-match (arrays, maps,
+    # structs, datetimes, ...), that Cast either never resolves -- and
+    # because the options ride along as children of TranspiledPythonUDF,
+    # an unresolvable Cast fails the WHOLE query at CheckAnalysis instead
+    # of falling back -- or diverges from the interpreted converter, which
+    # nulls type-mismatched results. Restrict transpilation to return
+    # types some lowering can match (the strict per-variant body-category
+    # check lives in ``_transpile_from_ast``); everything else falls back
+    # to interpreted Python.
+    if isinstance(returnType, str):
+        from pyspark.sql.types import _parse_datatype_string
+
+        returnType = _parse_datatype_string(returnType)
+    if not isinstance(returnType, (NumericType, StringType, BooleanType, BinaryType)):
+        return None, [
+            f"return type {returnType.simpleString()} is not supported by "
+            "the transpiler (no lowered expression can be cast to it "
+            "under ANSI rules); falling back to interpreted Python"
+        ]
+    # A functools.wraps-style decorator makes ``inspect.getsource`` return
+    # the WRAPPED function's source (getsource follows ``__wrapped__``),
+    # while the UDF actually executes the wrapper. Transpiling would
+    # silently reproduce the wrong behavior, so refuse and fall back.
+    # ``_call_impl`` first: a ``staticmethod`` / ``classmethod`` exposes a
+    # ``__wrapped__`` of its own, so asking the descriptor refuses every one of
+    # them for a wraps decorator that is not there.
+    if (
+        getattr(func, "__wrapped__", None) is not None
+        or getattr(_call_impl(_call_dunder(func)), "__wrapped__", None) is not None
+    ):
+        return None, [
+            "decorated callables (functools.wraps) are not supported: "
+            "the visible source is the wrapped function's, not the "
+            "wrapper's, so transpilation would change behavior"
+        ]
+    ast_info = _get_ast_from_func(func)
+    if ast_info is None:
+        return None, ["Error getting ast for function, cannot transpile"]
+    # Get the lambda body and parameters
+    function_ast, extraction_error = _get_function_from_ast(ast_info, _held_code(func))
+    if function_ast is None:
+        return None, [extraction_error]
+    # This walk covers nested scopes, not just the top level: ``_extract_code_globals``
+    # recurses into nested code objects, so a nested ``global x`` puts a name that is
+    # ALSO a body-local into the global capture table, where it would resolve to the
+    # module value for a body that raises UnboundLocalError.
+    if any(isinstance(n, (ast.Global, ast.Nonlocal)) for n in ast.walk(function_ast)):
+        return None, [
+            "`global` / `nonlocal` declarations rebind names outside the "
+            "function and are not supported by the transpiler"
+        ]
+    # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
+    # positional-only parameters can't be represented by the positional
+    # ``_udf_param_N`` placeholder scheme: a call site may omit a defaulted
+    # argument, leaving the placeholder referencing a position the call never
+    # bound, and ``_get_parameter_list`` only reads ``args``. Fall back to
+    # interpreted Python rather than emit an invalid plan.
+    fn_args = function_ast.args
+    if (
+        fn_args.defaults
+        or any(d is not None for d in fn_args.kw_defaults)
+        or fn_args.kwonlyargs
+        or fn_args.vararg is not None
+        or fn_args.kwarg is not None
+        or fn_args.posonlyargs
+    ):
+        return None, [
+            "functions with default, variadic, keyword-only, or "
+            "positional-only arguments are not supported by the transpiler"
+        ]
+    params = _get_parameter_list(function_ast)
+    # The FunctionDef above was recovered from TEXT, which can describe a
+    # different function than the one that runs: for ``def make(): return lambda
+    # x: x + N``, ``inspect.getsource`` on the returned lambda yields the whole
+    # ``def make()`` line, so the outer def is what gets picked. Its parameters
+    # must match the code object whose locals ``_capture_scope`` reads, or names
+    # resolve against an unrelated scope.
+    fn = _underlying_function(func)
+    if fn is not None and list(fn.__code__.co_varnames[: fn.__code__.co_argcount]) != params:
+        return None, [
+            "the source recovered for this UDF describes a different function "
+            "than the one it will run (its parameters do not match); falling "
+            "back to interpreted Python"
+        ]
+    # Drop a receiver that is already bound, so what is left is what the call
+    # site supplies. Decided by HOW ``func`` dispatches, not by the parameter's
+    # name: a bound ``__call__(this, x)`` or ``@classmethod f(cls, x)`` has a
+    # receiver not named ``self``, while a plain ``def f(self, x)`` supplies its
+    # ``self`` at the call site. Going by the name misnumbered every
+    # ``_udf_param_N`` -- a two-column call on ``__call__(this, x)`` read column b
+    # for ``x`` and returned a value where Python raises TypeError. Asking
+    # ``inspect.signature`` is both weaker (a ``__signature__`` off by exactly one
+    # is undetectable) and worse behaved (it runs user code).
+    #
+    # For a callable instance, two things can consume a leading parameter, and
+    # they compose: what the descriptor prepends when Python looks ``__call__``
+    # up -- the instance for a plain function, the class for a ``classmethod``,
+    # nothing for a ``staticmethod`` or for an already-bound method, whose
+    # ``__get__`` returns itself -- and whatever the callable already has bound.
+    # Each count below is checked against what Python returns for that shape.
+    if inspect.isfunction(func):
+        spoken_for = 0
+    elif inspect.ismethod(func):
+        spoken_for = 1
+    else:
+        call_entry = _call_dunder(func)
+        call_target = _call_impl(call_entry)
+        if not (inspect.isfunction(call_target) or inspect.ismethod(call_target)):
+            # A slot wrapper, property, partial, or other descriptor: what it
+            # prepends is not knowable from here.
+            return None, [
+                f"a {type(call_entry).__name__} as __call__ does not say which "
+                "parameters the call site supplies, so the placeholder "
+                "positions cannot be assigned"
+            ]
+        spoken_for = int(
+            inspect.isfunction(call_entry) or isinstance(call_entry, classmethod)
+        ) + int(inspect.ismethod(call_target))
+    if spoken_for > 1 or spoken_for > len(params):
+        # Two receivers at once -- a ``classmethod`` over an already-bound method
+        # prepends the class ON TOP of the method's own ``__self__`` -- or one with
+        # no parameter to hold it. Python raises for whatever the call site passes,
+        # so there is nothing correct to lower.
+        return None, ["callable leaves no parameter for the call site to bind"]
+    # Caller-facing params: callers match user-supplied kwargs against these, and
+    # the receiver is not named at the call site. Everything downstream indexes
+    # off THIS list, so the placeholder numbering needs no offset.
+    public_params = params[spoken_for:]
+    receiver = params[0] if spoken_for else None
+    # Warned here, not while lowering: this depends only on the AST, and lowering
+    # reruns for every judf. Warned even when the lowering then fails -- the user
+    # still wants to know the function never returns a value.
+    if _returns_only_none_implicitly(function_ast.body):
+        warnings.warn(
+            f"UDF {func} has no return statement, so it always returns None "
+            "(NULL) or raises; add a `return` if that was not intended.",
+            RuntimeWarning,
+        )
+    return (
+        _TranspileAnalysis(
+            function_ast=function_ast,
+            params=params,
+            public_params=public_params,
+            receiver=receiver,
+            returnType=returnType,
+            combos=_param_category_combos(function_ast, public_params),
+        ),
+        [],
+    )
+
+
+def _can_transpile(
+    session: "SparkSession", func: Callable[..., Any], analysis: _TranspileAnalysis
+) -> Tuple[bool, List[str]]:
+    """Whether ``func`` lowers at all right now, and the refusals if it does not.
+
+    For validating a UDF where it is defined. Returns a bool rather than the
+    expressions so a truncated option list cannot be mistaken for the full set
+    and end up in a plan -- lowering every variant just to discard it costs a py4j
+    roundtrip per node.
+    """
+    options, errors, _, _ = _build_transpiled(session, func, analysis, first_only=True)
+    return bool(options), errors
+
+
+def _build_transpiled(
     session: "SparkSession",
     func: Callable[..., Any],
-    returnType: "DataTypeOrString",
-) -> Tuple[List[Column], List[str], List[str], List[List[str]]]:
-    """
-    An experimental internal function that attempts to transpile a callable function.
+    analysis: _TranspileAnalysis,
+    first_only: bool = False,
+) -> Tuple[
+    List[Column],
+    List[str],
+    List[List[str]],
+    Optional[Callable],
+]:
+    """Resolve captured values and lower ``func`` to Catalyst expressions.
 
-    Returns
-    -------
-    list of transpiled options (one per backend x input-type variant)
-    list of errors as strings
-    list of positional parameter names (excluding a receiver already bound, as on a
-    method or callable instance) -- needed so the caller can resolve named-argument
-    invocations to positional order at call time, since the ``_udf_param_N``
-    substitution in :class:`UserDefinedPythonFunction` is positional.
-    list of per-option input-type categories (``"numeric"`` / ``"string"`` per
-    public param) -- the JVM picks the option whose categories match the bound
-    column types, or falls back to the Python UDF when none match.
+    Call this at ``judf`` creation time: the captured values it reads are baked
+    into the returned expressions, and they must be the same values
+    ``_wrap_function``'s ``cloudpickle`` snapshot sees.
+
+    ``first_only`` stops at the first option produced and so returns a TRUNCATED
+    option list, which must never reach a plan. Callers asking only "does this
+    lower at all?" should go through :func:`_can_transpile`, which returns a bool
+    and cannot be mistaken for the full set.
     """
+    errors: List[str] = []
     try:
-        # The transpiler lowers to atomic (numeric/string/boolean/binary)
-        # expressions and casts the result to the declared return type. For a
-        # return type no lowering can even category-match (arrays, maps,
-        # structs, datetimes, ...), that Cast either never resolves -- and
-        # because the options ride along as children of TranspiledPythonUDF,
-        # an unresolvable Cast fails the WHOLE query at CheckAnalysis instead
-        # of falling back -- or diverges from the interpreted converter, which
-        # nulls type-mismatched results. Restrict transpilation to return
-        # types some lowering can match (the strict per-variant body-category
-        # check lives in ``_transpile_from_ast``); everything else falls back
-        # to interpreted Python.
-        if isinstance(returnType, str):
-            from pyspark.sql.types import _parse_datatype_string
-
-            returnType = _parse_datatype_string(returnType)
-        if not isinstance(returnType, (NumericType, StringType, BooleanType, BinaryType)):
-            return (
-                [],
-                [
-                    f"return type {returnType.simpleString()} is not supported by "
-                    "the transpiler (no lowered expression can be cast to it "
-                    "under ANSI rules); falling back to interpreted Python"
-                ],
-                [],
-                [],
-            )
-        # A functools.wraps-style decorator makes ``inspect.getsource`` return
-        # the WRAPPED function's source (getsource follows ``__wrapped__``),
-        # while the UDF actually executes the wrapper. Transpiling would
-        # silently reproduce the wrong behavior, so refuse and fall back.
-        # ``_call_impl`` first: a ``staticmethod`` / ``classmethod`` exposes a
-        # ``__wrapped__`` of its own, so asking the descriptor refuses every one of
-        # them for a wraps decorator that is not there.
-        if (
-            getattr(func, "__wrapped__", None) is not None
-            or getattr(_call_impl(_call_dunder(func)), "__wrapped__", None) is not None
-        ):
-            return (
-                [],
-                [
-                    "decorated callables (functools.wraps) are not supported: "
-                    "the visible source is the wrapped function's, not the "
-                    "wrapper's, so transpilation would change behavior"
-                ],
-                [],
-                [],
-            )
-        # Not ``ast``: that name would shadow the module for this whole function.
-        src, ast_info = _get_src_ast_from_func(func)
-        if ast_info is None:
-            return ([], ["Error getting ast for function, cannot transpile"], [], [])
-        # Get the lambda body and parameters
-        function_ast, extraction_error = _get_function_from_ast(ast_info, _held_code(func))
-        if function_ast is None:
-            return ([], [extraction_error], [], [])
-        # Default, variadic (``*args`` / ``**kwargs``), keyword-only, and
-        # positional-only parameters can't be represented by the positional
-        # ``_udf_param_N`` placeholder scheme: a call site may omit a
-        # defaulted argument, leaving the placeholder referencing a position
-        # the call never bound, and ``_get_parameter_list`` only reads
-        # ``args``. Fall back to interpreted Python rather than emit an
-        # invalid plan.
-        fn_args = function_ast.args
-        if (
-            fn_args.defaults
-            or any(d is not None for d in fn_args.kw_defaults)
-            or fn_args.kwonlyargs
-            or fn_args.vararg is not None
-            or fn_args.kwarg is not None
-            or fn_args.posonlyargs
-        ):
-            return (
-                [],
-                [
-                    "functions with default, variadic, keyword-only, or "
-                    "positional-only arguments are not supported by the transpiler"
-                ],
-                [],
-                [],
-            )
-        params = _get_parameter_list(function_ast)
-        # Drop a receiver that is already bound, so what is left is what the call
-        # site supplies. Decided by HOW ``func`` dispatches, not by the parameter's
-        # name: a bound ``__call__(this, x)`` or ``@classmethod f(cls, x)`` has a
-        # receiver not named ``self``, while a plain ``def f(self, x)`` supplies its
-        # ``self`` at the call site. Going by the name misnumbered every
-        # ``_udf_param_N`` -- a two-column call on ``__call__(this, x)`` read column b
-        # for ``x`` and returned a value where Python raises TypeError. Asking
-        # ``inspect.signature`` is both weaker (a ``__signature__`` off by exactly one
-        # is undetectable) and worse behaved (it runs user code).
-        #
-        # For a callable instance, two things can consume a leading parameter, and
-        # they compose: what the descriptor prepends when Python looks ``__call__``
-        # up -- the instance for a plain function, the class for a ``classmethod``,
-        # nothing for a ``staticmethod`` or for an already-bound method, whose
-        # ``__get__`` returns itself -- and whatever the callable already has bound.
-        # Each count below is checked against what Python returns for that shape.
-        if inspect.isfunction(func):
-            spoken_for = 0
-        elif inspect.ismethod(func):
-            spoken_for = 1
-        else:
-            call_entry = _call_dunder(func)
-            call_target = _call_impl(call_entry)
-            if not (inspect.isfunction(call_target) or inspect.ismethod(call_target)):
-                # A slot wrapper, property, partial, or other descriptor: what it
-                # prepends is not knowable from here.
-                return (
-                    [],
-                    [
-                        f"a {type(call_entry).__name__} as __call__ does not say which "
-                        "parameters the call site supplies, so the placeholder "
-                        "positions cannot be assigned"
-                    ],
-                    [],
-                    [],
-                )
-            spoken_for = int(
-                inspect.isfunction(call_entry) or isinstance(call_entry, classmethod)
-            ) + int(inspect.ismethod(call_target))
-        if spoken_for > 1 or spoken_for > len(params):
-            # Two receivers at once -- a ``classmethod`` over an already-bound method
-            # prepends the class ON TOP of the method's own ``__self__`` -- or one with
-            # no parameter to hold it. Python raises for whatever the call site passes,
-            # so there is nothing correct to lower.
-            return ([], ["callable leaves no parameter for the call site to bind"], [], [])
-        # Caller-facing params: callers match user-supplied kwargs against this,
-        # and the receiver is not named at the call site. Everything downstream
-        # indexes off THIS list, so the placeholder numbering needs no offset.
-        public_params = params[spoken_for:]
-        transpiled: list[Column] = []
-        input_categories: list[list[str]] = []
-        errors = []
-        # One transpiled option per (backend x input-type variant). Untyped
-        # params are tried as both numeric and string so the JVM can pick the
-        # option matching the actual column types (or fall back if none match).
-        combos = _param_category_combos(function_ast, public_params)
-        # Maybe multiple transpilers (think CUDA, etc.).
+        scope = _capture_scope(func)
+        normalized = _normalize_function(
+            func, analysis.function_ast, analysis.params, analysis.receiver, scope
+        )
+        serialized_func = _freeze_captured_callable(func, scope)
         transpilers = _get_transpilers(session)
-        for transpiler in transpilers:
-            for combo in combos:
-                try:
-                    transpiled_column = transpiler._transpile_from_ast(
-                        src, ast_info, function_ast, public_params, returnType, combo
-                    )
-                    if transpiled_column is not None:
-                        transpiled.append(transpiled_column)
-                        input_categories.append(
-                            [combo.get(i, "numeric") for i in range(len(public_params))]
-                        )
-                except Exception as e:
-                    errors.append(str(e))
-        return (transpiled, errors, public_params, input_categories)
     except Exception as e:
-        # Don't re-raise: an inability to transpile must never break a
-        # working UDF. The caller treats an empty ``transpiled`` list as a
-        # silent fall-back to interpreted Python.
-        return ([], [str(e)], [], [])
+        return [], [str(e)], [], None
+    transpiled: List[Column] = []
+    input_categories: List[List[str]] = []
+    # One transpiled option per (backend x input-type variant). Untyped
+    # params are tried as both numeric and string so the JVM can pick the
+    # option matching the actual column types (or fall back if none match).
+    # Maybe multiple transpilers (think CUDA, etc.).
+    for transpiler in transpilers:
+        for combo in analysis.combos:
+            try:
+                transpiled_column = transpiler._transpile_from_ast(
+                    normalized,
+                    # The receiver is already stripped: ``_normalize_function``
+                    # refuses any reference to it, so every name the lowering can
+                    # still see is a column the call site binds.
+                    analysis.public_params,
+                    analysis.returnType,
+                    combo,
+                )
+                if transpiled_column is not None:
+                    transpiled.append(transpiled_column)
+                    input_categories.append(
+                        [combo.get(i, "numeric") for i in range(len(analysis.public_params))]
+                    )
+                    if first_only:
+                        return transpiled, errors, input_categories, serialized_func
+            except Exception as e:
+                errors.append(str(e))
+    # Nothing lowered means no baked literal to agree with, so the interpreted path
+    # keeps the user's own function rather than a reconstructed clone.
+    return (
+        transpiled,
+        list(dict.fromkeys(errors)),
+        input_categories,
+        serialized_func if transpiled else None,
+    )
