@@ -18,6 +18,7 @@
 import pandas as pd
 
 from pyspark import pandas as ps
+from pyspark.errors import AnalysisException, ParseException
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -188,6 +189,73 @@ class GroupbyAggregateMixin:
             sorted_agg_psdf = psdf.groupby(("X", "A")).agg(aggfunc).sort_index()
             sorted_agg_pdf = pdf.groupby(("X", "A")).agg(aggfunc).sort_index()
             self.assert_eq(sorted_agg_psdf, sorted_agg_pdf)
+
+    def test_aggregate_func_name(self):
+        pdf = pd.DataFrame({"A": [1, 1, 2, 2], "B": [1, 2, 3, 4]})
+        psdf = ps.from_pandas(pdf)
+
+        # A Spark SQL function name names the function to apply, and is not limited to the
+        # aggregations pandas itself knows about. Spark resolves such a name
+        # case-insensitively, unlike the "nunique" and "quartiles" shorthands, which are
+        # pandas-on-Spark's own and are matched exactly.
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "SUM"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "stddev_pop"}).sort_index(),
+            pd.DataFrame({"B": [0.5, 0.5]}, index=pd.Index([1, 2], name="A")),
+        )
+        # a name may be qualified, as a function registered in a catalog is
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "system.builtin.sum"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+        # IDENTIFIER('...') is Spark's way of writing a name; it still only names a function
+        self.assert_eq(
+            psdf.groupby("A").agg({"B": "IDENTIFIER('sum')"}).sort_index(),
+            pdf.groupby("A").agg({"B": "sum"}).sort_index(),
+        )
+
+        # Anything past a name does not parse as one. IDENTIFIER() takes a string literal,
+        # not an expression, so a subquery in that position is a parse error too.
+        for aggfunc in [
+            "sum(`B`) as `B` -- ",
+            "first((SELECT 1)) as `B` -- ",
+            "(SELECT 1) + min",
+            "sum + 1",
+            "sum, max",
+            "sum;",
+            "",
+            "IDENTIFIER((SELECT 1))",
+        ]:
+            with self.subTest(aggfunc=aggfunc):
+                with self.assertRaises(ParseException):
+                    psdf.groupby("A").agg({"B": aggfunc}).to_pandas()
+
+        # A quoted string is still a name: it does not become the body of the aggregate.
+        with self.assertRaises(AnalysisException):
+            psdf.groupby("A").agg({"B": "`(SELECT 1) + min`"}).to_pandas()
+
+        # every way of naming the aggregation names it the same way
+        aggfunc = "first((SELECT 1)) as `B` -- "
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(aggfunc).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg([aggfunc]).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg({"B": ["min", aggfunc]}).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(b=("B", aggfunc)).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.groupby("A").agg(b=ps.NamedAgg(column="B", aggfunc=aggfunc)).to_pandas()
+        with self.assertRaises(ParseException):
+            psdf.agg({"B": aggfunc}).to_pandas()
+
+        # a list of aggregations is checked for holding names at all, as a dict of them is
+        msg = "If the given function is a list, it should only contains function names as strings."
+        with self.assertRaisesRegex(ValueError, msg):
+            psdf.groupby("A").agg([1])
 
     def test_aggregate_relabel(self):
         # this is to test named aggregation in groupby
