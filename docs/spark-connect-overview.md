@@ -368,11 +368,30 @@ one may implement their own class extending `ClassFinder` for customized search 
 
 # Client application authentication
 
-While Spark Connect does not have built-in authentication, it is designed to
-work seamlessly with your existing authentication infrastructure. Its gRPC
-HTTP/2 interface allows for the use of authenticating proxies, which makes
-it possible to secure Spark Connect without having to implement authentication
-logic in Spark directly.
+Spark Connect does not have built-in authentication or authorization. The
+server trusts the client-supplied user ID, and any client that can reach the
+Spark Connect port (15002 by default) can execute arbitrary code as the Spark
+driver principal, for example by uploading and invoking application JARs.
+
+By default, the Spark Connect server only binds to a loopback address
+(`spark.connect.grpc.binding.address` defaults to `localhost`), so it is only
+reachable from the local host. If you configure it to bind to a non-loopback
+address, you must restrict network access to the Spark Connect port to
+trusted clients. Its gRPC HTTP/2 interface allows for the use of
+authenticating proxies, which makes it possible to secure Spark Connect
+without having to implement authentication logic in Spark directly.
+
+Spark's RPC authentication (`spark.authenticate` and
+`spark.authenticate.secret`) does not apply to Spark Connect clients. Neither
+does `spark.connect.authenticate.token` (or the `SPARK_CONNECT_AUTHENTICATE_TOKEN`
+environment variable): the server accepts the `token=` connection parameter
+shown above, but does not itself check it against a configured token in this
+version, so it provides no authentication on its own without a proxy in
+front of the port that validates it. To avoid giving a false sense of
+security, the Spark Connect server refuses to start with a non-loopback bind
+address when any of `spark.authenticate`, `spark.authenticate.secret`, or
+`spark.connect.authenticate.token` is configured. Set
+`spark.connect.grpc.binding.check.enabled` to `false` to disable this check.
 
 # What is supported
 

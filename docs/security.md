@@ -53,6 +53,21 @@ The REST Submission Server and the MesosClusterDispatcher do not support authent
 ensure that all network access to the REST API & MesosClusterDispatcher (port 6066 and 7077
 respectively by default) are restricted to hosts that are trusted to submit jobs.
 
+Similarly, the Spark Connect server does not support authentication or authorization: it trusts
+the client-supplied user identity, and any client that can reach its port (15002 by default) can
+execute arbitrary code as the Spark driver principal. By default the Spark Connect server only
+binds to a loopback address (`spark.connect.grpc.binding.address` defaults to `localhost`). If
+it is configured to bind to a non-loopback address, network access to the Spark Connect port
+must be restricted to trusted clients, for example by fronting it with an authenticating proxy
+(see the [Spark Connect overview](spark-connect-overview.html#client-application-authentication)).
+With a non-loopback bind address, the Spark Connect server refuses to start when Spark RPC
+authentication is configured, since those settings do not apply to Spark Connect clients.
+`spark.connect.authenticate.token` (or the `SPARK_CONNECT_AUTHENTICATE_TOKEN` environment
+variable) is treated the same way: setting it does not make the server check the token on
+requests in this version, so a non-loopback bind is refused rather than let it stand in for
+real authentication. This startup check can be disabled by setting
+`spark.connect.grpc.binding.check.enabled` to `false`.
+
 ### YARN
 
 For Spark on [YARN](running-on-yarn.html), Spark will automatically handle generating and

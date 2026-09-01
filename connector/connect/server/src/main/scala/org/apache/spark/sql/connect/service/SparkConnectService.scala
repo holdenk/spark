@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.connect.service
 
+import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.{Callable, TimeUnit}
 
@@ -33,14 +34,15 @@ import io.grpc.protobuf.services.ProtoReflectionService
 import io.grpc.stub.StreamObserver
 import org.apache.commons.lang3.StringUtils
 
-import org.apache.spark.{SparkContext, SparkEnv, SparkSQLException}
+import org.apache.spark.{SecurityManager, SparkContext, SparkEnv, SparkSQLException}
 import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.{AddArtifactsRequest, AddArtifactsResponse, SparkConnectServiceGrpc}
 import org.apache.spark.connect.proto.SparkConnectServiceGrpc.AsyncService
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.NETWORK_AUTH_ENABLED
 import org.apache.spark.internal.config.UI.UI_ENABLED
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.connect.config.Connect.{CONNECT_GRPC_BINDING_PORT, CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT, CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE}
+import org.apache.spark.sql.connect.config.Connect.{getAuthenticateToken, CONNECT_GRPC_BINDING_ADDRESS, CONNECT_GRPC_BINDING_CHECK_ENABLED, CONNECT_GRPC_BINDING_PORT, CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT, CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE}
 import org.apache.spark.sql.connect.ui.{SparkConnectServerAppStatusStore, SparkConnectServerListener, SparkConnectServerTab}
 import org.apache.spark.sql.connect.utils.ErrorUtils
 import org.apache.spark.status.ElementTrackingStore
@@ -396,11 +398,30 @@ object SparkConnectService extends Logging {
    * Starts the GRPC Service.
    */
   private def startGRPCService(): Unit = {
-    val debugMode = SparkEnv.get.conf.getBoolean("spark.connect.grpc.debug.enabled", true)
-    val port = SparkEnv.get.conf.get(CONNECT_GRPC_BINDING_PORT)
+    val conf = SparkEnv.get.conf
+    val port = conf.get(CONNECT_GRPC_BINDING_PORT)
+    val bindAddress = new InetSocketAddress(conf.get(CONNECT_GRPC_BINDING_ADDRESS), port)
+
+    // Neither Spark's RPC authentication nor spark.connect.authenticate.token is enforced
+    // per-request against Connect clients in this version, so refuse a non-loopback bind
+    // when either is configured (mirrors the RestSubmissionServer check in Master).
+    val authKey = SecurityManager.SPARK_AUTH_SECRET_CONF
+    require(
+      !conf.get(CONNECT_GRPC_BINDING_CHECK_ENABLED) ||
+        Option(bindAddress.getAddress).exists(_.isLoopbackAddress) ||
+        (conf.getOption(authKey).isEmpty && !conf.get(NETWORK_AUTH_ENABLED) &&
+          getAuthenticateToken.isEmpty),
+      s"The Spark Connect server does not support authentication via " +
+        s"${NETWORK_AUTH_ENABLED.key}, $authKey, or spark.connect.authenticate.token. " +
+        "Either bind the Spark Connect " +
+        "server to a loopback address (the default for spark.connect.grpc.binding.address), " +
+        "do not start it, do not configure authentication, or set " +
+        s"${CONNECT_GRPC_BINDING_CHECK_ENABLED.key} to false.")
+
+    val debugMode = conf.getBoolean("spark.connect.grpc.debug.enabled", true)
     val sb = NettyServerBuilder
-      .forPort(port)
-      .maxInboundMessageSize(SparkEnv.get.conf.get(CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE).toInt)
+      .forAddress(bindAddress)
+      .maxInboundMessageSize(conf.get(CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE).toInt)
       .addService(new SparkConnectService(debugMode))
 
     // Add all registered interceptors to the server builder.

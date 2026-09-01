@@ -18,11 +18,23 @@ package org.apache.spark.sql.connect.config
 
 import java.util.concurrent.TimeUnit
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.connect.common.config.ConnectCommon
 
 object Connect {
   import org.apache.spark.sql.internal.SQLConf.buildStaticConf
+
+  val CONNECT_GRPC_BINDING_ADDRESS =
+    buildStaticConf("spark.connect.grpc.binding.address")
+      .doc(
+        "The address for the Spark Connect server to bind. It defaults to localhost, so " +
+          "that the server is only reachable from the local host. The Spark Connect server " +
+          "performs no authentication, so only bind a non-loopback address after restricting " +
+          "network access to the port to trusted clients.")
+      .version("3.5.10")
+      .stringConf
+      .createWithDefault("localhost")
 
   val CONNECT_GRPC_BINDING_PORT =
     buildStaticConf("spark.connect.grpc.binding.port")
@@ -30,6 +42,37 @@ object Connect {
       .version("3.4.0")
       .intConf
       .createWithDefault(ConnectCommon.CONNECT_GRPC_BINDING_PORT)
+
+  val CONNECT_GRPC_BINDING_CHECK_ENABLED =
+    buildStaticConf("spark.connect.grpc.binding.check.enabled")
+      .doc(
+        "When true (the default), the Spark Connect server refuses to start with a " +
+          "non-loopback spark.connect.grpc.binding.address while Spark RPC authentication " +
+          "or spark.connect.authenticate.token is configured. Set to false to keep the " +
+          "startup behavior of earlier versions.")
+      .version("3.5.10")
+      .booleanConf
+      .createWithDefault(true)
+
+  val CONNECT_AUTHENTICATE_TOKEN_ENV = "SPARK_CONNECT_AUTHENTICATE_TOKEN"
+
+  val CONNECT_AUTHENTICATE_TOKEN =
+    buildStaticConf("spark.connect.authenticate.token")
+      .doc("A pre-shared token clients are expected to send as a bearer token to authenticate " +
+        "to the Spark Connect server. The server does not check this token on individual " +
+        "requests in this version; setting it only prevents the Spark Connect server from " +
+        "starting with a non-loopback spark.connect.grpc.binding.address, since that would " +
+        s"give a false sense of security. Also settable via the $CONNECT_AUTHENTICATE_TOKEN_ENV " +
+        "environment variable.")
+      .version("3.5.10")
+      .stringConf
+      .createOptional
+
+  def getAuthenticateToken: Option[String] = {
+    SparkEnv.get.conf
+      .get(CONNECT_AUTHENTICATE_TOKEN)
+      .orElse(Option(System.getenv(CONNECT_AUTHENTICATE_TOKEN_ENV)))
+  }
 
   val CONNECT_GRPC_INTERCEPTOR_CLASSES =
     buildStaticConf("spark.connect.grpc.interceptor.classes")
