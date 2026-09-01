@@ -286,7 +286,23 @@ class TorchDistributorBaselineUnitTestsMixin:
         )
 
         distributed_mode_input_params = {"num_processes": 4, "local_mode": False}
-        input_env_vars = {"MASTER_ADDR": "localhost", "MASTER_PORT": "9350", "RANK": "3"}
+
+        # Without the per-run rendezvous id in the environment, command construction must
+        # fail instead of falling back to a fixed rendezvous id.
+        missing_rdzv_env_vars = {"MASTER_ADDR": "localhost", "MASTER_PORT": "9350", "RANK": "3"}
+        self.setup_env_vars(missing_rdzv_env_vars)
+        with self.assertRaisesRegex(RuntimeError, "PYSPARK_TORCH_DISTRIBUTOR_RDZV_ID"):
+            TorchDistributor._create_torchrun_command(
+                distributed_mode_input_params, train_path
+            )
+        self.delete_env_vars(missing_rdzv_env_vars)
+
+        input_env_vars = {
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "9350",
+            "RANK": "3",
+            "PYSPARK_TORCH_DISTRIBUTOR_RDZV_ID": "0123456789abcdef",
+        }
 
         args_number = [1, 3]  # testing conversion to strings
         self.setup_env_vars(input_env_vars)
@@ -297,7 +313,7 @@ class TorchDistributorBaselineUnitTestsMixin:
             "--nnodes=4",
             "--node_rank=3",
             "--rdzv_endpoint=localhost:9350",
-            "--rdzv_id=0",
+            "--rdzv_id=0123456789abcdef",
             "--nproc_per_node=1",
             "train.py",
             "1",
