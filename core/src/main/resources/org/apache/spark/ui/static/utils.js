@@ -85,12 +85,40 @@ function getTimeZone() {
   }
 }
 
+/* escape XSS -- utils.js is shared, so it carries its own copy like the pages that
+ * define one (executorspage.js, stagepage.js, historypage.js). */
+function escapeHtml(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+/* Custom log URLs are rendered as links only when they are http(s) or relative
+ * URLs; anything else is shown as plain text. Browsers strip ASCII whitespace
+ * and control characters when parsing URLs, so remove them before checking
+ * the scheme. */
+function isHttpOrRelativeUrl(url) {
+  if (typeof url !== 'string') return false;
+  /* eslint-disable-next-line no-control-regex */
+  var normalized = url.replace(/[\u0000-\u0020]/g, '').toLowerCase();
+  return /^https?:\/\//.test(normalized) || !/^[a-z][a-z0-9+.-]*:/.test(normalized);
+}
+
 function formatLogsCells(execLogs, type) {
   if (type !== 'display') return Object.keys(execLogs);
   if (!execLogs) return;
   var result = '';
   $.each(execLogs, function (logName, logUrl) {
-    result += '<div><a href=' + logUrl + '>' + logName + '</a></div>'
+    // Custom log names and URLs can contain markup characters.
+    if (isHttpOrRelativeUrl(logUrl)) {
+      result += '<div><a href="' + escapeHtml(logUrl) + '">' + escapeHtml(logName) + '</a></div>'
+    } else {
+      result += '<div>' + escapeHtml(logName) + '</div>'
+    }
   });
   return result;
 }
