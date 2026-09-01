@@ -1531,8 +1531,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
         app
     }
 
-    // The listing is keyed on the application ID declared inside event-log content, which
-    // any writer to a shared (world-writable, sticky-bit) event-log directory.
+    // The listing is keyed on the application ID declared inside the event log's content, so
+    // two different log files in the same directory can declare the same key.
     if (!(oldApp eq app)) {
       val conflicting = oldApp.attempts.find(_.info.attemptId == attempt.info.attemptId)
         .filterNot(existing => isSameLogLocation(existing, attempt))
