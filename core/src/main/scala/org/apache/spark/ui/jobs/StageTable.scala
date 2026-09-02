@@ -40,7 +40,9 @@ private[ui] class StageTableBase(
     subPath: String,
     isFairScheduler: Boolean,
     killEnabled: Boolean,
-    isFailedStage: Boolean) {
+    isFailedStage: Boolean,
+    killViaGetEnabled: Boolean,
+    csrfToken: String) {
 
   val stagePage = Option(request.getParameter(stageTag + ".page")).map(_.toInt).getOrElse(1)
 
@@ -56,6 +58,8 @@ private[ui] class StageTableBase(
       subPath,
       isFairScheduler,
       killEnabled,
+      killViaGetEnabled,
+      csrfToken,
       currentTime,
       isFailedStage,
       request
@@ -101,6 +105,8 @@ private[ui] class StagePagedTable(
     subPath: String,
     isFairScheduler: Boolean,
     killEnabled: Boolean,
+    killViaGetEnabled: Boolean,
+    csrfToken: String,
     currentTime: Long,
     isFailedStage: Boolean,
     request: HttpServletRequest) extends PagedTable[StageTableRowData] {
@@ -221,11 +227,24 @@ private[ui] class StagePagedTable(
     val basePathUri = UIUtils.prependBaseUri(request, basePath)
 
     val killLink = if (killEnabled) {
-      // SPARK-6846 this should be POST-only but YARN AM won't proxy POST
-      val killLinkUri = s"$basePathUri/stages/stage/kill/?id=${s.stageId}"
-      <a href={killLinkUri}
-         data-kill-message={s"Are you sure you want to kill stage ${s.stageId} ?"}
-         class="kill-link float-end">(kill)</a>
+      val killMessage = s"Are you sure you want to kill stage ${s.stageId} ?"
+      if (killViaGetEnabled) {
+        // A plain GET link, which also works through proxies that do not forward POST,
+        // such as the YARN ResourceManager/AM proxy (SPARK-6846). The endpoint requires
+        // the CSRF token and rejects prefetch requests (see SparkUI.initialize), and
+        // webui.js gates the click on the confirmation dialog.
+        <a href={s"$basePathUri/stages/stage/kill/?id=${s.stageId}&csrfToken=$csrfToken"}
+           data-kill-message={killMessage}
+           class="kill-link float-end">(kill)</a>
+      } else {
+        // POST-only mode: the same form-wrapped link the master UI uses, which webui.js
+        // submits through the enclosing form after the confirmation dialog.
+        <form action={s"$basePathUri/stages/stage/kill/"} method="POST" class="d-inline float-end">
+          <input type="hidden" name="id" value={s.stageId.toString}/>
+          <input type="hidden" name="csrfToken" value={csrfToken}/>
+          <a href="#" data-kill-message={killMessage} class="kill-link">(kill)</a>
+        </form>
+      }
     } else {
       Seq.empty
     }
