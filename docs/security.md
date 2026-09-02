@@ -343,6 +343,8 @@ The following options control the authentication of Web UIs:
   <td>
     Whether to authorize requests that carry no authenticated user identity (a null remote
     user) when ACLs are enabled. Set to true to restore the behavior of earlier releases.
+    The default changed to false in 3.5.10; it was also backported to the 4.0.x, 4.1.x,
+    and 4.2.x lines and is the default starting in 4.3.0.
   </td>
   <td>3.5.10</td>
 </tr>
