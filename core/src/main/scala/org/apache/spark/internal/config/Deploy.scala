@@ -43,7 +43,9 @@ private[spark] object Deploy {
         "recovery. Set to '*' to disable filtering. Only the class-name patterns of the " +
         "java.io.ObjectInputFilter syntax are supported here, because that class requires " +
         "Java 9 and this branch supports Java 8; an unsupported pattern is rejected rather " +
-        "than partially applied.")
+        "than partially applied. " +
+        "Introduced in 4.3.0; also available in 3.5.10, 4.0.5, 4.1.4 and 4.2.1; and in " +
+        "all versions after 4.3.0.")
       .version("3.5.10")
       .stringConf
       .createWithDefault("java.**;scala.**;org.apache.spark.**;!*")
