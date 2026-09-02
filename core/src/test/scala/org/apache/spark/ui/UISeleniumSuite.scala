@@ -26,6 +26,7 @@ import scala.xml.Node
 
 import com.gargoylesoftware.css.parser.CSSParseException
 import com.gargoylesoftware.htmlunit.DefaultCssErrorHandler
+import org.eclipse.jetty.client.HttpClient
 import org.glassfish.jersey.internal.util.collection.MultivaluedStringMap
 import org.json4s._
 import org.json4s.jackson.JsonMethods
@@ -258,6 +259,79 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
 
       val updatedStageJson = getJson(sc.ui.get, "stages")
       updatedStageJson should be (stageJson)
+    }
+  }
+
+  private def scrapeCsrfToken(sc: SparkContext): String = {
+    val html = Utils.tryWithResource(
+      Source.fromURL(sc.ui.get.webUrl.stripSuffix("/") + "/jobs/"))(_.mkString)
+    """(?:csrfToken=|name="csrfToken" value=")([0-9a-f]+)""".r
+      .findFirstMatchIn(html)
+      .map(_.group(1))
+      .getOrElse(fail("no CSRF token found on the jobs page"))
+  }
+
+  test("kill endpoints require the CSRF token, and refuse prefetch and HEAD") {
+    // GET mode is off by default outside YARN, and this test is about the token, so ask
+    // for GET explicitly.
+    withSpark(newSparkContext(killEnabled = true,
+      additionalConfs = Map(UI_KILL_VIA_GET_ENABLED.key -> "true"))) { sc =>
+      sc.parallelize(1 to 10).map { x => Thread.sleep(10000); x }.countAsync()
+      val base = sc.ui.get.webUrl.stripSuffix("/")
+      // Retry only until the kill link appears. Everything after this runs once: a request
+      // that the endpoint accepts kills the job, and the link is then gone, so retrying
+      // the whole block could never succeed a second time.
+      val token = eventually(timeout(10.seconds), interval(50.milliseconds))(scrapeCsrfToken(sc))
+
+      Seq("/jobs/job/kill/?id=0", "/stages/stage/kill/?id=0").foreach { path =>
+        val withToken = new URL(base + path + s"&csrfToken=$token")
+        // Forged or scripted requests without the token, or with a wrong one, fail.
+        assert(TestUtils.httpResponseCode(new URL(base + path)) === 403)
+        assert(TestUtils.httpResponseCode(new URL(base + path + "&csrfToken=bogus")) === 403)
+        // HEAD must be safe (RFC 9110), so it is refused rather than delegated to doGet.
+        assert(TestUtils.httpResponseCode(withToken, "HEAD") === 405)
+        // Browser link prefetchers identify themselves; a valid token must not save them,
+        // since the token rides in the link they prefetch. HttpURLConnection drops
+        // Sec-Purpose, so drive these through Jetty's client instead.
+        val client = new HttpClient()
+        client.start()
+        try {
+          Seq("Sec-Purpose" -> "prefetch", "Purpose" -> "prefetch", "X-Moz" -> "prefetch")
+            .foreach { case (name, value) =>
+              assert(client.newRequest(withToken.toURI).header(name, value).send().getStatus
+                === 403, s"prefetch header $name was not rejected")
+            }
+        } finally {
+          client.stop()
+        }
+        // Last, because it is the one that actually kills.
+        assert(TestUtils.httpResponseCode(withToken) === 200)
+      }
+    }
+  }
+
+  test("kill link rendering follows spark.ui.killViaGetEnabled") {
+    withSpark(newSparkContext(killEnabled = true,
+      additionalConfs = Map(UI_KILL_VIA_GET_ENABLED.key -> "true"))) { sc =>
+      sc.parallelize(1 to 10).map { x => Thread.sleep(10000); x }.countAsync()
+      eventually(timeout(10.seconds), interval(50.milliseconds)) {
+        val html = Utils.tryWithResource(
+          Source.fromURL(sc.ui.get.webUrl.stripSuffix("/") + "/jobs/"))(_.mkString)
+        // GET mode: a link carrying the token. ("&amp;" is the escaped "&" in the href.)
+        assert("/jobs/job/kill/\\?id=\\d+&amp;csrfToken=[0-9a-f]+".r.findFirstIn(html).isDefined)
+        assert(!html.contains("""action="/jobs/job/kill/""""))
+      }
+    }
+    // No explicit setting and spark.master is local, so the default resolves to POST-only.
+    withSpark(newSparkContext(killEnabled = true)) { sc =>
+      sc.parallelize(1 to 10).map { x => Thread.sleep(10000); x }.countAsync()
+      eventually(timeout(10.seconds), interval(50.milliseconds)) {
+        val html = Utils.tryWithResource(
+          Source.fromURL(sc.ui.get.webUrl.stripSuffix("/") + "/jobs/"))(_.mkString)
+        assert(!html.contains("/jobs/job/kill/?id="))
+        assert(html.contains("""action="/jobs/job/kill/""""))
+        assert(html.contains("""name="csrfToken""""))
+      }
     }
   }
 
@@ -539,28 +613,28 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
   }
 
   test("kill stage POST/GET response is correct") {
-    withSpark(newSparkContext(killEnabled = true)) { sc =>
+    // GET is refused unless asked for, and either method needs the per-UI CSRF token.
+    withSpark(newSparkContext(killEnabled = true,
+      additionalConfs = Map(UI_KILL_VIA_GET_ENABLED.key -> "true"))) { sc =>
       sc.parallelize(1 to 10).map{x => Thread.sleep(10000); x}.countAsync()
-      eventually(timeout(5.seconds), interval(50.milliseconds)) {
-        val url = new URL(
-          sc.ui.get.webUrl.stripSuffix("/") + "/stages/stage/kill/?id=0")
-        // SPARK-6846: should be POST only but YARN AM doesn't proxy POST
-        TestUtils.httpResponseCode(url, "GET") should be (200)
-        TestUtils.httpResponseCode(url, "POST") should be (200)
-      }
+      val token = eventually(timeout(10.seconds), interval(50.milliseconds))(scrapeCsrfToken(sc))
+      val url = new URL(
+        sc.ui.get.webUrl.stripSuffix("/") + "/stages/stage/kill/?id=0" + s"&csrfToken=$token")
+      TestUtils.httpResponseCode(url, "GET") should be (200)
+      TestUtils.httpResponseCode(url, "POST") should be (200)
     }
   }
 
   test("kill job POST/GET response is correct") {
-    withSpark(newSparkContext(killEnabled = true)) { sc =>
+    // GET is refused unless asked for, and either method needs the per-UI CSRF token.
+    withSpark(newSparkContext(killEnabled = true,
+      additionalConfs = Map(UI_KILL_VIA_GET_ENABLED.key -> "true"))) { sc =>
       sc.parallelize(1 to 10).map{x => Thread.sleep(10000); x}.countAsync()
-      eventually(timeout(5.seconds), interval(50.milliseconds)) {
-        val url = new URL(
-          sc.ui.get.webUrl.stripSuffix("/") + "/jobs/job/kill/?id=0")
-        // SPARK-6846: should be POST only but YARN AM doesn't proxy POST
-        TestUtils.httpResponseCode(url, "GET") should be (200)
-        TestUtils.httpResponseCode(url, "POST") should be (200)
-      }
+      val token = eventually(timeout(10.seconds), interval(50.milliseconds))(scrapeCsrfToken(sc))
+      val url = new URL(
+        sc.ui.get.webUrl.stripSuffix("/") + "/jobs/job/kill/?id=0" + s"&csrfToken=$token")
+      TestUtils.httpResponseCode(url, "GET") should be (200)
+      TestUtils.httpResponseCode(url, "POST") should be (200)
     }
   }
 
