@@ -608,6 +608,73 @@ private[kafka010] object KafkaSourceProvider extends Logging {
   private val serClassName = classOf[ByteArraySerializer].getName
   private val deserClassName = classOf[ByteArrayDeserializer].getName
 
+  /**
+   * JVM system property a cluster administrator can set (e.g. via
+   * spark.driver.extraJavaOptions / spark.executor.extraJavaOptions) to allow the Kafka
+   * client options held back by [[validateRestrictedKafkaParams]] through data source
+   * options. Deliberately not a SQL or DataFrame option, so the set of forwarded options
+   * stays administrator-controlled.
+   */
+  private[kafka010] val ALLOW_RESTRICTED_OPTIONS_PROP = "spark.kafka.sql.allowRestrictedOptions"
+
+  /**
+   * Kafka client configs whose values name classes the Kafka client loads in the Spark JVM
+   * (on the driver, and on executors for the consumer/producer path). They are held back
+   * from data source options so the set of classes loaded from user-supplied options stays
+   * bounded. Keys are compared case-insensitively in lower case.
+   */
+  private[kafka010] val CLASS_LOADING_KAFKA_CONFIGS: Set[String] = Set(
+    "metric.reporters",
+    "interceptor.classes",
+    "ssl.engine.factory.class",
+    "sasl.login.class",
+    "sasl.login.callback.handler.class",
+    "sasl.client.callback.handler.class",
+    "security.providers")
+
+  /**
+   * JAAS login modules that are not accepted in the 'kafka.sasl.jaas.config' data source
+   * option value. Matched case-insensitively as substrings of the option value.
+   */
+  private[kafka010] val DISALLOWED_SASL_LOGIN_MODULES: Set[String] = Set(
+    "com.sun.security.auth.module.JndiLoginModule",
+    "com.sun.security.auth.module.LdapLoginModule")
+
+  /**
+   * Holds back user-specified Kafka parameters that name classes for the Kafka client to load
+   * in the Spark JVM, so they are not forwarded from data source options. Runs on every path
+   * that forwards 'kafka.'-prefixed data source options to a Kafka consumer, producer or
+   * admin client (see convertToSpecifiedParams).
+   */
+  private[kafka010] def validateRestrictedKafkaParams(
+      specifiedKafkaParams: Map[String, String]): Unit = {
+    if (java.lang.Boolean.getBoolean(ALLOW_RESTRICTED_OPTIONS_PROP)) {
+      return
+    }
+    specifiedKafkaParams.foreach { case (key, value) =>
+      val normalizedKey = key.toLowerCase(Locale.ROOT)
+      if (CLASS_LOADING_KAFKA_CONFIGS.contains(normalizedKey)) {
+        throw new IllegalArgumentException(
+          s"Kafka option 'kafka.$key' is not supported through data source options because " +
+            "it names classes the Kafka client loads in the Spark JVM. A cluster " +
+            "administrator may allow it by setting the JVM system property " +
+            s"'$ALLOW_RESTRICTED_OPTIONS_PROP=true' on the driver and executors.")
+      }
+      if (normalizedKey == "sasl.jaas.config") {
+        val normalizedValue = value.toLowerCase(Locale.ROOT)
+        DISALLOWED_SASL_LOGIN_MODULES.foreach { module =>
+          if (normalizedValue.contains(module.toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException(
+              s"Kafka option 'kafka.sasl.jaas.config' referencing the login module " +
+                s"'$module' is not supported through data source options. A cluster " +
+                "administrator may allow it by setting the JVM system property " +
+                s"'$ALLOW_RESTRICTED_OPTIONS_PROP=true' on the driver and executors.")
+          }
+        }
+      }
+    }
+  }
+
   def getKafkaOffsetRangeLimit(
       params: CaseInsensitiveMap[String],
       globalOffsetTimestampOptionKey: String,
@@ -732,10 +799,12 @@ private[kafka010] object KafkaSourceProvider extends Logging {
   }
 
   private def convertToSpecifiedParams(parameters: Map[String, String]): Map[String, String] = {
-    parameters
+    val specified = parameters
       .keySet
       .filter(_.toLowerCase(Locale.ROOT).startsWith("kafka."))
       .map { k => k.drop(6) -> parameters(k) }
       .toMap
+    validateRestrictedKafkaParams(specified)
+    specified
   }
 }
