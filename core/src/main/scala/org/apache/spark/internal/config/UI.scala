@@ -176,8 +176,10 @@ private[spark] object UI {
   val ACLS_ALLOW_NULL_USER = ConfigBuilder("spark.acls.allowNullUser")
     .doc("Whether to authorize requests that carry no authenticated user identity (a null " +
       "remote user) when ACLs are enabled. When false, such requests are denied. Set to " +
-      "true to restore the behavior of earlier releases.")
-    .version("4.4.0")
+      "true to restore the behavior of earlier releases. The default changed to false in " +
+      "3.5.10; it was also backported to the 4.0.x, 4.1.x, and 4.2.x lines and is the " +
+      "default starting in 4.3.0.")
+    .version("3.5.10")
     .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
     .booleanConf
     .createWithDefault(false)
