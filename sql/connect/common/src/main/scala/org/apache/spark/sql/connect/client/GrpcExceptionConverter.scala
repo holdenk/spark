@@ -489,8 +489,8 @@ private[client] object GrpcExceptionConverter {
     val visitedWithCurrent = visited + errorIdx
     val causeOpt =
       if (error.hasCauseIdx && error.getCauseIdx >= 0 && error.getCauseIdx < errors.size &&
-          !visitedWithCurrent.contains(error.getCauseIdx) &&
-          visitedWithCurrent.size < MAX_ERROR_CHAIN_DEPTH) {
+        !visitedWithCurrent.contains(error.getCauseIdx) &&
+        visitedWithCurrent.size < MAX_ERROR_CHAIN_DEPTH) {
         Some(errorsToThrowable(error.getCauseIdx, errors, visitedWithCurrent))
       } else {
         None
