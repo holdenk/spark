@@ -21,6 +21,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicBoolean
 
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.security.{Credentials, UserGroupInformation}
@@ -58,6 +59,9 @@ private[spark] class SecurityManager(
   private val authOn = sparkConf.get(NETWORK_AUTH_ENABLED)
   private var aclsOn = sparkConf.get(ACLS_ENABLE)
   private val allowNullUserInAcls = sparkConf.get(ACLS_ALLOW_NULL_USER)
+
+  // Guards the one-shot error logged the first time a request is refused for having no user.
+  private val warnedAboutNullUser = new AtomicBoolean(false)
 
   // admin acls should be set before view or modify acls
   private var adminAcls: Set[String] = sparkConf.get(ADMIN_ACLS).toSet
@@ -102,17 +106,6 @@ private[spark] class SecurityManager(
     log"; groups with modify permissions: ${MDC(LogKeys.MODIFY_ACLS_GROUPS,
       if (modifyAclsGroups.nonEmpty) modifyAclsGroups.mkString(", ") else "EMPTY")}" +
     log"; RPC SSL ${MDC(LogKeys.RPC_SSL_ENABLED, if (sslRpcEnabled) "enabled" else "disabled")}")
-
-  // Enabling ACLs without a filter to establish who is asking leaves nothing to authorize
-  // against, so every request is refused. Say so once, loudly, rather than only per-request
-  // at debug level: the symptom is a blanket 403 that names no configuration.
-  if (aclsOn && !allowNullUserInAcls && sparkConf.get(UI_FILTERS).isEmpty &&
-      !viewAcls.contains(WILDCARD_ACL) && !viewAclsGroups.contains(WILDCARD_ACL)) {
-    logError(s"${ACLS_ENABLE.key} is enabled but ${UI_FILTERS.key} is empty, so requests " +
-      "arrive with no user to authorize and will be refused. Configure an authentication " +
-      s"filter, or widen the acls to $WILDCARD_ACL, or set " +
-      s"${ACLS_ALLOW_NULL_USER.key} to true.")
-  }
 
   private val hadoopConf = SparkHadoopUtil.get.newConfiguration(sparkConf)
   // the default SSL configuration - it will be used by all communication layers unless overwritten
@@ -426,6 +419,16 @@ private[spark] class SecurityManager(
     } else if (user == null) {
       // The ACL names particular users or groups, and no authentication filter established an
       // identity for this request, so there is nothing to match it against.
+      if (!allowNullUserInAcls && warnedAboutNullUser.compareAndSet(false, true)) {
+        // Say this once at error level: the symptom is otherwise a blanket 403 that names no
+        // configuration, and the per-request detail below is invisible at the default level.
+        // Reported on the first refusal rather than at startup, because a filter can be
+        // installed after this object exists -- YARN client mode does exactly that.
+        logError(s"A request was refused because it carried no authenticated user and the " +
+          s"acls name particular users or groups. Configure an authentication filter via " +
+          s"${UI_FILTERS.key} so requests arrive with a user, widen the acls to " +
+          s"$WILDCARD_ACL, or set ${ACLS_ALLOW_NULL_USER.key} to true.")
+      }
       logDebug("The request has no authenticated user and the ACL is not a wildcard; denying " +
         s"access. Set ${ACLS_ALLOW_NULL_USER.key}=true to allow requests without a user.")
       allowNullUserInAcls
