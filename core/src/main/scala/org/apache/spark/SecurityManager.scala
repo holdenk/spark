@@ -103,6 +103,17 @@ private[spark] class SecurityManager(
       if (modifyAclsGroups.nonEmpty) modifyAclsGroups.mkString(", ") else "EMPTY")}" +
     log"; RPC SSL ${MDC(LogKeys.RPC_SSL_ENABLED, if (sslRpcEnabled) "enabled" else "disabled")}")
 
+  // Enabling ACLs without a filter to establish who is asking leaves nothing to authorize
+  // against, so every request is refused. Say so once, loudly, rather than only per-request
+  // at debug level: the symptom is a blanket 403 that names no configuration.
+  if (aclsOn && !allowNullUserInAcls && sparkConf.get(UI_FILTERS).isEmpty &&
+      !viewAcls.contains(WILDCARD_ACL) && !viewAclsGroups.contains(WILDCARD_ACL)) {
+    logError(s"${ACLS_ENABLE.key} is enabled but ${UI_FILTERS.key} is empty, so requests " +
+      "arrive with no user to authorize and will be refused. Configure an authentication " +
+      s"filter, or widen the acls to $WILDCARD_ACL, or set " +
+      s"${ACLS_ALLOW_NULL_USER.key} to true.")
+  }
+
   private val hadoopConf = SparkHadoopUtil.get.newConfiguration(sparkConf)
   // the default SSL configuration - it will be used by all communication layers unless overwritten
   private val defaultSSLOptions =
@@ -241,7 +252,8 @@ private[spark] class SecurityManager(
    * authorization to view the UI. If the UI acls are disabled
    * via spark.acls.enable, all users have view access. If the user is null and acls are
    * enabled, access is denied unless spark.acls.allowNullUser is set. Also if any one of the
-   * UI acls or groups specify the WILDCARD(*) then all authenticated users have view access.
+   * UI acls or groups specify the WILDCARD(*) then all users have view access, including
+   * requests that carry no user, since such an acl restricts nobody.
    *
    * @param user to see if is authorized
    * @return true is the user has permission, otherwise false
@@ -257,8 +269,8 @@ private[spark] class SecurityManager(
    * authorization to modify the application. If the modify acls are disabled
    * via spark.acls.enable, all users have modify access. If the user is null and acls are
    * enabled, access is denied unless spark.acls.allowNullUser is set. Also if any one
-   * of the modify acls or groups specify the WILDCARD(*) then all authenticated users have
-   * modify access.
+   * of the modify acls or groups specify the WILDCARD(*) then all users have modify access,
+   * including requests that carry no user, since such an acl restricts nobody.
    *
    * @param user to see if is authorized
    * @return true is the user has permission, otherwise false
@@ -405,20 +417,19 @@ private[spark] class SecurityManager(
       user: String,
       aclUsers: Set[String],
       aclGroups: Set[String]): Boolean = {
-    if (user == null) {
-      // A null user means no authentication filter established an identity for the request.
-      // Deny such requests when ACLs are enabled, unless the legacy behavior is restored.
-      if (aclsEnabled() && !allowNullUserInAcls) {
-        logDebug("ACLs are enabled and the request has no authenticated user; denying access. " +
-          s"Set ${ACLS_ALLOW_NULL_USER.key}=true to allow requests without a user.")
-        false
-      } else {
-        true
-      }
-    } else if (!aclsEnabled() ||
-        aclUsers.contains(WILDCARD_ACL) ||
-        aclUsers.contains(user) ||
-        aclGroups.contains(WILDCARD_ACL)) {
+    if (!aclsEnabled()) {
+      true
+    } else if (aclUsers.contains(WILDCARD_ACL) || aclGroups.contains(WILDCARD_ACL)) {
+      // The wildcard admits everyone, so this ACL restricts nothing and there is no identity
+      // worth checking. Requests that carry no user are covered by it like any other.
+      true
+    } else if (user == null) {
+      // The ACL names particular users or groups, and no authentication filter established an
+      // identity for this request, so there is nothing to match it against.
+      logDebug("The request has no authenticated user and the ACL is not a wildcard; denying " +
+        s"access. Set ${ACLS_ALLOW_NULL_USER.key}=true to allow requests without a user.")
+      allowNullUserInAcls
+    } else if (aclUsers.contains(user)) {
       true
     } else {
       val userGroups = Utils.getCurrentUserGroups(sparkConf, user)
