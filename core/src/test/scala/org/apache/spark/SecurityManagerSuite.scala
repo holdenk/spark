@@ -325,11 +325,20 @@ class SecurityManagerSuite extends SparkFunSuite with ResetSystemProperties {
     assert(securityManager.checkUIViewPermissions("user1"))
     assert(securityManager.checkUIViewPermissions("user5"))
     assert(securityManager.checkUIViewPermissions("user6"))
-    // the wildcard does not cover requests without an authenticated user
-    assert(securityManager.checkUIViewPermissions(null) === false)
+    // the wildcard restricts nobody, so it covers requests with no authenticated user too
+    assert(securityManager.checkUIViewPermissions(null))
     assert(securityManager.checkModifyPermissions("user4"))
     assert(securityManager.checkModifyPermissions("user7") === false)
     assert(securityManager.checkModifyPermissions("user8") === false)
+
+    // a wildcard in the groups acl behaves the same way
+    securityManager.setViewAcls(Set[String]("user1"), Seq("user2"))
+    securityManager.setViewAclsGroups(Seq("*"))
+    assert(securityManager.checkUIViewPermissions(null))
+
+    // ...but once the acl names particular users again, there is nothing to match
+    securityManager.setViewAclsGroups(Seq("group1"))
+    assert(securityManager.checkUIViewPermissions(null) === false)
 
     // check for modifyAcls with *
     securityManager.setModifyAcls(Set("user4"), Seq("*"))
