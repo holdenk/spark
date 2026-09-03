@@ -202,7 +202,7 @@ private[spark] object UI {
       "requests arrive with no user. " +
       "Introduced in 4.3.0; also available in 3.5.10, 4.0.5, 4.1.4 and 4.2.1; and in all " +
       "versions after 4.3.0.")
-    .version("4.3.0")
+    .version("4.2.1")
     .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
     .booleanConf
     .createWithDefault(false)
