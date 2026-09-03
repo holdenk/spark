@@ -377,8 +377,8 @@ The following options control the authentication of Web UIs:
     Whether UI ACLs should be enabled. If enabled, this checks to see if the user has access
     permissions to view or modify the application. Note this requires the user to be authenticated,
     so an authentication filter that establishes the remote user should be installed; requests
-    that carry no authenticated user are denied unless <code>spark.acls.allowNullUser</code>
-    is set to true.
+    that carry no authenticated user are denied unless the acl is the wildcard <code>*</code>
+    or <code>spark.acls.allowNullUser</code> is set to true.
   </td>
   <td>1.1.0</td>
 </tr>
@@ -387,7 +387,11 @@ The following options control the authentication of Web UIs:
   <td>false</td>
   <td>
     Whether to authorize requests that carry no authenticated user identity (a null remote
-    user) when ACLs are enabled. Set to true to restore the behavior of earlier releases.
+    user) when ACLs are enabled. Such requests are denied unless the acl in question is the
+    wildcard <code>*</code>, which admits everyone and so covers them too. Set to true to
+    restore the behavior of earlier releases. Note that ACLs need an authentication filter
+    (<code>spark.ui.filters</code>) to establish who is asking; without one, requests arrive
+    with no user.
     Introduced in 4.3.0; also available in 3.5.10, 4.0.5, 4.1.4 and 4.2.1; and in all
     versions after 4.3.0.
   </td>
