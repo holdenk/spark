@@ -633,7 +633,11 @@ object SQLConf {
     .withBindingPolicy(ConfigBindingPolicy.SESSION)
     .doc("Comma-separated list of Python transpilers to attempt, in order. " +
       "The first transpiler that successfully produces a Catalyst expression " +
-      "is used. Default: catalyst.")
+      "is used. Default: catalyst. " +
+      "`catalyst` lowers to Catalyst expressions; `java` lowers to generated " +
+      "Java source (locals, several statements, early returns) at the cost of " +
+      "being opaque to the optimizer. Prefer `catalyst,java`. Off by default; " +
+      "see pyspark.sql.transpile_java for what it lowers.")
     .version("4.3.0")
     .stringConf
     .createWithDefault("catalyst")
@@ -2515,9 +2519,11 @@ object SQLConf {
         "tables. At planning time, Spark will group the partitions by only those keys that are " +
         "in the operation's keys. That is currently enabled only if " +
         s"${REQUIRE_ALL_CLUSTER_KEYS_FOR_DISTRIBUTION.key} is false. This config also gates " +
-        "grouping a partitioning that was narrowed to a subset of its keys and whose keys are no " +
-        "longer distinct, which carries the same risk of skew; that applies regardless of " +
-        s"${REQUIRE_ALL_CLUSTER_KEYS_FOR_DISTRIBUTION.key}."
+        "grouping a partitioning whose keys collapsed, that is, where a projection or a " +
+        "reduction mapped keys that were distinct in the source onto the same key, so that " +
+        "grouping them would produce a partition larger than any the source declared. That " +
+        s"applies regardless of ${REQUIRE_ALL_CLUSTER_KEYS_FOR_DISTRIBUTION.key}. It does not " +
+        "apply to duplicate keys the source itself reported, which are grouped without this config."
       )
       .version("4.0.0")
       .withBindingPolicy(ConfigBindingPolicy.SESSION)
