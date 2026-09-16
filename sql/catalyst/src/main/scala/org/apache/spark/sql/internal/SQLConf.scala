@@ -613,15 +613,12 @@ object SQLConf {
   val ATTEMPT_TRANSPILATION_OF_PYTHON_UDFS =
     buildConf("spark.sql.experimental.optimizer.transpilePyUDFs")
     .withBindingPolicy(ConfigBindingPolicy.SESSION)
-    .doc("When true, attempt to transpile Python UDFs to Catalyst expressions. " +
-        "Transpilation also requires ANSI mode (spark.sql.ansi.enabled=true) -- " +
-        "the rewritten expressions target ANSI semantics, so with ANSI off the " +
-        "transpiler falls back to interpreted Python and a warning is logged at " +
-        "UDF construction. Transpiled UDFS attempt to match the Python functionality but " +
-        "may not be 100% equivalent. Some known differences include: overflows from input types " +
-        "(you can precast to decimal to avoid), type coercion on comparison, and implicit " +
-        "returns. This initial version only works with non-Connect Spark; Spark Connect " +
-        "support is to follow. This is an *experimental* feature."
+    .doc("When true, attempts to replace supported scalar Python UDFs with Catalyst " +
+        "expressions. This experimental feature requires ANSI mode and is unavailable " +
+        "in Spark Connect. Unsupported functions fall back to Python execution. Captured " +
+        "values may be baked into the plan only when cloudpickle snapshots them by value " +
+        "and their type is supported. Local assignments must bind literals. See the " +
+        "pyspark.sql.transpile module documentation for limitations."
     )
     .version("4.3.0")
     .booleanConf
