@@ -25,21 +25,23 @@ import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalTyp
 
 /**
  * Prunes the per-input-type options carried by a [[TranspiledPythonUDF]] down to those whose
- * declared categories match the resolved argument types.
+ * declared categories match the resolved argument types and whose expressions themselves resolve.
  *
  * A Python operator such as `a + b` is overloaded for text, so the transpiler emits one option
  * per input-type variant -- a numeric `Add` and a string `concat`, say -- each tagged with the
  * input-type categories it expects. Those options are children of the node, so leaving a
- * type-incompatible one in place (a numeric `Add` over string columns) would make `CheckAnalysis`
- * reject the whole plan. We can only choose once the argument types are known, which is after
- * reference resolution -- hence a rule here rather than in the builder, which runs at
- * call-construction time before the columns are bound -- and we must run before `CheckAnalysis`.
+ * type-incompatible or unresolved one in place (a numeric `Add` over string columns, or a Cast
+ * that never resolves) would make `CheckAnalysis` raise INTERNAL_ERROR on the whole plan. We can
+ * only choose once the argument types are known, which is after reference resolution -- hence a
+ * rule here rather than in the builder, which runs at call-construction time before the columns
+ * are bound -- and we must run before `CheckAnalysis`.
  *
  * Matching is strict by category (a numeric option only for numeric columns, a string option only
  * for string columns). We deliberately do not lean on implicit type coercion, which would, e.g.,
  * make a numeric `Add` "valid" over a string column and silently diverge from Python's
- * `TypeError`. When no option matches, the list is emptied and `ConvertToCatalyst` falls back to
- * the original Python UDF.
+ * `TypeError`. An option that matches by category but fails to resolve is dropped the same way.
+ * When none survive, the list is emptied and `ConvertToCatalyst` falls back to the original
+ * Python UDF.
  */
 object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
@@ -55,7 +57,9 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
                 if t.optionInputCategories.nonEmpty && t.pythonUDFExpr.childrenResolved =>
               val argTypes = t.pythonUDFExpr.children.map(_.dataType)
               val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
-                case (option, categories) if optionMatchesTypes(categories, argTypes) => option
+                case (option, categories)
+                    if optionMatchesTypes(categories, argTypes) && option.resolved =>
+                  option
               }
               t.copy(transpiledOptions = kept, optionInputCategories = Nil)
           }
