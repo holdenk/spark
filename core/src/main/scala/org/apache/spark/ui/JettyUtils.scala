@@ -515,7 +515,32 @@ private[spark] object JettyUtils extends Logging {
       s"?$query"
     }
     // SPARK-33611: use method `URI.create` to avoid percent-encoding twice on the query string.
-    URI.create(uri.toString() + queryString).normalize()
+    val proxyURI = try {
+      URI.create(uri.toString() + queryString).normalize()
+    } catch {
+      case _: IllegalArgumentException => null
+    }
+    // The target comes from an external registrant (an application's appUiUrl or a worker's
+    // webUiAddress); refuse to proxy to anything that is not an absolute http(s) URI.
+    if (isValidProxyTarget(proxyURI)) {
+      proxyURI
+    } else {
+      // Strip line breaks from the externally-sourced target before logging it.
+      logWarning(log"Rejecting invalid proxy target " +
+        log"${MDC(LogKeys.URI, target.replaceAll("[\r\n]+", " "))}")
+      null
+    }
+  }
+
+  /**
+   * Returns true if the URI is an absolute http(s) URI with an authority to proxy to.
+   * Checks the raw authority rather than getHost, which is null for non-RFC hostnames
+   * (e.g. containing underscores) that the proxy can still reach.
+   */
+  private def isValidProxyTarget(uri: URI): Boolean = uri != null && {
+    val scheme = uri.getScheme
+    uri.getRawAuthority != null && scheme != null &&
+      (scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
   }
 
   def createProxyLocationHeader(

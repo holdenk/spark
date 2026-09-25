@@ -228,6 +228,28 @@ class UISuite extends SparkFunSuite {
     assert(rewrittenURI.toString === s"http://$localhost:8081/json?order%5B0%5D%5Bcolumn%5D=0")
   }
 
+  test("SPARK-59625: createProxyURI rejects invalid proxy targets") {
+    val prefix = "/worker-id"
+    val path = "/worker-id/json"
+    // Absolute http(s) targets are accepted, with a case-insensitive scheme.
+    assert(JettyUtils.createProxyURI(prefix, s"http://$localhost:8081", path, null) !== null)
+    assert(JettyUtils.createProxyURI(prefix, s"https://$localhost:8081", path, null).toString ===
+      s"https://$localhost:8081/json")
+    assert(JettyUtils.createProxyURI(prefix, s"HTTP://$localhost:8081", path, null) !== null)
+    assert(JettyUtils.createProxyURI(prefix, "http://[::1]:4040", path, null) !== null)
+    // Non-RFC hostnames that the proxy can still reach (e.g. containing underscores) keep working.
+    assert(JettyUtils.createProxyURI(prefix, "http://my_host:4040", path, null) !== null)
+    // The target is externally registered (appUiUrl / webUiAddress); malformed, relative, or
+    // non-http(s) targets are rejected rather than breaking the proxy.
+    assert(JettyUtils.createProxyURI(prefix, "javascript:alert(1)", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "ftp://host:21", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "file:///etc/passwd", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "ht tp://bad url", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "http://host:4040/a b", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "http:///missing-authority", path, null) === null)
+    assert(JettyUtils.createProxyURI(prefix, "//protocol-relative:4040", path, null) === null)
+  }
+
   test("verify rewriting location header for reverse proxy") {
     val clientRequest = mock(classOf[HttpServletRequest])
     var headerValue = s"http://$localhost:4040/jobs"
@@ -565,6 +587,22 @@ class UISuite extends SparkFunSuite {
     } finally {
       stopServer(proxyServer)
       stopServer(targetServer)
+    }
+  }
+
+  test("SPARK-59625: createProxyHandler rejects an invalid proxy target") {
+    val (conf, securityMgr, sslOptions) = sslDisabledConf()
+    val proxyServer = JettyUtils.startJettyServer("0.0.0.0", 0, sslOptions, conf)
+    // The registered UI address is externally supplied; an invalid one must not be proxied.
+    val proxyHandler = JettyUtils.createProxyHandler(_ => Some("javascript:alert(1)"))
+    proxyServer.addHandler(proxyHandler, securityMgr)
+    try {
+      val proxyUrl = s"http://$localhost:${proxyServer.boundPort}/proxy/app-123/stages/"
+      TestUtils.withHttpConnection(new URI(proxyUrl).toURL) { conn =>
+        assert(conn.getResponseCode === HttpServletResponse.SC_FORBIDDEN)
+      }
+    } finally {
+      stopServer(proxyServer)
     }
   }
 
