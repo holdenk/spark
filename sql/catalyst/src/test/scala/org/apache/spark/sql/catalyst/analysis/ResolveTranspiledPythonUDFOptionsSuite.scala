@@ -189,15 +189,56 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
     val analyzed = getAnalyzer.executeAndCheck(
       Project(Seq(Alias(outer, "r")()), LocalRelation(a)), new QueryPlanningTracker)
     val nodes = nodesIn(analyzed)
+    // First, or the `forall`s below pass vacuously on an empty result and the failure arrives as a
+    // MatchError that says nothing about nothing having been transpiled.
+    assert(nodes.length == 2, s"expected both calls to survive analysis, got: $nodes")
     assert(nodes.forall(_.resolved), "every node must be resolved once analysis finishes")
     assert(nodes.forall(_.optionInputCategories.isEmpty), "categories must be cleared")
     assert(nodes.forall(_.transpiledOptions.forall(_.resolved)),
       "no unresolved option may survive to CheckAnalysis")
+    // By name rather than position: both are here, and which is which should not ride on the
+    // traversal order `collect` happens to use.
+    val analyzedInner = nodes.filter(_.name == "g").head
+    val analyzedOuter = nodes.filter(_.name == "f").head
     // The inner's only option cannot resolve, so it falls back to Python; the outer's can, once its
     // parameter is typed from the inner's return type, so it survives.
-    val Seq(analyzedOuter, analyzedInner) = nodes
     assert(analyzedInner.transpiledOptions.isEmpty)
     assert(analyzedOuter.transpiledOptions.length == 1)
+  }
+
+  test("nested call: an option needing function resolution is dropped where a flat call keeps it") {
+    // What the nested path costs is not type coercion alone. The transpiler emits `concat`, `upper`
+    // and friends as UnresolvedFunction -- see "only resolved by a later rule" below -- and
+    // ResolveFunctions is in the Resolution batch too. Behind a call whose own option cannot
+    // resolve, the outer never gets that pass, so a perfectly good option is dropped and the call
+    // runs interpreted Python, while the identical option over a plain column survives. Master
+    // errors on both, so this is not a regression, but nothing pinned the difference.
+    val a = $"a".binary
+    // A def, so each plan gets its own instance rather than sharing one tree.
+    def option: Expression = Cast(
+      UnresolvedFunction(Seq("upper"), Seq(TranspiledUDFParameter(0)), isDistinct = false),
+      StringType)
+
+    // Nested: `f(g(a))`, where g's only option is an impossible cast.
+    val inner = TranspiledPythonUDF("g", pyUDF(Seq(a), StringType), List(Cast(a, LongType)),
+      List(List("binary")))
+    val outer = TranspiledPythonUDF("f", pyUDF(Seq(inner), StringType), List(option),
+      List(List("string")))
+    val nested = nodesIn(getAnalyzer.executeAndCheck(
+      Project(Seq(Alias(outer, "r")()), LocalRelation(a)), new QueryPlanningTracker))
+    assert(nested.length == 2, s"expected both calls to survive analysis, got: $nested")
+    assert(nested.forall(_.resolved))
+    assert(nested.filter(_.name == "f").head.transpiledOptions.isEmpty,
+      "the outer option needed ResolveFunctions, which no longer runs, so it is dropped")
+
+    // Flat: the same option over a plain string column keeps it.
+    val s = $"s".string
+    val flatCall = TranspiledPythonUDF("f", pyUDF(Seq(s), StringType), List(option),
+      List(List("string")))
+    val flat = theNodeIn(getAnalyzer.executeAndCheck(
+      Project(Seq(Alias(flatCall, "r")()), LocalRelation(s)), new QueryPlanningTracker))
+    assert(flat.transpiledOptions.length == 1)
+    assert(flat.transpiledOptions.head.resolved)
   }
 
   test("full analysis drops an option that can never resolve instead of failing") {

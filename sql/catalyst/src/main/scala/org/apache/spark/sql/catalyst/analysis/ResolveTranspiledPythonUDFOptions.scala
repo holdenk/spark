@@ -22,7 +22,9 @@ import org.apache.spark.sql.catalyst.expressions.{TranspiledPythonUDF, Transpile
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.TRANSPILED_PYTHON_UDF
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalType, NumericType, StringType}
+import org.apache.spark.util.Utils
 
 /**
  * Prunes the per-input-type options carried by a [[TranspiledPythonUDF]] down to those whose
@@ -166,6 +168,20 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
  * eagerly, so the reference is bound before this rule ever sees the plan. Not an internal error
  * either before or after -- an earlier version of this comment claimed the fallback traded an
  * internal error for an ordinary one, and that was wrong in both directions.
+ *
+ * A second cost, on the nested path. A node sitting behind a call whose own option could not
+ * resolve never gets a Resolution-batch pass, so its options lose everything that batch would have
+ * done -- not type coercion alone but function resolution too, since the transpiler emits `concat`,
+ * `upper` and friends as `UnresolvedFunction`. Measured, each of these is dropped nested and kept
+ * on a plain column: `x + 1` over an int parameter, `x / 2`, a `CaseWhen` with mixed branch types,
+ * and `cast(upper(param) as string)`. Every one is a healthy option, so the warning below takes
+ * care not to blame the transpiler for them.
+ *
+ * Nor is it quite all-or-nothing. With several category-matching options, dropping the ones that
+ * needed a further pass changes which one is left first, and `ConvertToCatalyst` takes
+ * `headOption` -- so an outer call carrying [needs-coercion, clean] lowers the second nested where
+ * it would have lowered the first flat. Same semantics either way, since every option is a lowering
+ * of the same Python, but not the same plan.
  */
 object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
@@ -187,22 +203,35 @@ object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
               // unresolvable option is not. So do its work here rather than skip the node --
               // skipping leaves the parameters untyped, and CheckAnalysis reads `dataType` off one
               // and reports an internal error, which is the very thing this rule exists to avoid.
-              // Coercion cannot run again from here, so an option body that still needs it stays
-              // unresolved and is dropped just below: the call falls back to Python, which is the
-              // safe direction.
+              // No Resolution-batch rule runs again from here, so an option body still needing any
+              // of that batch's work -- type coercion, function resolution -- stays unresolved and
+              // is dropped just below. The call falls back to Python, which is the safe direction.
+              //
+              // Which of the two cases we are in decides what a drop actually means, and the helper
+              // clears the field that distinguishes them, so read it first.
+              val missedResolutionBatch = t.optionInputCategories.nonEmpty
               val typed = ResolveTranspiledPythonUDFOptions.pruneByCategoryAndTypeParameters(t)
               val (kept, dropped) = typed.transpiledOptions.partition(_.resolved)
-              // Say so. The doc above argues this only happens where the transpiler emitted an
-              // option it should not have, which makes a silent drop a bug that erases its own
-              // evidence: the query quietly runs interpreted Python and nothing records why.
-              // ConvertToCatalyst logs every one of its skip paths for the same reason.
+              // Never drop silently: the query quietly runs interpreted Python instead, and nothing
+              // else records why. ConvertToCatalyst logs each of its own skip paths for the same
+              // reason. Only one of the two causes is the transpiler's fault, so say which.
               if (dropped.nonEmpty) {
+                val cause = if (missedResolutionBatch) {
+                  log"this call sits behind one whose own option could not resolve, so it never " +
+                    log"got a Resolution-batch pass; an option needing type coercion or function " +
+                    log"resolution is dropped here even though it is fine on a plain column"
+                } else {
+                  log"the option went through the whole Resolution batch and still does not " +
+                    log"resolve, which means the transpiler emitted one that cannot"
+                }
+                // Redacted like a plan string: TreeNode.simpleString does not do it itself, and a
+                // WARN is more widely shipped than the DEBUG a plan fragment usually lands in.
+                val first = Utils.redact(
+                  SQLConf.get.stringRedactionPattern, dropped.head.simpleString(maxFields = 100))
                 logWarning(log"Dropping ${MDC(LogKeys.COUNT, dropped.length)} transpiled " +
-                  log"option(s) for Python UDF ${MDC(LogKeys.FUNCTION_NAME, t.name)} that " +
-                  log"analysis left " +
-                  log"unresolved; the call falls back to interpreted Python. This indicates the " +
-                  log"transpiler emitted an option it cannot resolve. First one: " +
-                  log"${MDC(LogKeys.EXPR, dropped.head.simpleString(maxFields = 100))}")
+                  log"option(s) for Python UDF ${MDC(LogKeys.FUNCTION_NAME, t.name)}; the call " +
+                  log"falls back to interpreted Python. Cause: " + cause +
+                  log". First dropped: ${MDC(LogKeys.EXPR, first)}")
               }
               typed.copy(transpiledOptions = kept)
           }
