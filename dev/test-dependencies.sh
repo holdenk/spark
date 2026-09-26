@@ -56,6 +56,16 @@ GUAVA_VERSION=$(build/mvn help:evaluate -Dexpression=guava.version -q -DforceStd
 build/mvn dependency:get -Dartifact=com.google.guava:guava:${GUAVA_VERSION} -q
 JETTY_VERSION=$(build/mvn help:evaluate -Dexpression=jetty.version -q -DforceStdout | grep -E "^[0-9.]+v[0-9]+")
 build/mvn dependency:get -Dartifact=org.eclipse.jetty:jetty-io:${JETTY_VERSION} -q
+# netty-transport-native-{epoll,kqueue} publish classifier-less "main" jars that
+# `mvn install` does not place in the local repo (Maven pulls the OS-classified
+# variants instead), but sbt's coursier -- resolving the classifier-less modules
+# forced by the netty overrides in project/SparkBuild.scala -- looks for them there
+# and does not fall back to a remote repo. Prefetch them so ./dev/mima's
+# `tools/update` doesn't fail with "netty-transport-native-epoll-<ver>.jar: not
+# found". Same class of workaround as the guava/jetty-io gets above (SPARK-37302).
+NETTY_VERSION=$(build/mvn help:evaluate -Dexpression=netty.version -q -DforceStdout | grep -E "^[0-9.]+\.Final$")
+build/mvn dependency:get -Dartifact=io.netty:netty-transport-native-epoll:${NETTY_VERSION} -q
+build/mvn dependency:get -Dartifact=io.netty:netty-transport-native-kqueue:${NETTY_VERSION} -q
 if [ $? != 0 ]; then
     echo -e "Error while getting version string from Maven:\n$OLD_VERSION"
     exit 1
