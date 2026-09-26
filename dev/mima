@@ -42,8 +42,8 @@ export_classpath() {
   echo "$out" | grep jar | tail -n1
 }
 
-TOOLS_CLASSPATH="$(export_classpath -DcopyDependencies=false "export tools/fullClasspath")"
-OLD_DEPS_CLASSPATH="$(export_classpath -DcopyDependencies=false $SPARK_PROFILES "export oldDeps/fullClasspath")"
+TOOLS_CLASSPATH="$(export_classpath -DcopyDependencies=false "export tools/fullClasspath")" || exit 1
+OLD_DEPS_CLASSPATH="$(export_classpath -DcopyDependencies=false $SPARK_PROFILES "export oldDeps/fullClasspath")" || exit 1
 
 rm -f .generated-mima*
 
