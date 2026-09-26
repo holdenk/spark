@@ -17,11 +17,14 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.internal.LogKeys
 import org.apache.spark.sql.catalyst.expressions.{TranspiledPythonUDF, TranspiledUDFParameter}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.TRANSPILED_PYTHON_UDF
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalType, NumericType, StringType}
+import org.apache.spark.util.Utils
 
 /**
  * Prunes the per-input-type options carried by a [[TranspiledPythonUDF]] down to those whose
@@ -40,6 +43,12 @@ import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalTyp
  * make a numeric `Add` "valid" over a string column and silently diverge from Python's
  * `TypeError`. When no option matches, the list is emptied and `ConvertToCatalyst` falls back to
  * the original Python UDF.
+ *
+ * A category match does not make an option resolvable -- `cast(binary as bigint)` matches "binary"
+ * and never resolves -- and this rule deliberately does not check, because the options it hands
+ * back are unresolved on purpose and stay that way until the analyzer coerces them. Dropping the
+ * ones that never get there is [[DropUnresolvedTranspiledPythonUDFOptions]], which runs once this
+ * batch has converged.
  */
 object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
@@ -56,24 +65,36 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
             // without it, but it would re-walk every option each time round.
             case t: TranspiledPythonUDF if t.arguments.forall(_.resolved) &&
                 (t.optionInputCategories.nonEmpty || !t.transpiledOptions.forall(_.resolved)) =>
-              val args = t.arguments
-              val pruned = if (t.optionInputCategories.isEmpty) {
-                t
-              } else {
-                val argTypes = args.map(_.dataType)
-                val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
-                  case (option, categories) if optionMatchesTypes(categories, argTypes) => option
-                }
-                t.copy(transpiledOptions = kept, optionInputCategories = Nil)
-              }
-              // Type each `_udf_param_N` reference from the argument it stands for. The options are
-              // unresolved until this runs, so the analyzer comes back after and coerces their
-              // bodies like anything else.
-              pruned.copy(transpiledOptions =
-                pruned.transpiledOptions.map(TranspiledUDFParameter.resolveTypes(_, args)))
+              pruneByCategoryAndTypeParameters(t)
           }
       }
     }
+  }
+
+  /**
+   * Prunes to the options whose categories match the argument types (when the categories are still
+   * set, clearing them), then types every `_udf_param_N` reference from the argument it stands for.
+   *
+   * Shared with [[DropUnresolvedTranspiledPythonUDFOptions]], which has to do this same work for a
+   * node this rule can never reach -- see that rule's doc. One copy, so the two cannot drift.
+   *
+   * The options are unresolved until the typing runs, so from inside the Resolution batch the
+   * analyzer comes back after and coerces their bodies like anything else.
+   */
+  private[analysis] def pruneByCategoryAndTypeParameters(
+      t: TranspiledPythonUDF): TranspiledPythonUDF = {
+    val args = t.arguments
+    val pruned = if (t.optionInputCategories.isEmpty) {
+      t
+    } else {
+      val argTypes = args.map(_.dataType)
+      val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
+        case (option, categories) if optionMatchesTypes(categories, argTypes) => option
+      }
+      t.copy(transpiledOptions = kept, optionInputCategories = Nil)
+    }
+    pruned.copy(transpiledOptions =
+      pruned.transpiledOptions.map(TranspiledUDFParameter.resolveTypes(_, args)))
   }
 
   // True when each declared category matches the corresponding argument type:
@@ -104,6 +125,116 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
         case ("bool", dt) => dt.isInstanceOf[BooleanType]
         case ("binary", dt) => dt.isInstanceOf[BinaryType]
         case _ => false
+      }
+    }
+  }
+}
+
+/**
+ * Drops any transpiled option that analysis left unresolved, so the call falls back to interpreted
+ * Python instead of failing the query.
+ *
+ * An option is a child of [[TranspiledPythonUDF]], so one that is still unresolved when analysis
+ * finishes reaches `CheckAnalysis`, which reports on an expression the user never wrote. For the
+ * common shape that is a type-check failure: an option of `cast(binary as bigint)` is measured as
+ * [[DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION]], "cannot cast BINARY to BIGINT", naming a cast the
+ * transpiler invented. It is an internal error only where a `_udf_param_N` reference is left
+ * untyped and `CheckAnalysis` reads `dataType` off it -- since SPARK-58626 that means a nested
+ * call, which is why this rule prunes and types such a node rather than skipping it. Either way the
+ * honest answer is the one a category miss already gets: run the Python.
+ *
+ * Matching categories does not rule any of this out -- the transpiler picks a lowering per operator
+ * rather than per exact type, so `cast(binary as bigint)` matches "binary" and never resolves.
+ *
+ * Separate from [[ResolveTranspiledPythonUDFOptions]], and in a batch after the Resolution batch,
+ * because inside that batch `!resolved` does not mean unresolvable. Every option starts unresolved
+ * by design: its `_udf_param_N` references carry no type until ResolveTranspiledPythonUDFOptions
+ * reads one off each bound argument, and the node staying unresolved is what brings the analyzer
+ * back to coerce the body (SPARK-58626). Dropping on `!resolved` from inside the batch would throw
+ * away every option that reads a parameter and turn transpilation off without saying so. Once the
+ * batch is at a fixed point, nothing is going to resolve one.
+ *
+ * The cost of waiting, and it is a real one: a reference above the call cannot resolve while the
+ * option holds the node unresolved, so for those queries the batch converges with that reference
+ * unresolved too and `CheckAnalysis` reports it instead of the fallback taking effect. The message
+ * gets worse, not merely different. Measured on `SELECT r FROM (SELECT f(b) AS r FROM t)` where
+ * `f`'s option cannot resolve:
+ *
+ *   before: [[DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION]] cannot cast "BINARY" to "BIGINT"
+ *   after:  [[UNRESOLVED_COLUMN.WITH_SUGGESTION]] `r` cannot be resolved. Did you mean [`r`]
+ *
+ * which offers `r` as the fix for `r` and never mentions the UDF. It reaches SQL and Connect, whose
+ * analysis is single-pass; the classic DataFrame API is spared because each `select` analyzes
+ * eagerly, so the reference is bound before this rule ever sees the plan. Not an internal error
+ * either before or after -- an earlier version of this comment claimed the fallback traded an
+ * internal error for an ordinary one, and that was wrong in both directions.
+ *
+ * A second cost, on the nested path. A node sitting behind a call whose own option could not
+ * resolve never gets a Resolution-batch pass, so its options lose everything that batch would have
+ * done -- not type coercion alone but function resolution too, since the transpiler emits `concat`,
+ * `upper` and friends as `UnresolvedFunction`. Measured, each of these is dropped nested and kept
+ * on a plain column: `x + 1` over an int parameter, `x / 2`, a `CaseWhen` with mixed branch types,
+ * and `cast(upper(param) as string)`. Every one is a healthy option, so the warning below takes
+ * care not to blame the transpiler for them.
+ *
+ * Nor is it quite all-or-nothing. With several category-matching options, dropping the ones that
+ * needed a further pass changes which one is left first, and `ConvertToCatalyst` takes
+ * `headOption` -- so an outer call carrying [needs-coercion, clean] lowers the second nested where
+ * it would have lowered the first flat. Same semantics either way, since every option is a lowering
+ * of the same Python, but not the same plan.
+ */
+object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = {
+    if (!plan.containsPattern(TRANSPILED_PYTHON_UDF)) {
+      plan
+    } else {
+      plan.resolveOperatorsWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
+        case op if op.containsPattern(TRANSPILED_PYTHON_UDF) =>
+          // Bottom-up, which is what makes the nested case work: dropping an inner call's dead
+          // option resolves the inner node, and only then does the outer call -- whose argument IS
+          // that node -- come into scope here.
+          op.transformExpressionsUpWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
+            // An unresolved argument means the query has a real error to report -- an unknown
+            // column, say -- and falling back to Python here would bury it.
+            case t: TranspiledPythonUDF if t.arguments.forall(_.resolved) &&
+                (t.optionInputCategories.nonEmpty || !t.transpiledOptions.forall(_.resolved)) =>
+              // Categories still set means ResolveTranspiledPythonUDFOptions never got to this
+              // node: its guard needs every argument resolved, and an inner call holding an
+              // unresolvable option is not. So do its work here rather than skip the node --
+              // skipping leaves the parameters untyped, and CheckAnalysis reads `dataType` off one
+              // and reports an internal error, which is the very thing this rule exists to avoid.
+              // No Resolution-batch rule runs again from here, so an option body still needing any
+              // of that batch's work -- type coercion, function resolution -- stays unresolved and
+              // is dropped just below. The call falls back to Python, which is the safe direction.
+              //
+              // Which of the two cases we are in decides what a drop actually means, and the helper
+              // clears the field that distinguishes them, so read it first.
+              val missedResolutionBatch = t.optionInputCategories.nonEmpty
+              val typed = ResolveTranspiledPythonUDFOptions.pruneByCategoryAndTypeParameters(t)
+              val (kept, dropped) = typed.transpiledOptions.partition(_.resolved)
+              // Never drop silently: the query quietly runs interpreted Python instead, and nothing
+              // else records why. ConvertToCatalyst logs each of its own skip paths for the same
+              // reason. Only one of the two causes is the transpiler's fault, so say which.
+              if (dropped.nonEmpty) {
+                val cause = if (missedResolutionBatch) {
+                  log"this call sits behind one whose own option could not resolve, so it never " +
+                    log"got a Resolution-batch pass; an option needing type coercion or function " +
+                    log"resolution is dropped here even though it is fine on a plain column"
+                } else {
+                  log"the option went through the whole Resolution batch and still does not " +
+                    log"resolve, which means the transpiler emitted one that cannot"
+                }
+                // Redacted like a plan string: TreeNode.simpleString does not do it itself, and a
+                // WARN is more widely shipped than the DEBUG a plan fragment usually lands in.
+                val first = Utils.redact(
+                  SQLConf.get.stringRedactionPattern, dropped.head.simpleString(maxFields = 100))
+                logWarning(log"Dropping ${MDC(LogKeys.COUNT, dropped.length)} transpiled " +
+                  log"option(s) for Python UDF ${MDC(LogKeys.FUNCTION_NAME, t.name)}; the call " +
+                  log"falls back to interpreted Python. Cause: " + cause +
+                  log". First dropped: ${MDC(LogKeys.EXPR, first)}")
+              }
+              typed.copy(transpiledOptions = kept)
+          }
       }
     }
   }

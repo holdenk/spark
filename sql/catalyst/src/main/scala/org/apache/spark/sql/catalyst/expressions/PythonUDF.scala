@@ -400,9 +400,10 @@ case class TranspiledPythonUDF(
   // Per-option input-type categories ("numeric"/"string" per public param),
   // parallel to `transpiledOptions`. ResolveTranspiledPythonUDFOptions prunes the
   // options to those whose categories match the resolved input types (before
-  // CheckAnalysis can reject a type-incompatible option) and clears this field;
-  // ConvertToCatalyst then picks the first survivor or falls back to the Python
-  // UDF. Empty means "no restriction" (kept as-is).
+  // CheckAnalysis can reject a type-incompatible option) and clears this field,
+  // and DropUnresolvedTranspiledPythonUDFOptions then drops any that analysis
+  // never resolved; ConvertToCatalyst picks the first survivor or falls back to
+  // the Python UDF. Empty means "no restriction" (kept as-is).
   optionInputCategories: List[List[String]] = Nil) extends Expression with Unevaluable {
   require(
     optionInputCategories.isEmpty || optionInputCategories.length == transpiledOptions.length,

@@ -53,9 +53,11 @@ case class UserDefinedPythonFunction(
     // Per-option input-type categories ("numeric"/"string" per public param),
     // parallel to `transpiled` (same length). The analyzer rule
     // ResolveTranspiledPythonUDFOptions later keeps only the options whose
-    // categories match the bound argument types; when none match, the call
-    // falls back to the plain Python UDF. `builder` requires the two lists to
-    // be parallel and skips transpilation otherwise.
+    // categories match the bound argument types, and
+    // DropUnresolvedTranspiledPythonUDFOptions drops any that analysis never
+    // resolved; when none remain, the call falls back to the plain Python UDF.
+    // `builder` requires the two lists to be parallel and skips transpilation
+    // otherwise.
     transpiledInputTypes: JList[JList[String]] = Nil.asJava,
     // Schema of the intermediate aggregation buffer, set only for the incremental Python
     // aggregator eval types (see [[PythonAggregate]]); `null` otherwise. Nullable rather than
@@ -129,7 +131,8 @@ case class UserDefinedPythonFunction(
     // builder runs at call-construction time, before the argument columns are
     // bound, so their types aren't known yet. ResolveTranspiledPythonUDFOptions
     // prunes the options to those matching the resolved input types (once known,
-    // and before CheckAnalysis), and ConvertToCatalyst picks the survivor.
+    // and before CheckAnalysis), DropUnresolvedTranspiledPythonUDFOptions drops
+    // any that never resolved, and ConvertToCatalyst picks the survivor.
     // Only build the node when every option carries its parallel input-type
     // categories. ResolveTranspiledPythonUDFOptions prunes type-incompatible
     // options using those categories, but only when they are present (its guard
