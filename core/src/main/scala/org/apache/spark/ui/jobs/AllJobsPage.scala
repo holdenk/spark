@@ -123,7 +123,7 @@ private[ui] class AllJobsPage(parent: JobsTab, store: AppStatusStore) extends We
     }
   }
 
-  private def makeExecutorEvent(executors: Seq[v1.ExecutorSummary]):
+  def makeExecutorEvent(executors: Seq[v1.ExecutorSummary]):
       Seq[String] = {
     val events = ListBuffer[String]()
     executors.sortBy { e =>
@@ -158,7 +158,7 @@ private[ui] class AllJobsPage(parent: JobsTab, store: AppStatusStore) extends We
              |    '${
                       e.removeReason.map { reason =>
                         s"""<br>Reason: ${StringEscapeUtils.escapeEcmaScript(
-                          reason.replace("\n", " "))}"""
+                          Utility.escape(Utility.escape(reason.replace("\n", " "))))}"""
                       }.getOrElse("")
                    }"' +
              |    'data-html="true">Executor ${e.id} removed</div>'
@@ -262,7 +262,9 @@ private[ui] class AllJobsPage(parent: JobsTab, store: AppStatusStore) extends We
         UIUtils.prependBaseUri(request, parent.basePath),
         "jobs", // subPath
         killEnabled,
-        jobIdTitle
+        jobIdTitle,
+        parent.actionsViaGetEnabled,
+        parent.csrfToken
       ).table(jobPage)
     } catch {
       case e @ (_ : IllegalArgumentException | _ : IndexOutOfBoundsException) =>
@@ -509,7 +511,9 @@ private[ui] class JobPagedTable(
     basePath: String,
     subPath: String,
     killEnabled: Boolean,
-    jobIdTitle: String
+    jobIdTitle: String,
+    actionsViaGetEnabled: Boolean,
+    csrfToken: String
   ) extends PagedTable[JobTableRowData] {
 
   private val (sortColumn, desc, pageSize) = getTableParameters(request, jobTag, jobIdTitle)
@@ -571,16 +575,16 @@ private[ui] class JobPagedTable(
       val confirm =
         s"if (window.confirm('Are you sure you want to kill job ${job.jobId} ?')) " +
           "{ this.parentNode.submit(); return true; } else { return false; }"
-      // SPARK-6846 this should be POST-only but YARN AM won't proxy POST
-      /*
-      val killLinkUri = s"$basePathUri/jobs/job/kill/"
-      <form action={killLinkUri} method="POST" style="display:inline">
+      // The form this file used to carry commented out, now live in both modes; only the
+      // method follows spark.ui.actionsViaGetEnabled, see UIUtils.actionFormMethod. The
+      // confirm handler submits the enclosing form.
+      <form action={s"$basePath/jobs/job/kill/"}
+            method={UIUtils.actionFormMethod(actionsViaGetEnabled)}
+            style="display:inline">
         <input type="hidden" name="id" value={job.jobId.toString}/>
+        <input type="hidden" name="csrfToken" value={csrfToken}/>
         <a href="#" onclick={confirm} class="kill-link">(kill)</a>
       </form>
-       */
-      val killLinkUri = s"$basePath/jobs/job/kill/?id=${job.jobId}"
-      <a href={killLinkUri} onclick={confirm} class="kill-link">(kill)</a>
     } else {
       Seq.empty
     }
