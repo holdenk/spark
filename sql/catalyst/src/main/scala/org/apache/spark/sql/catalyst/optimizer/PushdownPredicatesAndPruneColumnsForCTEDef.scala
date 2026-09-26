@@ -57,10 +57,12 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
 
   /**
    * Gather all the predicates and referenced attributes on different points of CTE references
-   * using pattern `ScanOperation` (which takes care of determinism) and combine those predicates
-   * and attributes that belong to the same CTE definition.
-   * For the same CTE definition, if any of its references does not have predicates, the combined
-   * predicate will be a TRUE literal, which means there will be no predicate push-down.
+   * using pattern `PhysicalOperation` and combine those predicates and attributes that belong
+   * to the same CTE definition. `PhysicalOperation` still returns a single filter even when it
+   * is non-deterministic, so such predicates are excluded below.
+   * For the same CTE definition, if any of its references does not have pushable predicates, the
+   * combined predicate will be a TRUE literal, which means there will be no predicate push-down
+   * for that definition at all, including for its other references.
    */
   private def gatherPredicatesAndAttributes(plan: LogicalPlan, cteMap: CTEMap): Unit = {
     plan match {
@@ -77,8 +79,11 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
         val newPredicates = if (isTruePredicate(preds)) {
           preds
         } else {
-          // Make sure we only push down predicates that do not contain forward CTE references.
-          val filteredPredicates = restoreCTEDefAttrs(predicates.filter(_.find {
+          // Only push down deterministic predicates that do not contain forward CTE references.
+          // A reference keeps its own predicates, so a non-deterministic one pushed into the
+          // shared definition as well would be evaluated a second time.
+          val deterministicPredicates = predicates.filter(_.deterministic)
+          val filteredPredicates = restoreCTEDefAttrs(deterministicPredicates.filter(_.find {
             case s: SubqueryExpression => s.plan.find {
               case r: CTERelationRef =>
                 // If the ref's ID does not exist in the map or if ref's corresponding precedence
@@ -128,7 +133,7 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
   private def pushdownPredicatesAndAttributes(
       plan: LogicalPlan,
       cteMap: CTEMap): LogicalPlan = plan.transformWithSubqueries {
-    case cteDef @ CTERelationDef(child, id, originalPlanWithPredicates, _, _, _) =>
+    case cteDef @ CTERelationDef(child, id, originalPlanWithPredicates, _, _, _, _) =>
       val (_, _, newPreds, newAttrSet) = cteMap(id)
       val preds = originalPlanWithPredicates.map(_._2).getOrElse(Seq.empty)
       if (!isTruePredicate(newPreds) &&
@@ -186,10 +191,12 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
    * the very same `AliasHelper` utilities, so the two cannot drift apart): through projection
    * and grouping-key aliases, positionally into each branch (`Union`), and unchanged
    * through operators that pass the referenced attributes verbatim (`Join`, `Window`, and
-   * output-preserving unary nodes like `Filter`, `Sort`, `Repartition`). Descent stops at
-   * operators that remap attributes in other ways (e.g. `Generate`, `Expand`): if the filter
-   * cannot be located, the input plan is returned unchanged, and the caller re-pushes on top,
-   * which is redundant but always semantics-preserving.
+   * output-preserving unary nodes like `Filter`, `Sort`, `Repartition`). The descent is recursive
+   * because the filter can end up several operators down -- in particular between the projections
+   * `PushPredicateThroughNonJoin` splits a `Project` into for expensive projected expressions.
+   * Descent stops at operators that remap attributes in other ways (e.g. `Generate`, `Expand`):
+   * if the filter cannot be located, the input plan is returned unchanged, and the caller
+   * re-pushes on top, which is redundant but always semantics-preserving.
    *
    * Ancestors of the removed filter are rebuilt with `withNewChildren` rather than direct
    * case-class copies so that `TreeNode` tags (e.g. `Project.hiddenOutputTag`, which the
@@ -271,7 +278,7 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
 object CleanUpTempCTEInfo extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan =
     plan.transformWithPruning(_.containsPattern(CTE)) {
-      case cteDef @ CTERelationDef(_, _, Some(_), _, _, _) =>
+      case cteDef @ CTERelationDef(_, _, Some(_), _, _, _, _) =>
         cteDef.copy(originalPlanWithPredicates = None)
     }
 }
