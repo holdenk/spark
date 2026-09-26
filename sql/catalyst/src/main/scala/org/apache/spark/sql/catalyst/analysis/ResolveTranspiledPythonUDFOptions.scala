@@ -132,10 +132,16 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
  * Python instead of failing the query.
  *
  * An option is a child of [[TranspiledPythonUDF]], so one that is still unresolved when analysis
- * finishes reaches `CheckAnalysis` and comes back as an INTERNAL_ERROR naming the plan, which tells
- * the user nothing. The honest answer is the one a category miss already gets: run the Python.
- * Matching categories does not rule this out -- the transpiler picks a lowering per operator rather
- * than per exact type, so `cast(binary as bigint)` matches "binary" and never resolves.
+ * finishes reaches `CheckAnalysis`, which reports on an expression the user never wrote. For the
+ * common shape that is a type-check failure: an option of `cast(binary as bigint)` is measured as
+ * [[DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION]], "cannot cast BINARY to BIGINT", naming a cast the
+ * transpiler invented. It is an internal error only where a `_udf_param_N` reference is left
+ * untyped and `CheckAnalysis` reads `dataType` off it -- since SPARK-58626 that means a nested
+ * call, which is why this rule prunes and types such a node rather than skipping it. Either way the
+ * honest answer is the one a category miss already gets: run the Python.
+ *
+ * Matching categories does not rule any of this out -- the transpiler picks a lowering per operator
+ * rather than per exact type, so `cast(binary as bigint)` matches "binary" and never resolves.
  *
  * Separate from [[ResolveTranspiledPythonUDFOptions]], and in a batch after the Resolution batch,
  * because inside that batch `!resolved` does not mean unresolvable. Every option starts unresolved
@@ -145,11 +151,20 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
  * away every option that reads a parameter and turn transpilation off without saying so. Once the
  * batch is at a fixed point, nothing is going to resolve one.
  *
- * The cost of waiting: a reference above the call (an alias the query selects on) cannot resolve
- * while the option holds the node unresolved, so for those queries the batch converges with that
- * reference unresolved too and `CheckAnalysis` reports it rather than the fallback taking effect.
- * Still an error, but no longer an internal one, and it only arises where the transpiler emitted an
- * option it should not have.
+ * The cost of waiting, and it is a real one: a reference above the call cannot resolve while the
+ * option holds the node unresolved, so for those queries the batch converges with that reference
+ * unresolved too and `CheckAnalysis` reports it instead of the fallback taking effect. The message
+ * gets worse, not merely different. Measured on `SELECT r FROM (SELECT f(b) AS r FROM t)` where
+ * `f`'s option cannot resolve:
+ *
+ *   before: [[DATATYPE_MISMATCH.CAST_WITHOUT_SUGGESTION]] cannot cast "BINARY" to "BIGINT"
+ *   after:  [[UNRESOLVED_COLUMN.WITH_SUGGESTION]] `r` cannot be resolved. Did you mean [`r`]
+ *
+ * which offers `r` as the fix for `r` and never mentions the UDF. It reaches SQL and Connect, whose
+ * analysis is single-pass; the classic DataFrame API is spared because each `select` analyzes
+ * eagerly, so the reference is bound before this rule ever sees the plan. Not an internal error
+ * either before or after -- an earlier version of this comment claimed the fallback traded an
+ * internal error for an ordinary one, and that was wrong in both directions.
  */
 object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {

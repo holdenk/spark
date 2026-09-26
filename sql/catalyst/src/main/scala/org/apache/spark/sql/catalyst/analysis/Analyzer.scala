@@ -681,7 +681,8 @@ class Analyzer(
     Batch("Remove TempResolvedColumn", Once, RemoveTempResolvedColumn),
     // Resolution has converged by here, so a transpiled UDF option that is still unresolved never
     // will be. Drop it and let the call fall back to interpreted Python rather than hand
-    // CheckAnalysis an unresolved child to call an internal error.
+    // CheckAnalysis an unresolved child to report on -- a type-check failure naming a cast the
+    // transpiler invented, or an internal error where a parameter was left untyped.
     Batch("Drop Unresolved Transpiled UDF Options", Once,
       DropUnresolvedTranspiledPythonUDFOptions),
     Batch("Post-Hoc Resolution", Once,
