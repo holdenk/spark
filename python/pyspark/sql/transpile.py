@@ -538,7 +538,13 @@ def _truthiness_col(cat: Optional[str], c: Column) -> Optional[Column]:
       "string"  -> coalesce(length(c) > 0, False)  -- empty string is falsy
       "numeric" -> coalesce(c != 0, False)           -- zero is falsy
                    NaN != 0 is True in Spark so float NaN is truthy, matching Python.
+
+    Gated on the coarse category, like the comparison lowerings: which KIND of number
+    it is cannot change whether the number is zero, so a parameter narrowed to
+    "integral" / "integral32" / "fractional" by some other operator in the same body
+    still gets its truthiness test.
     """
+    cat = _coarse_category(cat)
     if cat == "bool":
         return coalesce(c, lit(False))
     if cat == "string":
