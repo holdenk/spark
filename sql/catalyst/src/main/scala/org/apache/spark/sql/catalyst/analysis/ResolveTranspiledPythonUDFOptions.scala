@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.internal.LogKeys
 import org.apache.spark.sql.catalyst.expressions.{TranspiledPythonUDF, TranspiledUDFParameter}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -190,7 +191,20 @@ object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
               // unresolved and is dropped just below: the call falls back to Python, which is the
               // safe direction.
               val typed = ResolveTranspiledPythonUDFOptions.pruneByCategoryAndTypeParameters(t)
-              typed.copy(transpiledOptions = typed.transpiledOptions.filter(_.resolved))
+              val (kept, dropped) = typed.transpiledOptions.partition(_.resolved)
+              // Say so. The doc above argues this only happens where the transpiler emitted an
+              // option it should not have, which makes a silent drop a bug that erases its own
+              // evidence: the query quietly runs interpreted Python and nothing records why.
+              // ConvertToCatalyst logs every one of its skip paths for the same reason.
+              if (dropped.nonEmpty) {
+                logWarning(log"Dropping ${MDC(LogKeys.COUNT, dropped.length)} transpiled " +
+                  log"option(s) for Python UDF ${MDC(LogKeys.FUNCTION_NAME, t.name)} that " +
+                  log"analysis left " +
+                  log"unresolved; the call falls back to interpreted Python. This indicates the " +
+                  log"transpiler emitted an option it cannot resolve. First one: " +
+                  log"${MDC(LogKeys.EXPR, dropped.head.simpleString(maxFields = 100))}")
+              }
+              typed.copy(transpiledOptions = kept)
           }
       }
     }
