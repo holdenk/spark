@@ -625,6 +625,16 @@ def scol_for(sdf: PySparkDataFrame, column_name: str) -> Column:
         return sdf["`{}`".format(column_name)]
 
 
+def unresolved_scol_for(column_name: str) -> Column:
+    """
+    Return Spark Column for the given column name, not bound to any DataFrame.
+
+    Unlike ``scol_for`` this does not take the DataFrame the name belongs to, so the column is
+    resolved against whichever frame it is later used with.
+    """
+    return F.col("`{}`".format(column_name))
+
+
 def column_labels_level(column_labels: List[Label]) -> int:
     """Return the level of the column index."""
     if len(column_labels) == 0:
