@@ -20,10 +20,9 @@ package org.apache.spark.sql.execution.datasources.v2
 import java.util.{Collections, Optional, OptionalLong}
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.{MultiInstanceRelation, NamedRelation, TimeTravelSpec}
 import org.apache.spark.sql.catalyst.catalog.{CatalogColumnStat, CatalogStatistics}
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, AttributeSet, Expression, NamedExpression, SortOrder, V2ExpressionUtils}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, AttributeSeq, AttributeSet, Expression, SortOrder, V2ExpressionUtils}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, ExposesMetadataColumns, Histogram, HistogramBin, LeafNode, LogicalPlan, Statistics}
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
@@ -38,6 +37,7 @@ import org.apache.spark.sql.connector.read.{Scan, Statistics => V2Statistics, Su
 import org.apache.spark.sql.connector.read.colstats.{ColumnStatistics, Histogram => V2Histogram, HistogramBin => V2HistogramBin}
 import org.apache.spark.sql.connector.read.streaming.{Offset, SparkDataStream}
 import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.connector.{SupportsRuntimeCatalystFiltering, V2StatisticsUtils}
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -208,12 +208,13 @@ case class DataSourceV2ScanRelation(
   lazy val runtimeFilterAttrs: AttributeSet = {
     checkRuntimeFilteringInterfaces()
     resolvedFullyPushedRuntimeFilterAttrs
-    val filterAttrs = scan match {
-      case s: SupportsRuntimeV2Filtering => s.filterAttributes
-      case s: SupportsRuntimeCatalystFiltering => s.filterAttributes()
-      case _ => Array.empty[NamedReference]
-    }
-    resolveFilterAttrs(filterAttrs, "filterAttributes()")
+    resolvedRuntimeFilterAttrs
+  }
+
+  private[sql] lazy val declaredRuntimeFilterAttrs: Array[NamedReference] = scan match {
+    case s: SupportsRuntimeV2Filtering => s.filterAttributes
+    case s: SupportsRuntimeCatalystFiltering => s.filterAttributes()
+    case _ => Array.empty
   }
 
   private lazy val declaredFullyPushedRuntimeFilterAttrs: Array[NamedReference] = scan match {
@@ -221,10 +222,17 @@ case class DataSourceV2ScanRelation(
     case _ => Array.empty
   }
 
+  private lazy val resolvedRuntimeFilterAttrs: AttributeSet = {
+    resolveFilterAttrs(declaredRuntimeFilterAttrs, "filterAttributes()")
+  }
+
   private lazy val resolvedFullyPushedRuntimeFilterAttrs: AttributeSet = {
-    checkFullyPushedFilterAttrs()
-    resolveFilterAttrs(
+    checkFullyPushedFilterAttrsAreTopLevel()
+    val resolvedAttrs = resolveFilterAttrs(
       declaredFullyPushedRuntimeFilterAttrs, "fullyPushedFilterAttributes()")
+    resolvedRuntimeFilterAttrs
+    checkFullyPushedFilterAttrsAreFilterable()
+    resolvedAttrs
   }
 
   /**
@@ -245,20 +253,8 @@ case class DataSourceV2ScanRelation(
   private def resolveFilterAttrs(
       filterAttrs: Array[NamedReference],
       method: String): AttributeSet = {
-    val resolvedAttrs = filterAttrs.map { ref =>
-      try {
-        V2ExpressionUtils.resolveRef[NamedExpression](ref, this)
-      } catch {
-        case e: AnalysisException =>
-          throw QueryCompilationErrors.cannotResolveDataSourceRuntimeFilterAttributeError(
-            attribute = ref.fieldNames,
-            method = method,
-            scanClass = scan.getClass.getName,
-            relationOutput = fromAttributes(output),
-            cause = e)
-      }
-    }
-    AttributeSet(resolvedAttrs)
+    V2ExpressionUtils.resolveDataSourceRuntimeFilterRefs(
+      filterAttrs, output, method, scan.getClass.getName)
   }
 
   override val nodePatterns: Seq[TreePattern] = Seq(DATA_SOURCE_V2_SCAN_RELATION)
@@ -319,9 +315,23 @@ case class DataSourceV2ScanRelation(
     }
   }
 
-  private def checkFullyPushedFilterAttrs(): Unit = {
+  private def checkFullyPushedFilterAttrsAreTopLevel(): Unit = {
     declaredFullyPushedRuntimeFilterAttrs.find(_.fieldNames.length > 1).foreach { ref =>
       throw QueryCompilationErrors.nestedDataSourceFullyPushedRuntimeFilterAttributeError(
+        attribute = ref.fieldNames,
+        scanClass = scan.getClass.getName,
+        relationOutput = fromAttributes(output))
+    }
+  }
+
+  private def checkFullyPushedFilterAttrsAreFilterable(): Unit = {
+    declaredFullyPushedRuntimeFilterAttrs.find { fullyPushedRef =>
+      !declaredRuntimeFilterAttrs.exists { filterRef =>
+        fullyPushedRef.fieldNames.length == filterRef.fieldNames.length &&
+          fullyPushedRef.fieldNames.lazyZip(filterRef.fieldNames).forall(conf.resolver)
+      }
+    }.foreach { ref =>
+      throw QueryCompilationErrors.fullyPushedDataSourceRuntimeFilterAttributeNotFilterableError(
         attribute = ref.fieldNames,
         scanClass = scan.getClass.getName,
         relationOutput = fromAttributes(output))
@@ -334,11 +344,21 @@ case class DataSourceV2ScanRelation(
         output = this.relation.output.map(QueryPlan.normalizeExpressions(_, this.relation.output))
       ),
       output = this.output.map(QueryPlan.normalizeExpressions(_, this.output)),
+      // keyGroupedPartitioning may reference columns pruned out of `output`, which is kept as long
+      // as any key survives. A pruned key carries no information for plan comparison, since the
+      // physical outputPartitioning projects it away, so drop it before normalizing; otherwise the
+      // dangling attribute's exprId would keep otherwise-equivalent scans unequal and defeat
+      // subplan merging.
       keyGroupedPartitioning = keyGroupedPartitioning.map(
-        _.map(QueryPlan.normalizeExpressions(_, output))
+        _.filter(_.references.subsetOf(outputSet))
+          .map(QueryPlan.normalizeExpressions(_, output))
       ),
+      // ordering may likewise reference columns pruned out of `output`. Ordering is prefix-based,
+      // so keep only the leading run of sort orders that reference output columns and drop the rest
+      // before normalizing, for the same reason as keyGroupedPartitioning above.
       ordering = ordering.map(
-        _.map(o => o.copy(child = QueryPlan.normalizeExpressions(o.child, output)))
+        _.takeWhile(_.references.subsetOf(outputSet))
+          .map(o => o.copy(child = QueryPlan.normalizeExpressions(o.child, output)))
       ),
       // pushedFilters may reference columns pruned out of `output` (see the field doc), so they are
       // normalized against the relation's full output rather than `output`.
@@ -554,12 +574,14 @@ object DataSourceV2Relation {
     }
 
     var colStats: Seq[(Attribute, ColumnStat)] = Seq.empty[(Attribute, ColumnStat)]
+    val resolver = SQLConf.get.resolver
     // columnStats() may be null even when numRows/sizeInBytes are present, so normalize it to an
     // empty map before conversion to avoid an NPE.
     val v2ColumnStats = Option(v2Statistics.columnStats()).getOrElse(EMPTY_V2_COLUMN_STATS)
     if (!v2ColumnStats.isEmpty) {
       val keys = v2ColumnStats.keySet()
-
+      val outputAttrs = AttributeSeq.fromNormalOutput(output)
+      var keyed = Seq.empty[(Attribute, String, ColumnStat)]
       keys.forEach(key => {
         val colStat = v2ColumnStats.get(key)
         val distinct: Option[BigInt] =
@@ -583,12 +605,32 @@ object DataSourceV2Relation {
 
         val catalystColStat = ColumnStat(distinct, min, max, nullCount, avgLen, maxLen, histogram)
 
-        output.foreach(attribute => {
-          if (attribute.name.equals(key.describe())) {
-            colStats = colStats :+ (attribute -> catalystColStat)
+        // Catalyst column statistics only support top-level attributes. Prefer a unique exact name
+        // when the configured resolver matches multiple output attributes.
+        val fieldNames = key.fieldNames
+        if (fieldNames.length == 1) {
+          val fieldName = fieldNames.head
+          val exprIds = outputAttrs
+            .getCandidatesForResolution(Seq(fieldName), resolver)._1
+            .map(_.exprId).toSet
+          output.filter(attr => exprIds.contains(attr.exprId)) match {
+            case Seq(single) => keyed = keyed :+ ((single, fieldName, catalystColStat))
+            case multiple => multiple.filter(_.name == fieldName) match {
+              case Seq(exact) => keyed = keyed :+ ((exact, fieldName, catalystColStat))
+              case _ =>
+            }
           }
-        })
+        }
       })
+      // Several keys can resolve to one attribute (e.g. "id" and "ID" when case-insensitive); keep
+      // a unique match, preferring an exact-name key, so the result is deterministic.
+      colStats = keyed.groupBy(_._1.exprId).values.toSeq.flatMap {
+        case Seq((attribute, _, stat)) => Some(attribute -> stat)
+        case many => many.filter { case (attr, fieldName, _) => fieldName == attr.name } match {
+          case Seq((attribute, _, stat)) => Some(attribute -> stat)
+          case _ => None
+        }
+      }
     }
     val attributeStats = AttributeMap(colStats)
     // Prefer the source-reported size. Otherwise infer a projection-aware size from the row count
