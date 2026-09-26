@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.TranspiledPythonUDF
+import org.apache.spark.sql.catalyst.expressions.{TranspiledPythonUDF, TranspiledUDFParameter}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.TRANSPILED_PYTHON_UDF
@@ -25,23 +25,27 @@ import org.apache.spark.sql.types.{BinaryType, BooleanType, DataType, DecimalTyp
 
 /**
  * Prunes the per-input-type options carried by a [[TranspiledPythonUDF]] down to those whose
- * declared categories match the resolved argument types and whose expressions themselves resolve.
+ * declared categories match the resolved argument types.
  *
  * A Python operator such as `a + b` is overloaded for text, so the transpiler emits one option
  * per input-type variant -- a numeric `Add` and a string `concat`, say -- each tagged with the
  * input-type categories it expects. Those options are children of the node, so leaving a
- * type-incompatible or unresolved one in place (a numeric `Add` over string columns, or a Cast
- * that never resolves) would make `CheckAnalysis` raise INTERNAL_ERROR on the whole plan. We can
- * only choose once the argument types are known, which is after reference resolution -- hence a
- * rule here rather than in the builder, which runs at call-construction time before the columns
- * are bound -- and we must run before `CheckAnalysis`.
+ * type-incompatible one in place (a numeric `Add` over string columns) would make `CheckAnalysis`
+ * reject the whole plan. We can only choose once the argument types are known, which is after
+ * reference resolution -- hence a rule here rather than in the builder, which runs at
+ * call-construction time before the columns are bound -- and we must run before `CheckAnalysis`.
  *
  * Matching is strict by category (a numeric option only for numeric columns, a string option only
  * for string columns). We deliberately do not lean on implicit type coercion, which would, e.g.,
  * make a numeric `Add` "valid" over a string column and silently diverge from Python's
- * `TypeError`. An option that matches by category but fails to resolve is dropped the same way.
- * When none survive, the list is emptied and `ConvertToCatalyst` falls back to the original
- * Python UDF.
+ * `TypeError`. When no option matches, the list is emptied and `ConvertToCatalyst` falls back to
+ * the original Python UDF.
+ *
+ * A category match does not make an option resolvable -- `cast(binary as bigint)` matches "binary"
+ * and never resolves -- and this rule deliberately does not check, because the options it hands
+ * back are unresolved on purpose and stay that way until the analyzer coerces them. Dropping the
+ * ones that never get there is [[DropUnresolvedTranspiledPythonUDFOptions]], which runs once this
+ * batch has converged.
  */
 object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
@@ -53,15 +57,26 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
           // Bottom-up so a nested TranspiledPythonUDF (a transpiled UDF feeding another) is pruned
           // -- and thus resolved -- before its parent's input types are inspected.
           op.transformExpressionsUpWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
-            case t: TranspiledPythonUDF
-                if t.optionInputCategories.nonEmpty && t.pythonUDFExpr.childrenResolved =>
-              val argTypes = t.pythonUDFExpr.children.map(_.dataType)
-              val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
-                case (option, categories)
-                    if optionMatchesTypes(categories, argTypes) && option.resolved =>
-                  option
+            // The second half of the guard stops this firing every later iteration: categories
+            // cleared and options resolved means there's nothing to do. It would still converge
+            // without it, but it would re-walk every option each time round.
+            case t: TranspiledPythonUDF if t.arguments.forall(_.resolved) &&
+                (t.optionInputCategories.nonEmpty || !t.transpiledOptions.forall(_.resolved)) =>
+              val args = t.arguments
+              val pruned = if (t.optionInputCategories.isEmpty) {
+                t
+              } else {
+                val argTypes = args.map(_.dataType)
+                val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
+                  case (option, categories) if optionMatchesTypes(categories, argTypes) => option
+                }
+                t.copy(transpiledOptions = kept, optionInputCategories = Nil)
               }
-              t.copy(transpiledOptions = kept, optionInputCategories = Nil)
+              // Type each `_udf_param_N` reference from the argument it stands for. The options are
+              // unresolved until this runs, so the analyzer comes back after and coerces their
+              // bodies like anything else.
+              pruned.copy(transpiledOptions =
+                pruned.transpiledOptions.map(TranspiledUDFParameter.resolveTypes(_, args)))
           }
       }
     }
@@ -95,6 +110,55 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
         case ("bool", dt) => dt.isInstanceOf[BooleanType]
         case ("binary", dt) => dt.isInstanceOf[BinaryType]
         case _ => false
+      }
+    }
+  }
+}
+
+/**
+ * Drops any transpiled option that analysis left unresolved, so the call falls back to interpreted
+ * Python instead of failing the query.
+ *
+ * An option is a child of [[TranspiledPythonUDF]], so one that is still unresolved when analysis
+ * finishes reaches `CheckAnalysis` and comes back as an INTERNAL_ERROR naming the plan, which tells
+ * the user nothing. The honest answer is the one a category miss already gets: run the Python.
+ * Matching categories does not rule this out -- the transpiler picks a lowering per operator rather
+ * than per exact type, so `cast(binary as bigint)` matches "binary" and never resolves.
+ *
+ * Separate from [[ResolveTranspiledPythonUDFOptions]], and in a batch after the Resolution batch,
+ * because inside that batch `!resolved` does not mean unresolvable. Every option starts unresolved
+ * by design: its `_udf_param_N` references carry no type until ResolveTranspiledPythonUDFOptions
+ * reads one off each bound argument, and the node staying unresolved is what brings the analyzer
+ * back to coerce the body (SPARK-58626). Dropping on `!resolved` from inside the batch would throw
+ * away every option that reads a parameter and turn transpilation off without saying so. Once the
+ * batch is at a fixed point, nothing is going to resolve one.
+ *
+ * The cost of waiting: a reference above the call (an alias the query selects on) cannot resolve
+ * while the option holds the node unresolved, so for those queries the batch converges with that
+ * reference unresolved too and `CheckAnalysis` reports it rather than the fallback taking effect.
+ * Still an error, but no longer an internal one, and it only arises where the transpiler emitted an
+ * option it should not have.
+ */
+object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = {
+    if (!plan.containsPattern(TRANSPILED_PYTHON_UDF)) {
+      plan
+    } else {
+      plan.resolveOperatorsWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
+        case op if op.containsPattern(TRANSPILED_PYTHON_UDF) =>
+          // Bottom-up like ResolveTranspiledPythonUDFOptions, so a nested call is settled before
+          // the parent that reads it.
+          op.transformExpressionsUpWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
+            // Resolved arguments mean ResolveTranspiledPythonUDFOptions has already run and cleared
+            // the categories; that is checked rather than assumed, since dropping options while
+            // they are still parallel to a category list breaks the node's own `require`. An
+            // unresolved argument means the query has a real error to report -- an unknown column,
+            // say -- and falling back to Python here would bury it.
+            case t: TranspiledPythonUDF
+                if t.arguments.forall(_.resolved) && t.optionInputCategories.isEmpty &&
+                  !t.transpiledOptions.forall(_.resolved) =>
+              t.copy(transpiledOptions = t.transpiledOptions.filter(_.resolved))
+          }
       }
     }
   }

@@ -28,7 +28,7 @@ import net.razorvine.pickle.Pickler
 import org.apache.spark.api.python.{PythonEvalType, PythonFunction, PythonWorkerUtils, SpecialLengths}
 import org.apache.spark.sql.{Column, TableArg}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Descending, Expression, FunctionTableSubqueryArgumentExpression, NamedArgumentExpression, NullsFirst, NullsLast, PythonAggregate, PythonUDAF, PythonUDF, PythonUDTF, PythonUDTFAnalyzeResult, PythonUDTFSelectedExpression, SortOrder, TranspiledPythonUDF, UnresolvedPolymorphicPythonUDTF, UnresolvedTableArgPlanId}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Descending, Expression, FunctionTableSubqueryArgumentExpression, NamedArgumentExpression, NullsFirst, NullsLast, PythonAggregate, PythonUDAF, PythonUDF, PythonUDTF, PythonUDTFAnalyzeResult, PythonUDTFSelectedExpression, SortOrder, TranspiledPythonUDF, TranspiledUDFParameter, UnresolvedPolymorphicPythonUDTF, UnresolvedTableArgPlanId}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.{Generate, LogicalPlan, NamedParametersSupport, OneRowRelation}
 import org.apache.spark.sql.classic.{DataFrame, Dataset, SparkSession}
@@ -53,9 +53,11 @@ case class UserDefinedPythonFunction(
     // Per-option input-type categories ("numeric"/"string" per public param),
     // parallel to `transpiled` (same length). The analyzer rule
     // ResolveTranspiledPythonUDFOptions later keeps only the options whose
-    // categories match the bound argument types and that resolve; when none
-    // remain, the call falls back to the plain Python UDF. `builder` requires
-    // the two lists to be parallel and skips transpilation otherwise.
+    // categories match the bound argument types, and
+    // DropUnresolvedTranspiledPythonUDFOptions drops any that analysis never
+    // resolved; when none remain, the call falls back to the plain Python UDF.
+    // `builder` requires the two lists to be parallel and skips transpilation
+    // otherwise.
     transpiledInputTypes: JList[JList[String]] = Nil.asJava,
     // Schema of the intermediate aggregation buffer, set only for the incremental Python
     // aggregator eval types (see [[PythonAggregate]]); `null` otherwise. Nullable rather than
@@ -128,16 +130,15 @@ case class UserDefinedPythonFunction(
     // option plus its declared input-type categories. We can't pick here: this
     // builder runs at call-construction time, before the argument columns are
     // bound, so their types aren't known yet. ResolveTranspiledPythonUDFOptions
-    // prunes the options to those matching the resolved input types that also
-    // resolve (once known, and before CheckAnalysis), and ConvertToCatalyst
-    // picks the survivor.
+    // prunes the options to those matching the resolved input types (once known,
+    // and before CheckAnalysis), DropUnresolvedTranspiledPythonUDFOptions drops
+    // any that never resolved, and ConvertToCatalyst picks the survivor.
     // Only build the node when every option carries its parallel input-type
     // categories. ResolveTranspiledPythonUDFOptions prunes type-incompatible
-    // and unresolved options using those categories, but only when they are
-    // present (its guard is `optionInputCategories.nonEmpty`); an empty or
-    // mismatched categories list would leave a type-invalid option to fail
-    // CheckAnalysis instead of falling back. If the two lists don't line up,
-    // skip transpilation.
+    // options using those categories, but only when they are present (its guard
+    // is `optionInputCategories.nonEmpty`); an empty or mismatched categories
+    // list would leave a type-invalid option to fail CheckAnalysis instead of
+    // falling back. If the two lists don't line up, skip transpilation.
     // A call-site arity mismatch (user passed more or fewer args than the UDF's
     // parameters) must fall back to the plain Python UDF so the standard runtime
     // TypeError surfaces. Each option's category list has exactly one entry per
@@ -148,13 +149,17 @@ case class UserDefinedPythonFunction(
     if (transpiledExprsForUse.nonEmpty &&
         optionInputTypesForUse.length == transpiledExprsForUse.length &&
         optionInputTypesForUse.forall(_.length == e.length)) {
-      val udfChildren = udfExpr.children.toArray
-      // Resolve the `_udf_param_N` placeholders the transpiler emits into the bound
-      // UDF arguments. Apply this ONLY to the transpiled options -- never to
-      // `udfExpr` itself, whose children are the user's argument expressions. A user
-      // column literally named `_udf_param_N` passed as an argument must not be
-      // rewritten, so we leave `udfExpr` untouched.
-      def resolveUDFParams(expression: Expression, children: Array[Expression]): Expression = {
+      // Turn the transpiler's `_udf_param_N` placeholders into references to the bound arguments.
+      // References, not copies, so the argument stays in `udfExpr`'s children and ConvertToCatalyst
+      // can compute it once in a Project below the operator (SPARK-58626). We run before the
+      // arguments are bound so the reference has no type yet; ResolveTranspiledPythonUDFOptions
+      // fills that in, which is also what gets the option body coerced.
+      //
+      // Options ONLY, never `udfExpr` itself. Somebody's column really can be called
+      // `_udf_param_0`, and if they pass it in we must not rewrite it.
+      // Only the arity is needed, so the arguments are not in scope here at all -- there is nothing
+      // to read one off the wrong node with.
+      def resolveUDFParams(expression: Expression): Expression = {
         expression match {
           case UnresolvedAttribute(nameParts)
               if nameParts.length == 1 && nameParts.head.startsWith("_udf_param_") =>
@@ -162,17 +167,16 @@ case class UserDefinedPythonFunction(
             val index = suffix.toIntOption.getOrElse {
               throw QueryCompilationErrors.invalidUDFParameterPlaceholder(nameParts.head)
             }
-            if (index >= 0 && index < children.length) {
-              children(index)
+            if (index >= 0 && index < e.length) {
+              TranspiledUDFParameter(index)
             } else {
-              throw QueryCompilationErrors.invalidUDFParameterPlaceholderIndex(
-                index, children.length)
+              throw QueryCompilationErrors.invalidUDFParameterPlaceholderIndex(index, e.length)
             }
           case _ =>
-            expression.mapChildren(resolveUDFParams(_, children))
+            expression.mapChildren(resolveUDFParams)
         }
       }
-      val resolvedOptions = transpiledExprsForUse.map(resolveUDFParams(_, udfChildren))
+      val resolvedOptions = transpiledExprsForUse.map(resolveUDFParams)
       TranspiledPythonUDF(name, udfExpr, resolvedOptions, optionInputTypesForUse)
     } else {
       udfExpr

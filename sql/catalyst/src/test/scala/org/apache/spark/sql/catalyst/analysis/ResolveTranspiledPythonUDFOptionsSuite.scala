@@ -20,15 +20,16 @@ package org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.api.python.PythonEvalType
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Cast, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Cast, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF, TranspiledUDFParameter}
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, LogicalPlan, Project}
 import org.apache.spark.sql.types.{DataType, LongType, StringType}
 
 /**
  * Unit tests for [[ResolveTranspiledPythonUDFOptions]], which prunes a
  * TranspiledPythonUDF's per-input-type options to those whose declared categories match the
- * resolved argument types and whose expressions resolve. func=null in the leaf PythonUDF is
- * intentional: these structural tests don't execute Python.
+ * resolved argument types, and for [[DropUnresolvedTranspiledPythonUDFOptions]], which drops the
+ * ones analysis never resolved. func=null in the leaf PythonUDF is intentional: these structural
+ * tests don't execute Python.
  */
 class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
 
@@ -40,6 +41,12 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
   private def prune(node: TranspiledPythonUDF, rel: LocalRelation): TranspiledPythonUDF = {
     val rewritten = ResolveTranspiledPythonUDFOptions(Project(Seq(Alias(node, "r")()), rel))
     theNodeIn(rewritten)
+  }
+
+  // Both rules, in the order the analyzer runs them: categories first, then the drop.
+  private def pruneAndDrop(node: TranspiledPythonUDF, rel: LocalRelation): TranspiledPythonUDF = {
+    val plan = Project(Seq(Alias(node, "r")()), rel)
+    theNodeIn(DropUnresolvedTranspiledPythonUDFOptions(ResolveTranspiledPythonUDFOptions(plan)))
   }
 
   private def analyzeAndPrune(
@@ -102,13 +109,38 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
     assert(pruned.transpiledOptions == List(onlyOpt))
   }
 
+  test("category pruning keeps an option that is still unresolved, and types it") {
+    // Every real option is born unresolved: a `_udf_param_N` reference has no type until this rule
+    // reads one off the bound argument. Checking `resolved` here would drop the lot and turn
+    // transpilation off, so the check belongs in DropUnresolvedTranspiledPythonUDFOptions.
+    val a = $"a".long
+    val option = Cast(Add(TranspiledUDFParameter(0), Literal(1L)), LongType)
+    assert(!option.resolved)
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(option), List(List("numeric")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions.length == 1)
+    assert(pruned.transpiledOptions.head.resolved)
+  }
+
+  test("the drop rule leaves a node alone while its categories are still set") {
+    // The category rule owns that state and clears it; dropping options against a list still
+    // parallel to them would trip the node's `require`.
+    val a = $"a".binary
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(Cast(a, LongType)),
+      List(List("binary")))
+    val plan = Project(Seq(Alias(node, "r")()), LocalRelation(a))
+    val untouched = theNodeIn(DropUnresolvedTranspiledPythonUDFOptions(plan))
+    assert(untouched.transpiledOptions.length == 1)
+    assert(untouched.optionInputCategories == List(List("binary")))
+  }
+
   test("drops an option that fails to resolve even when its category matches") {
     val a = $"a".binary
     val neverResolves = Cast(a, LongType)
     assert(!neverResolves.resolved)
     val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(neverResolves),
       List(List("binary")))
-    val pruned = prune(node, LocalRelation(a))
+    val pruned = pruneAndDrop(node, LocalRelation(a))
     assert(pruned.transpiledOptions.isEmpty)
     assert(pruned.optionInputCategories.isEmpty)
   }
@@ -120,7 +152,7 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
     assert(good.resolved && !bad.resolved)
     val node = TranspiledPythonUDF("udf", pyUDF(Seq(a), StringType), List(good, bad),
       List(List("binary"), List("binary")))
-    val pruned = prune(node, LocalRelation(a))
+    val pruned = pruneAndDrop(node, LocalRelation(a))
     assert(pruned.transpiledOptions == List(good))
     assert(pruned.optionInputCategories.isEmpty)
   }
