@@ -1605,8 +1605,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         transpiler = CountingCatalystTranspiler()
         converted = transpiler._transpile_from_ast(
-            source,
-            function_ast,
             function_ast,
             ["a"],
             LongType(),
