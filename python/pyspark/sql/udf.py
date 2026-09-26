@@ -255,6 +255,10 @@ class UserDefinedFunction:
         # the JVM-side ``_udf_param_N`` substitution sees the inputs in
         # the right order. Empty list when this UDF is not a candidate.
         self._transpiled_param_names: list[str] = []
+        # The subset of the names above that Python forbids calling by keyword.
+        # The kwargs rewrite in ``__call__`` must leave these alone rather than
+        # silently coerce them to positional -- see the note there.
+        self._positional_only_param_names: frozenset = frozenset()
         # True once a lowering has actually produced options, so a later refusal
         # means the captured values changed rather than a body the transpiler
         # never supported -- only the former is worth warning about again.
@@ -314,6 +318,9 @@ class UserDefinedFunction:
                     # Copied rather than aliased -- ``asNondeterministic`` empties
                     # this field while the analysis keeps its own list.
                     self._transpiled_param_names = list(analysis.public_params)
+                    self._positional_only_param_names = frozenset(
+                        analysis.positional_only_public_params
+                    )
                     # Lower once purely to validate, so an unsupported body is
                     # reported where the UDF is defined rather than at first use
                     # (which is what the existing tests assert). These expressions
@@ -338,6 +345,7 @@ class UserDefinedFunction:
             warnings.warn(f"Exception transpiling UDF {func}: {e}")
             self._transpile_analysis = None
             self._transpiled_param_names = []
+            self._positional_only_param_names = frozenset()
 
     def _build_transpiled_options(
         self, session: Optional["SparkSession"]
@@ -685,12 +693,19 @@ class UserDefinedFunction:
         # (which breaks nested calls like ``isnotnull``). Uses the param list
         # captured for every transpile CANDIDATE, not ``self.transpiled``,
         # which re-lowers on every access.
+        #
+        # A positional-only param is never resolved here -- Python itself
+        # rejects calling one by keyword, and rewriting would paper over that.
+        # Left unresolved, its kwarg reaches the JVM as a
+        # ``NamedArgumentExpression``, which drops the transpiled expression and
+        # falls back to interpreted Python, so the worker's own keyword call
+        # raises the same ``TypeError`` Python would.
         if kwargs and self._transpiled_param_names:
             params = self._transpiled_param_names
             ordered: list = list(args)
             remaining_kwargs = dict(kwargs)
             for pname in params[len(args) :]:
-                if pname in remaining_kwargs:
+                if pname in remaining_kwargs and pname not in self._positional_only_param_names:
                     ordered.append(remaining_kwargs.pop(pname))
                 else:
                     # Caller didn't supply this param positionally or by
@@ -857,6 +872,7 @@ class UserDefinedFunction:
         self._transpile_analysis = None
         self._transpiled_param_names = []
         self._transpile_validated = False
+        self._positional_only_param_names = frozenset()
         return self
 
 
