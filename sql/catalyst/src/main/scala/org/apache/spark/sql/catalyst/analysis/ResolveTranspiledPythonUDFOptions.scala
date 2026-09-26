@@ -62,24 +62,36 @@ object ResolveTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
             // without it, but it would re-walk every option each time round.
             case t: TranspiledPythonUDF if t.arguments.forall(_.resolved) &&
                 (t.optionInputCategories.nonEmpty || !t.transpiledOptions.forall(_.resolved)) =>
-              val args = t.arguments
-              val pruned = if (t.optionInputCategories.isEmpty) {
-                t
-              } else {
-                val argTypes = args.map(_.dataType)
-                val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
-                  case (option, categories) if optionMatchesTypes(categories, argTypes) => option
-                }
-                t.copy(transpiledOptions = kept, optionInputCategories = Nil)
-              }
-              // Type each `_udf_param_N` reference from the argument it stands for. The options are
-              // unresolved until this runs, so the analyzer comes back after and coerces their
-              // bodies like anything else.
-              pruned.copy(transpiledOptions =
-                pruned.transpiledOptions.map(TranspiledUDFParameter.resolveTypes(_, args)))
+              pruneByCategoryAndTypeParameters(t)
           }
       }
     }
+  }
+
+  /**
+   * Prunes to the options whose categories match the argument types (when the categories are still
+   * set, clearing them), then types every `_udf_param_N` reference from the argument it stands for.
+   *
+   * Shared with [[DropUnresolvedTranspiledPythonUDFOptions]], which has to do this same work for a
+   * node this rule can never reach -- see that rule's doc. One copy, so the two cannot drift.
+   *
+   * The options are unresolved until the typing runs, so from inside the Resolution batch the
+   * analyzer comes back after and coerces their bodies like anything else.
+   */
+  private[analysis] def pruneByCategoryAndTypeParameters(
+      t: TranspiledPythonUDF): TranspiledPythonUDF = {
+    val args = t.arguments
+    val pruned = if (t.optionInputCategories.isEmpty) {
+      t
+    } else {
+      val argTypes = args.map(_.dataType)
+      val kept = t.transpiledOptions.zip(t.optionInputCategories).collect {
+        case (option, categories) if optionMatchesTypes(categories, argTypes) => option
+      }
+      t.copy(transpiledOptions = kept, optionInputCategories = Nil)
+    }
+    pruned.copy(transpiledOptions =
+      pruned.transpiledOptions.map(TranspiledUDFParameter.resolveTypes(_, args)))
   }
 
   // True when each declared category matches the corresponding argument type:
@@ -146,18 +158,24 @@ object DropUnresolvedTranspiledPythonUDFOptions extends Rule[LogicalPlan] {
     } else {
       plan.resolveOperatorsWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
         case op if op.containsPattern(TRANSPILED_PYTHON_UDF) =>
-          // Bottom-up like ResolveTranspiledPythonUDFOptions, so a nested call is settled before
-          // the parent that reads it.
+          // Bottom-up, which is what makes the nested case work: dropping an inner call's dead
+          // option resolves the inner node, and only then does the outer call -- whose argument IS
+          // that node -- come into scope here.
           op.transformExpressionsUpWithPruning(_.containsPattern(TRANSPILED_PYTHON_UDF)) {
-            // Resolved arguments mean ResolveTranspiledPythonUDFOptions has already run and cleared
-            // the categories; that is checked rather than assumed, since dropping options while
-            // they are still parallel to a category list breaks the node's own `require`. An
-            // unresolved argument means the query has a real error to report -- an unknown column,
-            // say -- and falling back to Python here would bury it.
-            case t: TranspiledPythonUDF
-                if t.arguments.forall(_.resolved) && t.optionInputCategories.isEmpty &&
-                  !t.transpiledOptions.forall(_.resolved) =>
-              t.copy(transpiledOptions = t.transpiledOptions.filter(_.resolved))
+            // An unresolved argument means the query has a real error to report -- an unknown
+            // column, say -- and falling back to Python here would bury it.
+            case t: TranspiledPythonUDF if t.arguments.forall(_.resolved) &&
+                (t.optionInputCategories.nonEmpty || !t.transpiledOptions.forall(_.resolved)) =>
+              // Categories still set means ResolveTranspiledPythonUDFOptions never got to this
+              // node: its guard needs every argument resolved, and an inner call holding an
+              // unresolvable option is not. So do its work here rather than skip the node --
+              // skipping leaves the parameters untyped, and CheckAnalysis reads `dataType` off one
+              // and reports an internal error, which is the very thing this rule exists to avoid.
+              // Coercion cannot run again from here, so an option body that still needs it stays
+              // unresolved and is dropped just below: the call falls back to Python, which is the
+              // safe direction.
+              val typed = ResolveTranspiledPythonUDFOptions.pruneByCategoryAndTypeParameters(t)
+              typed.copy(transpiledOptions = typed.transpiledOptions.filter(_.resolved))
           }
       }
     }

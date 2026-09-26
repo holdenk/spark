@@ -55,8 +55,11 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
       Project(Seq(Alias(node, "r")()), rel), new QueryPlanningTracker))
   }
 
-  private def theNodeIn(plan: LogicalPlan): TranspiledPythonUDF =
-    plan.expressions.flatMap(_.collect { case t: TranspiledPythonUDF => t }).head
+  private def theNodeIn(plan: LogicalPlan): TranspiledPythonUDF = nodesIn(plan).head
+
+  // Outermost first, which is the order `collect` yields for a nested call.
+  private def nodesIn(plan: LogicalPlan): Seq[TranspiledPythonUDF] =
+    plan.expressions.flatMap(_.collect { case t: TranspiledPythonUDF => t })
 
   test("keeps the numeric option for numeric columns and drops the string one") {
     val a = $"a".long
@@ -122,16 +125,30 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
     assert(pruned.transpiledOptions.head.resolved)
   }
 
-  test("the drop rule leaves a node alone while its categories are still set") {
-    // The category rule owns that state and clears it; dropping options against a list still
-    // parallel to them would trip the node's `require`.
+  test("the drop rule prunes by category itself when the categories are still set") {
+    // This used to skip such a node, to avoid dropping options while they were still parallel to a
+    // category list and tripping the node's `require`. That left a nested call's parameters untyped
+    // and CheckAnalysis calling it an internal error (SPARK-59090). It now does the category prune,
+    // which clears the list and satisfies the `require`, and the category semantics still apply:
+    // a "string" option over a binary column is not a match and goes.
     val a = $"a".binary
-    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(Cast(a, LongType)),
-      List(List("binary")))
-    val plan = Project(Seq(Alias(node, "r")()), LocalRelation(a))
-    val untouched = theNodeIn(DropUnresolvedTranspiledPythonUDFOptions(plan))
-    assert(untouched.transpiledOptions.length == 1)
-    assert(untouched.optionInputCategories == List(List("binary")))
+    val mismatched = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(Concat(Seq(a, a))),
+      List(List("string")))
+    val pruned = theNodeIn(DropUnresolvedTranspiledPythonUDFOptions(
+      Project(Seq(Alias(mismatched, "r")()), LocalRelation(a))))
+    assert(pruned.optionInputCategories.isEmpty)
+    assert(pruned.transpiledOptions.isEmpty)
+
+    // And taking over that job does not make it over-eager: a matching option whose parameter it
+    // types itself resolves, so it survives.
+    val b = $"b".long
+    val matching = TranspiledPythonUDF("udf", pyUDF(Seq(b)),
+      List(Cast(Add(TranspiledUDFParameter(0), Literal(1L)), LongType)), List(List("numeric")))
+    val kept = theNodeIn(DropUnresolvedTranspiledPythonUDFOptions(
+      Project(Seq(Alias(matching, "r")()), LocalRelation(b))))
+    assert(kept.optionInputCategories.isEmpty)
+    assert(kept.transpiledOptions.length == 1)
+    assert(kept.transpiledOptions.head.resolved)
   }
 
   test("drops an option that fails to resolve even when its category matches") {
@@ -155,6 +172,32 @@ class ResolveTranspiledPythonUDFOptionsSuite extends AnalysisTest {
     val pruned = pruneAndDrop(node, LocalRelation(a))
     assert(pruned.transpiledOptions == List(good))
     assert(pruned.optionInputCategories.isEmpty)
+  }
+
+  test("nested call: an unresolvable inner option does not strand the outer's parameters") {
+    // SPARK-59090 regression. The outer call's argument IS the inner TranspiledPythonUDF, so while
+    // the inner holds an unresolvable option the outer is unresolved too and
+    // ResolveTranspiledPythonUDFOptions -- which needs every argument resolved -- never fires on
+    // it. Its categories stay set and its `_udf_param_N` references stay untyped. Skipping such a
+    // node here left CheckAnalysis to read `dataType` off an untyped parameter and call it an
+    // internal error: the exact failure this rule removes.
+    val a = $"a".binary
+    val inner = TranspiledPythonUDF("g", pyUDF(Seq(a)), List(Cast(a, LongType)),
+      List(List("binary")))
+    val outer = TranspiledPythonUDF("f", pyUDF(Seq(inner)),
+      List(Cast(Add(TranspiledUDFParameter(0), Literal(1L)), LongType)), List(List("numeric")))
+    val analyzed = getAnalyzer.executeAndCheck(
+      Project(Seq(Alias(outer, "r")()), LocalRelation(a)), new QueryPlanningTracker)
+    val nodes = nodesIn(analyzed)
+    assert(nodes.forall(_.resolved), "every node must be resolved once analysis finishes")
+    assert(nodes.forall(_.optionInputCategories.isEmpty), "categories must be cleared")
+    assert(nodes.forall(_.transpiledOptions.forall(_.resolved)),
+      "no unresolved option may survive to CheckAnalysis")
+    // The inner's only option cannot resolve, so it falls back to Python; the outer's can, once its
+    // parameter is typed from the inner's return type, so it survives.
+    val Seq(analyzedOuter, analyzedInner) = nodes
+    assert(analyzedInner.transpiledOptions.isEmpty)
+    assert(analyzedOuter.transpiledOptions.length == 1)
   }
 
   test("full analysis drops an option that can never resolve instead of failing") {
