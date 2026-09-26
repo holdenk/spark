@@ -317,11 +317,51 @@ public class SparkSaslSuite {
   }
 
   @Test
+  public void testClientIdBoundAfter() throws Exception {
+    TransportConf conf = new TransportConf("shuffle", MapConfigProvider.EMPTY);
+    SecretKeyHolder keyHolder = mock(SecretKeyHolder.class);
+    when(keyHolder.getSaslUser(anyString())).thenReturn("user");
+    when(keyHolder.getSecretKey(anyString())).thenReturn("secret");
+    TransportClient client = mock(TransportClient.class);
+    SaslRpcHandler handler = new SaslRpcHandler(conf, null, null, keyHolder);
+    SparkSaslClient saslClient = new SparkSaslClient("app-1", keyHolder, false);
+    try {
+      byte[] clientToken = saslClient.firstToken();
+      boolean authenticated = false;
+      for (int i = 0; i < 10 && !authenticated; i++) {
+        SaslMessage msg = new SaslMessage("app-1", clientToken);
+        ByteBuf buf = Unpooled.buffer(msg.encodedLength() + clientToken.length);
+        msg.encode(buf);
+        buf.writeBytes(msg.body().nioByteBuffer());
+
+        AtomicReference<ByteBuffer> response = new AtomicReference<>();
+        RpcResponseCallback callback = mock(RpcResponseCallback.class);
+        doAnswer(invocation -> {
+          response.set((ByteBuffer) invocation.getArguments()[0]);
+          return null;
+        }).when(callback).onSuccess(any(ByteBuffer.class));
+
+        authenticated = handler.doAuthChallenge(client, buf.nioBuffer(), callback);
+        if (!authenticated) {
+          // No client ID set since we did not finish the challenge.
+          verify(client, never()).setClientId(anyString());
+          clientToken = saslClient.response(JavaUtils.bufferToArray(response.get()));
+        }
+      }
+      assertTrue(authenticated);
+      verify(client).setClientId("app-1");
+    } finally {
+      saslClient.dispose();
+    }
+  }
+
+  @Test
   public void testRpcHandlerDelegate() throws Exception {
     // Tests all delegates exception for receive(), which is more complicated and already handled
     // by all other tests.
     RpcHandler handler = mock(RpcHandler.class);
-    RpcHandler saslHandler = new SaslRpcHandler(null, null, handler, null);
+    RpcHandler saslHandler = new SaslRpcHandler(
+      new TransportConf("shuffle", MapConfigProvider.EMPTY), null, handler, null);
 
     saslHandler.getStreamManager();
     verify(handler).getStreamManager();
@@ -331,6 +371,19 @@ public class SparkSaslSuite {
 
     saslHandler.exceptionCaught(null, null);
     verify(handler).exceptionCaught(isNull(), isNull());
+  }
+
+  @Test
+  public void testStreamManagerFailsClosedWhenConfigured() {
+    // Pins the wiring: with the conf set, the handler must return the fail-closed wrapper.
+    RpcHandler handler = mock(RpcHandler.class);
+    when(handler.getStreamManager()).thenReturn(mock(StreamManager.class));
+    TransportConf conf = new TransportConf("shuffle", new MapConfigProvider(
+      ImmutableMap.of("spark.network.auth.requireAuthForStreamRequests", "true")));
+    RpcHandler saslHandler = new SaslRpcHandler(conf, null, handler, null);
+
+    assertThrows(SecurityException.class,
+      () -> saslHandler.getStreamManager().openStream("/jars/app.jar"));
   }
 
   @Test

@@ -212,8 +212,8 @@ private object PostgresDialect extends JdbcDialect with SQLConfHelper {
       indexName: String,
       tableIdent: Identifier,
       options: JDBCOptions): Boolean = {
-    val sql = s"SELECT * FROM pg_indexes WHERE tablename = '${tableIdent.name()}' AND" +
-      s" indexname = '$indexName'"
+    val sql = s"SELECT * FROM pg_indexes WHERE tablename = '${escapeSql(tableIdent.name())}' AND" +
+      s" indexname = '${escapeSql(indexName)}'"
     JdbcUtils.checkIfIndexExists(conn, sql, options)
   }
 

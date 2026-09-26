@@ -79,15 +79,17 @@ class ExternalShuffleService(sparkConf: SparkConf, securityManager: SecurityMana
 
   /** Create a new shuffle block handler. Factored out for subclasses to override. */
   protected def newShuffleBlockHandler(conf: TransportConf): ExternalBlockHandler = {
+    // Constrain registered localDirs to the configured local directories.
+    val localDirs = Utils.getConfiguredLocalDirs(sparkConf)
     if (sparkConf.get(config.SHUFFLE_SERVICE_DB_ENABLED) && enabled) {
       val shuffleDBName = sparkConf.get(config.SHUFFLE_SERVICE_DB_BACKEND)
       val dbBackend = DBBackend.byName(shuffleDBName)
       logInfo(s"Use ${dbBackend.name()} as the implementation of " +
         s"${config.SHUFFLE_SERVICE_DB_BACKEND.key}")
       new ExternalBlockHandler(conf,
-        findRegisteredExecutorsDBFile(dbBackend.fileName(registeredExecutorsDB)))
+        findRegisteredExecutorsDBFile(dbBackend.fileName(registeredExecutorsDB)), localDirs, false)
     } else {
-      new ExternalBlockHandler(conf, null)
+      new ExternalBlockHandler(conf, null, localDirs, false)
     }
   }
 

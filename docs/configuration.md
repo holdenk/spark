@@ -748,7 +748,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.redaction.regex</code></td>
-  <td>(?i)secret|password|token|access[.]key</td>
+  <td>(?i)secret|password|token|access[.]?key|credential</td>
   <td>
     Regex to decide which Spark configuration properties and environment variables in driver and
     executor environments contain sensitive information. When this regex matches a property key or
@@ -1433,6 +1433,28 @@ Apart from these, the following properties are also available, and may be useful
     By default this is not set, meaning all application information will be kept in memory.
   </td>
   <td>3.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.ui.actionsViaGetEnabled</code></td>
+  <td><code>true</code> on YARN, <code>false</code> otherwise</td>
+  <td>
+    Whether the job/stage kill endpoints of the web UI accept HTTP GET requests in
+    addition to POST. Left unset, this follows the cluster manager: GET is accepted when
+    <code>spark.master</code> is <code>yarn</code>, because the YARN ResourceManager/AM
+    proxy does not forward POST requests, and refused everywhere else.
+    Either way the state-changing endpoints require the random per-UI CSRF token embedded
+    in the forms the UI renders, and reject prefetch requests (identified by
+    the Purpose, Sec-Purpose, or X-Moz headers) and HEAD requests, so forged cross-site
+    requests and incidental fetches cannot trigger them. Scripted clients can read
+    the token from the jobs page before calling the endpoint. The kill controls on the
+    jobs and stages pages are the same forms in both modes; only their method follows
+    this setting. In GET mode the browser submits the token in the URL's query string,
+    so it can be recorded in browser history and server or proxy access logs; it is
+    random per UI instance and grants nothing beyond the UI's own state-changing
+    endpoints. Prefetch rejection relies on the prefetcher identifying itself via those
+    headers; one that sends none of them is not detected.
+  </td>
+  <td>3.5.10</td>
 </tr>
 <tr>
   <td><code>spark.ui.killEnabled</code></td>

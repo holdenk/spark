@@ -170,7 +170,9 @@ abstract class JdbcDialect extends Serializable with Logging {
    * name is a reserved keyword, or in case it contains characters that require quotes (e.g. space).
    */
   def quoteIdentifier(colName: String): String = {
-    s""""$colName""""
+    // By ANSI standard, quotes are escaped with another quotes.
+    val escapedColName = colName.replace("\"", "\"\"")
+    s""""$escapedColName""""
   }
 
   /**
@@ -534,11 +536,11 @@ abstract class JdbcDialect extends Serializable with Logging {
   }
 
   def getTableCommentQuery(table: String, comment: String): String = {
-    s"COMMENT ON TABLE $table IS '$comment'"
+    s"COMMENT ON TABLE $table IS '${escapeSql(comment)}'"
   }
 
   def getSchemaCommentQuery(schema: String, comment: String): String = {
-    s"COMMENT ON SCHEMA ${quoteIdentifier(schema)} IS '$comment'"
+    s"COMMENT ON SCHEMA ${quoteIdentifier(schema)} IS '${escapeSql(comment)}'"
   }
 
   def removeSchemaCommentQuery(schema: String): String = {

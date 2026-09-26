@@ -17,11 +17,10 @@
 # under the License.
 #
 
-name: "Build (master, Scala 2.13, Hadoop 3, JDK 8)"
+name: "Build / Scala 2.13 (Hadoop 3, JDK 8)"
 
 on:
-  schedule:
-    - cron: '0 19 * * *'
+  workflow_dispatch:
 
 jobs:
   run-build:
@@ -32,18 +31,18 @@ jobs:
     if: github.repository == 'apache/spark'
     with:
       java: 8
-      branch: master
       hadoop: hadoop3
       envs: >-
         {
-          "SCALA_PROFILE": "scala2.13"
+          "SCALA_PROFILE": "scala2.13",
+          "ORACLE_DOCKER_IMAGE_NAME": "gvenzl/oracle-xe:21.3.0"
         }
       jobs: >-
         {
           "build": "true",
-          "pyspark": "true",
           "sparkr": "true",
           "tpcds-1g": "true",
           "docker-integration-tests": "true",
-          "lint" : "true"
+          "k8s-integration-tests": "true",
+          "lint": "true"
         }

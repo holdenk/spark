@@ -132,7 +132,13 @@ private case object MySQLDialect extends JdbcDialect with SQLConfHelper {
   }
 
   override def quoteIdentifier(colName: String): String = {
-    s"`$colName`"
+    // Per MySQL documentation: https://dev.mysql.com/doc/refman/8.4/en/identifiers.html
+    //
+    // Identifier quote characters can be included within an identifier if you quote the
+    // identifier. If the character to be included within the identifier is the same as
+    // that used to quote the identifier itself, then you need to double the character.
+    val escapedColName = colName.replace("`", "``")
+    s"`$escapedColName`"
   }
 
   override def schemasExists(conn: Connection, options: JDBCOptions, schema: String): Boolean = {
@@ -198,7 +204,7 @@ private case object MySQLDialect extends JdbcDialect with SQLConfHelper {
 
   // See https://dev.mysql.com/doc/refman/8.0/en/alter-table.html
   override def getTableCommentQuery(table: String, comment: String): String = {
-    s"ALTER TABLE $table COMMENT = '$comment'"
+    s"ALTER TABLE $table COMMENT = '${escapeSql(comment)}'"
   }
 
   override def getJDBCType(dt: DataType): Option[JdbcType] = dt match {
@@ -243,7 +249,7 @@ private case object MySQLDialect extends JdbcDialect with SQLConfHelper {
       tableIdent: Identifier,
       options: JDBCOptions): Boolean = {
     val sql = s"SHOW INDEXES FROM ${quoteIdentifier(tableIdent.name())} " +
-      s"WHERE key_name = '$indexName'"
+      s"WHERE key_name = '${escapeSql(indexName)}'"
     JdbcUtils.checkIfIndexExists(conn, sql, options)
   }
 
