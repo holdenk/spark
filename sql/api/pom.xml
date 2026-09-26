@@ -72,9 +72,15 @@
             <groupId>org.apache.arrow</groupId>
             <artifactId>arrow-vector</artifactId>
         </dependency>
+        <!-- Use Arrow's Unsafe allocator instead of arrow-memory-netty.
+             arrow-memory-netty 12.0.1 reaches into io.netty.buffer.PooledByteBufAllocator
+             internals (the `chunkSize` field) that Netty 4.1.120+ removed, so it throws
+             NoSuchFieldError under the CVE-mandated Netty 4.1.124. The fix for newer Netty
+             lives only in Arrow 18+ (which requires Java 11), so on Java 8 (max Arrow 17)
+             we switch to the Netty-free Unsafe allocation manager instead. -->
         <dependency>
             <groupId>org.apache.arrow</groupId>
-            <artifactId>arrow-memory-netty</artifactId>
+            <artifactId>arrow-memory-unsafe</artifactId>
         </dependency>
     </dependencies>
     <build>
