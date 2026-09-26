@@ -1243,8 +1243,11 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
         |""".stripMargin)
 
     checkRowLevelOperationOptions(
-      sql(s"UPDATE $tableNameAsString WITH (`write.split-size` = 10) SET salary = -1 WHERE pk = 1"),
-      "write.split-size" -> "10")
+      sql(s"UPDATE $tableNameAsString WITH " +
+        s"(`load-option` = 'load-value', `write-option` = 'write-value') " +
+        s"SET salary = -1 WHERE pk = 1"),
+      "load-option" -> "load-value",
+      "write-option" -> "write-value")
 
     checkAnswer(
       sql(s"SELECT * FROM $tableNameAsString"),
@@ -1367,4 +1370,39 @@ abstract class UpdateTableSuiteBase extends RowLevelOperationSuiteBase {
       sql(s"SELECT * FROM $tableNameAsString"),
       Row(1, -1, "hr") :: Row(2, 200, "software") :: Row(3, -1, "hr") :: Nil)
   }
+
+  test("update with a SQL variable in the condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    withSessionVariable("target_dep") {
+      sql("DECLARE VARIABLE target_dep STRING DEFAULT 'hr'")
+      sql(s"UPDATE $tableNameAsString SET salary = 999 WHERE dep = target_dep")
+
+      checkAnswer(
+        sql(s"SELECT * FROM $tableNameAsString"),
+        Row(1, 999, "hr") :: Row(2, 200, "software") :: Nil)
+    }
+  }
+
+  test("update with a SQL scripting local variable in the condition") {
+    createAndInitTable("pk INT NOT NULL, salary INT, dep STRING",
+      """{ "pk": 1, "salary": 100, "dep": "hr" }
+        |{ "pk": 2, "salary": 200, "dep": "software" }
+        |""".stripMargin)
+
+    sql(
+      s"""BEGIN
+         |  DECLARE local_dep STRING DEFAULT 'hr';
+         |  UPDATE $tableNameAsString SET salary = 999 WHERE dep = local_dep;
+         |END
+         |""".stripMargin)
+
+    checkAnswer(
+      sql(s"SELECT * FROM $tableNameAsString"),
+      Row(1, 999, "hr") :: Row(2, 200, "software") :: Nil)
+  }
+
 }

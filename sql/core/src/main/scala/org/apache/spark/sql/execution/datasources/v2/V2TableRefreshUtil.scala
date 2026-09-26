@@ -88,21 +88,27 @@ private[sql] object V2TableRefreshUtil extends SQLConfHelper with Logging {
     plan transformWithSubqueries {
       case r @ ExtractV2CatalogAndIdentifier(catalog, ident)
           if (r.isVersioned || !versionedOnly) && r.timeTravelSpec.isEmpty =>
-        val currentTable = currentTables.getOrElseUpdate((catalog, ident, r.options), {
+        val stateOptions = CatalogV2Util.extractTableStateOptions(catalog, r.options)
+        val currentTable = currentTables.getOrElseUpdate((catalog, ident, stateOptions), {
           val tableName = V2TableUtil.toQualifiedName(catalog, ident)
-          lookupCachedRelation(spark, catalog, ident, r.table) match {
-            case Some(cached) if cached.options == r.options =>
+          lookupCachedRelation(spark, catalog, ident, r.table, stateOptions) match {
+            case Some(cached) =>
               logDebug(s"Refreshing table metadata for $tableName using shared relation cache")
               cached.table
             case _ =>
               logDebug(s"Refreshing table metadata for $tableName using catalog")
-              CatalogV2Util.getTable(catalog, ident, options = r.options)
+              CatalogV2Util.getTableWithStateOptions(catalog, ident, stateOptions)
           }
         })
         validateTableIdentity(currentTable, r)
         validateDataColumns(currentTable, r, schemaValidationMode)
         validateMetadataColumns(currentTable, r, schemaValidationMode)
-        r.copy(table = currentTable)
+        val refreshed = r.copy(table = currentTable)
+        if (schemaValidationMode == ALLOW_NEW_FIELDS) {
+          AnalyzedSchemaProjection.rebindToAnalyzedSchema(refreshed)
+        } else {
+          refreshed
+        }
     }
   }
 
@@ -110,8 +116,10 @@ private[sql] object V2TableRefreshUtil extends SQLConfHelper with Logging {
       spark: SparkSession,
       catalog: TableCatalog,
       ident: Identifier,
-      table: Table): Option[DataSourceV2Relation] = {
-    CatalogV2Util.lookupCachedRelation(spark.sharedState.relationCache, catalog, ident, table, conf)
+      table: Table,
+      stateOptions: CaseInsensitiveStringMap): Option[DataSourceV2Relation] = {
+    CatalogV2Util.lookupCachedRelationWithStateOptions(
+      spark.sharedState.relationCache, catalog, ident, table, stateOptions, conf)
   }
 
   // it is not safe to allow any schema changes in commands (e.g. CTAS, RTAS, MERGE)
@@ -120,7 +128,7 @@ private[sql] object V2TableRefreshUtil extends SQLConfHelper with Logging {
   }
 
   private def containsCommand(plan: LogicalPlan): Boolean = {
-    plan.find(_.isInstanceOf[Command]).isDefined
+    plan.exists(_.isInstanceOf[Command])
   }
 
   private def validateTableIdentity(currentTable: Table, relation: DataSourceV2Relation): Unit = {
