@@ -1503,6 +1503,192 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertIsNotNone(converted)
         self.assertLessEqual(transpiler.category_calls, len(list(ast.walk(function_ast))))
 
+    def test_udf_transpile_variety_reports_own_categories(self):
+        # SPARK-55213: a variety may return a ``(Column, list[str])`` tuple from
+        # ``_transpile_from_ast`` to report the input categories the option it
+        # built actually needs, instead of being labeled with the combo the
+        # caller asked about. The caller uses the variety's categories when
+        # present and falls back to the combo otherwise, so a variety that works
+        # out its own input types (e.g. from annotations) is not matched against
+        # the caller's guess -- and a new type it supports is not another entry
+        # in a fixed category enum.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class BoolOnlyTranspiler(AbstractTranspiler):
+            variety = "bool_only_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                # This variety only ever builds a boolean option, regardless of
+                # the numeric/string combo the caller asked about.
+                return (
+                    col("_udf_param_0").cast(returnType),
+                    ["bool"] * len(params),
+                )
+
+        BoolOnlyTranspiler.register()
+        try:
+            with self.sql_conf(
+                {
+                    **_TRANSPILE_ON,
+                    "spark.sql.experimental.optimizer.pyTranspilers": "bool_only_55213",
+                }
+            ):
+
+                def add(a: int, b: int):
+                    return a + b
+
+                u = UserDefinedFunction(add, LongType())
+                self.assertTrue(u.transpiled)
+                # The variety reported "bool" for both params; the combo's numeric
+                # guess (the only combo for two int-annotated params) must NOT
+                # label the option.
+                self.assertEqual([["bool", "bool"]], u._transpiled_input_categories)
+        finally:
+            AbstractTranspiler.varieties.pop("bool_only_55213", None)
+
+    def test_udf_transpile_variety_plain_column_falls_back_to_combo(self):
+        # SPARK-55213: a variety that returns a plain ``Column`` (the existing
+        # contract) is labeled with the combo the caller asked about, so existing
+        # varieties do not move.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class NumericOnlyTranspiler(AbstractTranspiler):
+            variety = "numeric_only_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                return col("_udf_param_0").cast(returnType)
+
+        NumericOnlyTranspiler.register()
+        try:
+            with self.sql_conf(
+                {
+                    **_TRANSPILE_ON,
+                    "spark.sql.experimental.optimizer.pyTranspilers": "numeric_only_55213",
+                }
+            ):
+
+                def add(a: int, b: int):
+                    return a + b
+
+                u = UserDefinedFunction(add, LongType())
+                self.assertTrue(u.transpiled)
+                # Plain Column return -> labeled with the combo (numeric for two
+                # int-annotated params), not anything the variety invented.
+                self.assertEqual([["numeric", "numeric"]], u._transpiled_input_categories)
+        finally:
+            AbstractTranspiler.varieties.pop("numeric_only_55213", None)
+
+    def test_udf_transpile_variety_tuple_with_none_column_declines(self):
+        # SPARK-55213: a variety that declines inside a tuple -- returning
+        # ``(None, categories)`` -- must be treated like a plain-``None`` decline,
+        # not appended as a ``None`` Column that would surface a raw JVM NPE at
+        # UDF-call time (breaking "a transpile failure must never break a working
+        # UDF"). The whole UDF falls back to interpreted Python with the usual
+        # warning, and no option is produced.
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class DeclineInTupleTranspiler(AbstractTranspiler):
+            variety = "decline_in_tuple_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                return (None, ["numeric"] * len(params))
+
+        DeclineInTupleTranspiler.register()
+        try:
+            with self.sql_conf(
+                {
+                    **_TRANSPILE_ON,
+                    "spark.sql.experimental.optimizer.pyTranspilers": "decline_in_tuple_55213",
+                }
+            ):
+
+                def add(a: int, b: int):
+                    return a + b
+
+                u, reasons = self._fallback_reason(add, LongType())
+                # The decline is silent (like a plain None), so no option is
+                # produced and the categories list stays empty too.
+                self.assertEqual([], u._transpiled_input_categories)
+        finally:
+            AbstractTranspiler.varieties.pop("decline_in_tuple_55213", None)
+
+    def test_udf_transpile_variety_malformed_return_falls_back(self):
+        # SPARK-55213: a variety whose return is neither a Column nor a
+        # (Column, categories) tuple -- e.g. a bare list by typo -- must be
+        # refused, not appended as garbage that surfaces a JVM error at call time.
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class ListReturningTranspiler(AbstractTranspiler):
+            variety = "list_returning_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                from pyspark.sql.functions import col
+
+                # A list, not a tuple: the documented shape is (Column, list[str]),
+                # and this is the natural slip.
+                return [col("_udf_param_0").cast(returnType), ["numeric"] * len(params)]
+
+        ListReturningTranspiler.register()
+        try:
+            with self.sql_conf(
+                {
+                    **_TRANSPILE_ON,
+                    "spark.sql.experimental.optimizer.pyTranspilers": "list_returning_55213",
+                }
+            ):
+
+                def add(a: int, b: int):
+                    return a + b
+
+                u, reasons = self._fallback_reason(add, LongType())
+                self.assertIn("unsupported result", reasons)
+        finally:
+            AbstractTranspiler.varieties.pop("list_returning_55213", None)
+
+    def test_udf_transpile_variety_wrong_length_categories_falls_back(self):
+        # SPARK-55213: a variety whose categories list length differs from the
+        # public param count is refused. The JVM matches options to bound column
+        # types by index and drops the WHOLE option set on any length mismatch,
+        # so accepting one would silently neuter every other variety's options.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class WrongLengthTranspiler(AbstractTranspiler):
+            variety = "wrong_length_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                # One category short of the two public params.
+                return (col("_udf_param_0").cast(returnType), ["numeric"])
+
+        WrongLengthTranspiler.register()
+        try:
+            with self.sql_conf(
+                {
+                    **_TRANSPILE_ON,
+                    "spark.sql.experimental.optimizer.pyTranspilers": "wrong_length_55213",
+                }
+            ):
+
+                def add(a: int, b: int):
+                    return a + b
+
+                u, reasons = self._fallback_reason(add, LongType())
+                self.assertIn("input categories", reasons)
+        finally:
+            AbstractTranspiler.varieties.pop("wrong_length_55213", None)
+
     # ------------------------------------------------------------------
     # Edge cases (SPARK-55206 follow-up). Helpers build a UDF with
     # transpilation on; `_vals` runs it and returns outputs (asserting it
