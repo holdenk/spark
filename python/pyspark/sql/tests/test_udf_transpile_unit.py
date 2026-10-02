@@ -2611,6 +2611,164 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         for combo in combos:
             self.assertEqual(combo[0], "string")
 
+    def test_annotation_category_map_and_array(self):
+        # dict/Dict/Mapping (bare or subscripted) -> "map", list/List/Sequence
+        # -> "array"; a stringized annotation unwraps the same way. Pinning them
+        # stops the untyped numeric/string blow-up (SPARK-55219).
+        import ast as _ast
+
+        from pyspark.sql.transpile import _annotation_category
+
+        def cat(src: str) -> object:
+            return _annotation_category(_ast.parse(src).body[0].args.args[0].annotation)
+
+        self.assertEqual(cat("def f(a: dict): ..."), "map")
+        self.assertEqual(cat("def f(a: Dict): ..."), "map")
+        self.assertEqual(cat("def f(a: Mapping): ..."), "map")
+        self.assertEqual(cat("def f(a: dict[str, str]): ..."), "map")
+        self.assertEqual(cat("def f(a: Dict[str, str]): ..."), "map")
+        self.assertEqual(cat("def f(a: Mapping[str, str]): ..."), "map")
+        self.assertEqual(cat("def f(a: typing.Dict[str, str]): ..."), "map")
+        self.assertEqual(cat('def f(a: "dict"): ...'), "map")
+        self.assertEqual(cat("def f(a: list): ..."), "array")
+        self.assertEqual(cat("def f(a: List): ..."), "array")
+        self.assertEqual(cat("def f(a: Sequence): ..."), "array")
+        self.assertEqual(cat("def f(a: list[int]): ..."), "array")
+        self.assertEqual(cat("def f(a: List[int]): ..."), "array")
+        self.assertEqual(cat("def f(a: Sequence[int]): ..."), "array")
+        self.assertEqual(cat("def f(a: typing.List[int]): ..."), "array")
+        self.assertEqual(cat('def f(a: "list"): ...'), "array")
+        # Annotated[X, ...] is transparent: unwrap to X.
+        self.assertEqual(cat("def f(a: Annotated[int, 'pos']): ..."), "numeric")
+        self.assertEqual(cat("def f(a: Annotated[dict, 'pos']): ..."), "map")
+        self.assertEqual(cat("def f(a: typing.Annotated[str, 'x']): ..."), "string")
+        # Unrelated / absent annotations stay untyped.
+        self.assertIsNone(_annotation_category(None))
+        self.assertEqual(cat("def f(a: int): ..."), "numeric")
+        self.assertEqual(cat("def f(a: str): ..."), "string")
+        self.assertIsNone(cat("def f(a: set): ..."))
+
+    def test_param_category_combos_pins_map_and_array(self):
+        # A pinned map/array param is a single-element candidate, so it shrinks
+        # the combo matrix instead of doubling it like an untyped param.
+        import ast as _ast
+
+        from pyspark.sql.transpile import _param_category_combos
+
+        # a: dict (pinned "map"), b untyped -> 2 combos, a always "map".
+        fn = _ast.parse("def f(a: dict, b): return b").body[0]
+        combos = _param_category_combos(fn, ["a", "b"])
+        self.assertEqual(len(combos), 2)
+        for combo in combos:
+            self.assertEqual(combo[0], "map")
+            self.assertIn(combo[1], ("numeric", "string"))
+
+        # Two pinned complex params -> a single combo, no numeric/string split.
+        fn = _ast.parse("def f(a: list, b: dict): return b").body[0]
+        combos = _param_category_combos(fn, ["a", "b"])
+        self.assertEqual(combos, [{0: "array", 1: "map"}])
+
+    def test_param_category_combos_present_unrecognized_falls_back(self):
+        # A present-but-unrecognised annotation (set, tuple, Optional[dict], a
+        # custom class) must NOT be inferred as numeric/string -- that would
+        # blow up the option matrix and risk running a numeric/string lowering
+        # over a complex column. Instead the function yields no variant and
+        # falls back to interpreted Python. An absent annotation still tries
+        # both numeric and string (the core inference).
+        import ast as _ast
+
+        from pyspark.sql.transpile import _param_category_combos
+
+        # Present but unrecognised -> no variant (fall back).
+        for src in (
+            "def f(a: set): ...",
+            "def f(a: tuple): ...",
+            "def f(a: Optional[dict]): ...",
+            "def f(a: Widget): ...",
+        ):
+            fn = _ast.parse(src).body[0]
+            self.assertEqual(_param_category_combos(fn, ["a"]), [], src)
+
+        # Mixed: one present-unrecognised param still kills the whole matrix,
+        # even when the others are fine -- we refuse to guess a category for it.
+        fn = _ast.parse("def f(a: set, b: int): return b").body[0]
+        self.assertEqual(_param_category_combos(fn, ["a", "b"]), [])
+
+        # Absent annotation is NOT the same: it stays untyped (numeric + string).
+        fn = _ast.parse("def f(a, b): return b").body[0]
+        combos = _param_category_combos(fn, ["a", "b"])
+        self.assertEqual(len(combos), 4)
+
+    def test_udf_transpile_map_and_array_input_categories(self):
+        # A map/array-annotated param is pinned to its category, so the option
+        # survives against a matching MapType/ArrayType column and is pruned
+        # (falling back to interpreted Python) against a non-matching column.
+        # The body ignores the complex param and lowers the numeric one, so the
+        # built-in transpiler produces an option whose categories the JVM picks.
+        def map_plus(x: dict, y: int):
+            return y + 1
+
+        def array_plus(x: list, y: int):
+            return y + 1
+
+        # Matching column -> lowered (no EvalPython).
+        self.assertEqual(
+            self._vals(
+                map_plus,
+                LongType(),
+                "a map<string,string>, b long",
+                [({"k": "v"}, 1), ({}, 2), (None, 3)],
+            ),
+            [2, 3, 4],
+        )
+        self.assertEqual(
+            self._vals(
+                array_plus,
+                LongType(),
+                "a array<string>, b long",
+                [(["x"], 1), ([], 2), (None, 3)],
+            ),
+            [2, 3, 4],
+        )
+
+        # Non-matching column -> the option is pruned and interpreted Python
+        # runs (EvalPython present) but still returns the right value.
+        with self.sql_conf(_TRANSPILE_ON):
+            u = UserDefinedFunction(map_plus, LongType())
+            self.assertTrue(u.transpiled, f"{map_plus} produced no options")
+            df = self.spark.createDataFrame([("z", 1)], "a string, b long")
+            projected = df.select(u("a", "b"))
+            self.assertGreater(self._eval_python_count(projected), 0)
+            self.assertEqual([r[0] for r in projected.collect()], [2])
+
+            u = UserDefinedFunction(array_plus, LongType())
+            self.assertTrue(u.transpiled, f"{array_plus} produced no options")
+            df = self.spark.createDataFrame([(1, 1)], "a long, b long")
+            projected = df.select(u("a", "b"))
+            self.assertGreater(self._eval_python_count(projected), 0)
+            self.assertEqual([r[0] for r in projected.collect()], [2])
+
+    def test_udf_transpile_present_unrecognized_annotation_falls_back(self):
+        # A param annotated with a type we do not recognise (set, tuple) must not
+        # be inferred as numeric/string. The transpiler yields no option, so the
+        # UDF falls back to interpreted Python instead of blowing up the option
+        # matrix (SPARK-55219).
+        def set_plus(x: set, y: int):
+            return y + 1
+
+        def tuple_plus(x: tuple, y: int):
+            return y + 1
+
+        with self.sql_conf(_TRANSPILE_ON):
+            for func in (set_plus, tuple_plus):
+                u = UserDefinedFunction(func, LongType())
+                self.assertEqual([], u.transpiled, f"{func} must not transpile")
+                # Interpreted Python still runs and returns the right value.
+                df = self.spark.createDataFrame([(1, 1)], "a long, b long")
+                projected = df.select(u("a", "b"))
+                self.assertGreater(self._eval_python_count(projected), 0, str(func))
+                self.assertEqual([r[0] for r in projected.collect()], [2], str(func))
+
 
 if __name__ == "__main__":
     from pyspark.testing import main
