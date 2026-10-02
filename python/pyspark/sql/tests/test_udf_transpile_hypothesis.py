@@ -362,52 +362,11 @@ def neq_pair(x, y):
 lambda_plus_four = lambda x: x + 4 if x is not None else 0  # noqa: E731
 
 
-# Scope capture and local assignment (SPARK-55207).
-
-
-def _make_plus_captured(offset):
-    def plus_captured(x):
-        # Bakes a captured int into an arithmetic lowering.
-        return x + offset
-
-    return plus_captured
-
-
-def _make_captured_compare(threshold):
-    def captured_compare(x):
-        # A captured value on the right of an ordering comparison. The explicit
-        # else keeps this a single terminal ``if`` statement, and the guard keeps
-        # NULL away from ``>`` (which the transpiler lowers with a raise).
-        if x is None:
-            return False
-        else:
-            return x > threshold
-
-    return captured_compare
-
-
-plus_captured_four = _make_plus_captured(4)
-captured_compare_zero = _make_captured_compare(0)
-
-
-# The remaining assignment shapes (multi-target, annotated, augmented, longer
-# chains) are covered by ``test_udf_transpile_assignment_forms`` in
-# test_udf_transpile_unit.py; each generated example here runs two full Spark
-# jobs, so only the shapes with a distinct arithmetic profile are fuzzed.
-def _make_assign_literals(offset):
-    def binds_literals(x):
-        # One binding written as a literal and one taking its value from a
-        # captured constant. Both are substituted at their read sites, which is
-        # the whole of the assignment support -- a computed right-hand side falls
-        # back instead.
-        b = 4
-        k = offset
-        return x + b + k
-
-    return binds_literals
-
-
-assign_literals = _make_assign_literals(3)
+# Scope capture and local assignment (SPARK-55207) are not fuzzed here: a
+# captured value is fixed at construction, so after baking, e.g. `x + offset`
+# lowers to the same plan as the literal `x + 4` fuzzed above, and each example
+# would re-run covered arithmetic at two Spark jobs apiece. The capture paths
+# are covered deterministically in test_udf_transpile_unit.py.
 
 
 # ----------------------------------------------------------------------------
@@ -479,10 +438,8 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
                 # captures nothing hypothesis generates -- only the DataFrame rows
                 # vary per example -- so the answer is fixed per (func, return
                 # type) and checking it once is enough. Keyed on the function
-                # OBJECT, not its name -- the factory closures in this file
-                # (``_make_plus_captured`` and friends) give every instance the
-                # same ``__name__``, so two of them would collide and the second
-                # one's check would be skipped silently.
+                # OBJECT, not its name, so factory closures sharing a
+                # ``__name__`` cannot collide and skip a check silently.
                 check_key = (func, return_type.simpleString())
                 if check_key not in self._transpile_checked:
                     self.assertTrue(
@@ -575,34 +532,6 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(plus_four, LongType(), df, "a")
             self.assertEqual(transpiled, interpreted, f"plus_four mismatch on {value!r}")
-
-        # -- scope capture and local assignment (SPARK-55207) ----------------
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_captured_offset_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(plus_captured_four, LongType(), df, "a")
-            self.assertEqual(transpiled, interpreted, f"plus_captured_four mismatch on {value!r}")
-
-        @_hyp_settings
-        @given(value=_long_strategy)
-        @_seed_examples(_LONG_EDGES)
-        def test_captured_compare_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(captured_compare_zero, BooleanType(), df, "a")
-            self.assertEqual(
-                transpiled, interpreted, f"captured_compare_zero mismatch on {value!r}"
-            )
-
-        @_hyp_settings
-        @given(value=_long_arith_strategy)
-        @_seed_examples(_LONG_ARITH_EDGES)
-        def test_assign_literals_matches_python(self, value):
-            df = self._single_arg_df(value, LongType())
-            transpiled, interpreted = self._run(assign_literals, LongType(), df, "a")
-            self.assertEqual(transpiled, interpreted, f"assign_literals mismatch on {value!r}")
 
         @_hyp_settings
         @given(value=_long_arith_strategy)

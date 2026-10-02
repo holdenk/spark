@@ -281,19 +281,12 @@ _LOWERED_BUILTIN_NAMES = frozenset({"len"})
 def _refuse_unrepresentable_value(description: str, value: Any) -> None:
     """Refuse a bakeable-TYPE value whose VALUE has no faithful column equivalent.
 
-    Called wherever a Python value becomes a ``lit()`` -- both for a captured name
-    (:meth:`_LiteralNormalizer._bake`) and for a literal written in the body
-    (``_convert_chunk``'s ``ast.Constant`` arm). Keeping one copy matters because
-    the two paths converge: a literal assignment (``b = 1e400``) is substituted by
-    the normalizer and then lowered as a body constant, so a check on only one side
-    is a check that can be walked around.
+    Runs wherever a Python value becomes a ``lit()`` -- a captured name and a
+    body literal converge here, so a check on only one path could be walked around.
     """
-    # Python ints are unbounded, so a value can exceed what LongType holds. Refuse
-    # explicitly rather than letting ``lit`` throw a Java stack trace -- and were
-    # ``lit`` ever to accept such a value (a decimal, say), it would still classify
-    # as "numeric" and then fail CheckAnalysis against a bigint column, killing the
-    # query instead of falling back. ``bool`` is excluded: it subclasses int but is
-    # 0/1.
+    # Python ints are unbounded; LongType is not. Refuse explicitly rather than
+    # letting ``lit`` throw a Java stack trace. ``bool`` is excluded: it
+    # subclasses int but is only ever 0/1.
     if (
         isinstance(value, int)
         and not isinstance(value, bool)
@@ -304,15 +297,10 @@ def _refuse_unrepresentable_value(description: str, value: Any) -> None:
             "integer; Python integers are unbounded but Spark's LongType is not, "
             "so the transpiler falls back to interpreted Python"
         )
-    # NaN compares false against everything in Python, but Spark orders it above
-    # every other double and treats it as equal to itself, so a baked NaN silently
-    # flips `a < nan` and `a == nan`. A NaN COLUMN value can only be documented
-    # (the type says nothing about it), but one that is known here can be refused.
-    #
-    # The infinities go with it: the trailing cast to an integral return type
-    # raises CAST_OVERFLOW where the interpreted path returns NULL -- breaking a
-    # query rather than falling back, which is what every guard here exists to
-    # avoid. ``1e400`` is an ordinary-looking literal that evaluates to one.
+    # Python compares NaN as false against everything while Spark orders it above
+    # all other doubles, and an infinity's trailing cast to an integral return
+    # type raises CAST_OVERFLOW where the interpreted path returns NULL.
+    # ``1e400`` is an ordinary-looking literal that evaluates to one.
     if isinstance(value, float) and not math.isfinite(value):
         raise UnsupportedOperationException(
             f"{description} is the non-finite float {value}, which has no faithful "
@@ -321,10 +309,9 @@ def _refuse_unrepresentable_value(description: str, value: Any) -> None:
             "be cast to an integral type. The transpiler falls back to interpreted "
             "Python"
         )
-    # A lone surrogate is a legal Python str but not encodable, and py4j encodes
-    # every command as UTF-8. This one must be refused BEFORE reaching ``lit``:
-    # the UnicodeEncodeError happens inside the socket write, which drops the
-    # gateway connection rather than falling back, damaging the whole session.
+    # A lone surrogate is a legal Python str but not UTF-8 encodable, and py4j
+    # encodes every command as UTF-8: reaching ``lit`` would raise inside the
+    # socket write and drop the gateway connection, damaging the whole session.
     if isinstance(value, str):
         try:
             value.encode("utf-8")
@@ -340,17 +327,14 @@ def _as_literal(node: ast.AST) -> Optional[ast.Constant]:
     """The constant ``node`` already is, or ``None`` when it is not one.
 
     This is the single place the "assignments bind literals" rule is enforced. It
-    runs on an ALREADY-VISITED expression, so a captured name has become an
-    ``ast.Constant`` by the time it arrives; what reaches here as something else is
-    genuinely computed (``a + 1``, a call, a comparison) or is a column reference,
-    and either way this transpiler will not evaluate it.
+    runs on an ALREADY-VISITED expression, so what arrives as something else is
+    genuinely computed (``a + 1``, a call) or a column reference, and either way
+    this transpiler will not evaluate it.
 
     The one concession is a unary ``-``/``+`` on a numeric constant: Python parses
     ``-5`` as ``UnaryOp(USub, Constant(5))``, never ``Constant(-5)``, so without
-    folding it a negative literal would be refused as "computed" -- a confusing
-    answer for something spelled exactly like a literal. Folding is exact for
-    ``int`` and ``float`` and is not applied to anything else (``-"ab"`` is a
-    Python TypeError, and ``-True`` would silently become ``-1``).
+    folding it a negative literal would be refused as "computed". Folding is not
+    applied to anything else (``-"ab"`` is a TypeError, ``-True`` becomes ``-1``).
     """
     if isinstance(node, ast.Constant):
         return node
@@ -521,14 +505,13 @@ class _CapturedScope:
         cell, or a readable module global.
 
         The free names for which this is False are the builtins, which travel
-        with Python itself rather than with the pickled function -- so a builtin
-        the lowering recognizes (``_LOWERED_BUILTIN_NAMES``) can be left in
-        place for it. A body local counts even though it is never captured:
-        reading it before its assignment raises UnboundLocalError in Python, and
-        leaving it for the lowering would lower a call Python rejects. A name
-        bound where the executor would re-read it (``_bound_names``) counts too:
-        the by-reference refusal in ``lookup_name`` is what keeps a shadowed
-        builtin from being lowered as the real one.
+        with Python itself -- so a builtin the lowering recognizes
+        (``_LOWERED_BUILTIN_NAMES``) can be left in place for it. A body local
+        counts even though it is never captured: reading it before its assignment
+        is an UnboundLocalError in Python, and leaving it for the lowering would
+        lower a call Python rejects. A ``_bound_names`` entry counts too: the
+        by-reference refusal in ``lookup_name`` keeps a shadowed builtin from
+        being lowered as the real one.
         """
         return (
             name in self._local_names
@@ -537,21 +520,19 @@ class _CapturedScope:
             or name in self._bound_names
         )
 
-    def snapshot(self) -> Tuple[Tuple[str, Any], ...]:
-        """Return the bakeable values whose mutation could change a lowering.
+    def snapshot(self) -> Dict[str, Any]:
+        """The bakeable values whose mutation could change a lowering.
 
         The filter matches ``_LiteralNormalizer._bake`` exactly, so no name the
         lowering can bake is left unfrozen.
         """
         values = dict(self._global_values or {})
         values.update(self._cells)
-        return tuple(
-            sorted(
-                (name, value)
-                for name, value in values.items()
-                if value is None or type(value) in _BAKEABLE_TYPES
-            )
-        )
+        return {
+            name: value
+            for name, value in values.items()
+            if value is None or type(value) in _BAKEABLE_TYPES
+        }
 
 
 def _capture_scope(func: Callable) -> _CapturedScope:
@@ -562,29 +543,19 @@ def _capture_scope(func: Callable) -> _CapturedScope:
             "could not determine the UDF's code object, so its scope cannot be resolved"
         )
     code = fn.__code__
-    # Does the DRIVER's snapshot of this function reach the executor at all, or does
-    # the executor re-import and build its own? Everything below is gated on this,
-    # cells as much as globals: a re-imported class re-executes its own body, so a
-    # ``__call__`` that was built by a factory gets a FRESH closure over whatever
-    # that import produces. Baking the driver's cell there is exactly as wrong as
-    # baking its globals -- ``E.__call__ = _mk(7)`` on an importable class lowered
-    # to ``x + 99`` for a driver holding 99 while the executor computed ``x + 7``.
+    # Everything below is gated on whether the DRIVER's snapshot of this function
+    # reaches the executor at all, cells as much as globals: a re-imported class
+    # re-executes its own body, so a factory-built ``__call__`` gets a FRESH
+    # closure over whatever that import produces. Baking the driver's cell there
+    # is exactly as wrong as baking its globals.
     #
     # It follows the function that CARRIES the code: ``_method_reduce`` reduces a
     # bound method to its ``__func__``, so gating on the instance's class would bake
-    # for a method inherited from a by-reference base.
+    # for a method inherited from a by-reference base. A callable instance whose
+    # ``__call__`` does not travel needs no extra check here: its captured values
+    # are read below, but ``_freeze_captured_callable`` refuses callable instances
+    # with any bakeable capture, so the lowering falls back all the same.
     snapshot_travels = _pickled_by_value(fn)
-    is_callable_instance = not isinstance(func, types.FunctionType) and not inspect.ismethod(func)
-    if snapshot_travels and is_callable_instance:
-        # A callable instance reaches its code through ``type(func).__call__``,
-        # which cloudpickle ships only when BOTH the class owning ``__call__`` and
-        # the receiver's own class are by value. A by-reference class anywhere on
-        # that path is re-imported with its original ``__call__``, however the
-        # driver's was patched, so the carrying function alone is not enough.
-        owner = next((k for k in type(func).__mro__ if "__call__" in k.__dict__), None)
-        snapshot_travels = (
-            owner is not None and _pickled_by_value(owner) and _pickled_by_value(type(func))
-        )
     # cloudpickle's own sentinel, so an unassigned cell is the object the
     # executor would receive.
     cells = (
@@ -613,7 +584,7 @@ def _capture_scope(func: Callable) -> _CapturedScope:
 
 def _freeze_captured_callable(func: Callable, scope: _CapturedScope) -> Callable:
     """Return a callable whose bakeable globals and closure cells are fixed."""
-    values = dict(scope.snapshot())
+    values = scope.snapshot()
     if not values:
         return func
     if not isinstance(func, types.FunctionType) and not inspect.ismethod(func):
@@ -862,12 +833,6 @@ def _normalize_function(
     # ``function_ast`` across builds (a UDF is lowered once to validate it at
     # construction and again when its judf is created). Normalizing the original
     # would let a rebound capture leak between builds, so work on a copy.
-    #
-    # No depth or size guard is needed. Substituting literals cannot grow the tree,
-    # and a body nested deeply enough to exhaust the stack in ``deepcopy`` raises
-    # RecursionError, which ``_build_transpiled``'s ``except Exception`` turns into
-    # an ordinary fallback -- the same way an over-deep body behaves without any of
-    # this rewriting.
     source = copy.deepcopy(function_ast)
     statement = normalizer.normalize_body(source.body)
     # Replace the copy's body rather than constructing a fresh ``ast.FunctionDef``.
@@ -2068,20 +2033,6 @@ def _analyze_func(
     )
 
 
-def _can_transpile(
-    session: "SparkSession", func: Callable[..., Any], analysis: _TranspileAnalysis
-) -> Tuple[bool, List[str]]:
-    """Whether ``func`` lowers at all right now, and the refusals if it does not.
-
-    For validating a UDF where it is defined. Returns a bool rather than the
-    expressions so a truncated option list cannot be mistaken for the full set
-    and end up in a plan -- lowering every variant just to discard it costs a py4j
-    roundtrip per node.
-    """
-    options, errors, _, _ = _build_transpiled(session, func, analysis, first_only=True)
-    return bool(options), errors
-
-
 def _build_transpiled(
     session: "SparkSession",
     func: Callable[..., Any],
@@ -2100,9 +2051,8 @@ def _build_transpiled(
     ``_wrap_function``'s ``cloudpickle`` snapshot sees.
 
     ``first_only`` stops at the first option produced and so returns a TRUNCATED
-    option list, which must never reach a plan. Callers asking only "does this
-    lower at all?" should go through :func:`_can_transpile`, which returns a bool
-    and cannot be mistaken for the full set.
+    option list, which must never reach a plan; it is for the validate-at-
+    definition call in ``UserDefinedFunction.__init__``.
     """
     errors: List[str] = []
     try:

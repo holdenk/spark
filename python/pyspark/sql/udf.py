@@ -305,7 +305,7 @@ class UserDefinedFunction:
                 transpile_enabled = False
             if transpile_enabled and session:
                 # Import only if needed, also avoid circular import loops.
-                from pyspark.sql.transpile import _analyze_func, _can_transpile
+                from pyspark.sql.transpile import _analyze_func, _build_transpiled
 
                 # ``self.returnType`` parses (and caches) the declared return
                 # type; the transpiler needs the parsed form to decide whether
@@ -323,15 +323,18 @@ class UserDefinedFunction:
                     )
                     # Lower once purely to validate, so an unsupported body is
                     # reported where the UDF is defined rather than at first use
-                    # (which is what the existing tests assert). These expressions
-                    # are discarded; the ones that reach the plan come from a fresh
+                    # (which is what the existing tests assert). ``first_only``
+                    # truncates the option list at one, so it is discarded and
+                    # never reaches a plan; the ones that do come from a fresh
                     # lowering in ``_create_judf``. A refusal here does NOT clear
                     # the analysis: it may be value-dependent (an unbakeable
                     # capture, say), and the values are re-read per lowering, so
                     # the same UDF can transpile later.
-                    lowers, build_errors = _can_transpile(session, func, analysis)
+                    options, build_errors, _, _ = _build_transpiled(
+                        session, func, analysis, first_only=True
+                    )
                     errors = errors + build_errors
-                    self._transpile_validated = lowers
+                    self._transpile_validated = lowers = bool(options)
                 if not lowers:
                     detail = f": {_format_transpile_errors(errors)}" if errors else ""
                     warnings.warn(f"Unable to transpile UDF {func}{detail}")
@@ -354,15 +357,9 @@ class UserDefinedFunction:
 
         Returns the options, their input categories, and the callable to serialize.
 
-        ``session`` is the session the expressions will be planned against, and
-        the one whose confs are consulted while lowering; ``_create_judf`` passes
-        the very session it builds the JVM UDF with. ``None`` yields no options.
-
         Both gates are re-read here, not just at construction: a conf is session
         state and can be flipped afterwards, and lowering anyway would attach
-        options the JVM has to discard, logging a warning per query. No ANSI
-        warning is emitted -- construction already issued one, and this runs on
-        every read of ``transpiled`` and every ``judf`` build.
+        options the JVM has to discard, logging a warning per query.
 
         Deliberately not cached: captured free variables are baked in as
         literals, so the lowering is only valid for the values current at the
@@ -383,19 +380,11 @@ class UserDefinedFunction:
             if not options and errors and self._transpile_validated:
                 # A lowering has succeeded before, so a refusal now means the
                 # captured values changed since (a cell rebound to something
-                # unbakeable, say). Warn rather than fall back mutely: every other
-                # fallback path tells the user, and a silent one looks like the
-                # transpiler simply chose not to fire. Gated on having validated so
-                # a body the transpiler never supported warns once, at definition,
-                # instead of on every judf build and ``transpiled`` read. No errors
-                # means no transpiler was configured for THIS session, which is a
-                # deliberate setting rather than something to warn about.
-                #
-                # Read-only on purpose: this method runs for every ``transpiled``
-                # access, and latching the flag here would let an introspection
-                # call -- or a call passing a session other than the active one --
-                # change the warning behavior for the UDF's lifetime. Only
-                # construction and ``_create_judf`` set it.
+                # unbakeable, say). Warn rather than fall back mutely. Gated on
+                # having validated so a body the transpiler never supported warns
+                # once, at definition, instead of on every judf build and
+                # ``transpiled`` read. No errors means no transpiler was configured
+                # for THIS session, which is a deliberate setting, not a failure.
                 warnings.warn(
                     f"Unable to transpile UDF {self.func}: {_format_transpile_errors(errors)}"
                 )
@@ -409,22 +398,14 @@ class UserDefinedFunction:
     def transpiled(self) -> list:
         """The Catalyst expressions this UDF would be rewritten into, if any.
 
-        Introspection helper: each access re-lowers the function against the
-        ACTIVE session (or the instantiated one), re-reading its transpile and
-        ANSI confs and the captured values as of the call. An empty list means a
-        lowering right now would produce nothing and the UDF runs as interpreted
-        Python. Unlike ``_create_judf`` it will not create a session just to
-        answer.
-
-        This reports what a lowering NOW would give, which is what gets planned
-        only until the first query: ``_judf`` caches its lowering for the UDF's
-        lifetime, so afterwards a conf flip or a rebound capture changes this
-        without changing the plan.
-
-        Empty forever for a UDF that was not a transpile CANDIDATE, whatever the
-        confs say now -- candidacy is settled once, in ``__init__``, and the
-        commonest reason to miss it is the confs having been off back then. Turning
-        them on afterwards does not make an existing UDF eligible; rebuild it.
+        Introspection helper: each access re-lowers against the active (or
+        instantiated) session, re-reading its confs and the captured values as of
+        the call. Empty means the UDF runs as interpreted Python. This reports
+        what a lowering NOW would give: ``_judf`` caches its own lowering for the
+        UDF's lifetime, so after the first query a conf flip or a rebound capture
+        changes this without changing the plan. Empty forever for a UDF that was
+        not a transpile candidate at construction; rebuild it after enabling the
+        confs.
         """
         from pyspark.sql import SparkSession
 
@@ -645,11 +626,8 @@ class UserDefinedFunction:
         sc = spark.sparkContext
 
         if include_transpiled:
-            if func is not self.func:
-                raise PySparkRuntimeError(
-                    errorClass="CANNOT_TRANSPILE_MISMATCHED_FUNCTION",
-                    messageParameters={"func": getattr(func, "__qualname__", repr(func))},
-                )
+            # The only caller on this path is ``_judf``, which passes
+            # ``self.func``; the transpiled options are baked from its scope.
             transpiled, input_categories, serialized_func = self._build_transpiled_options(spark)
         else:
             transpiled, input_categories, serialized_func = [], [], None
