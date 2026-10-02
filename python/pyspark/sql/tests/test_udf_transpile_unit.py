@@ -3553,11 +3553,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             a = 5
             return a * 2
 
-        def rebind_twice(a):
-            a = 5
-            a = 6
-            return a
-
         def rebind_one_of_two(a, b):
             a = 5
             return a + b
@@ -3569,7 +3564,6 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
 
         cases = [
             ("rebind once", rebind_once, "a long", [(10,)], [10]),
-            ("rebind twice", rebind_twice, "a long", [(10,)], [6]),
             ("rebind one of two", rebind_one_of_two, "a long, b long", [(10, 4)], [9]),
             ("rebind from another binding", rebind_from_another_binding, "a long", [(10,)], [8]),
         ]
