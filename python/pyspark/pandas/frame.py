@@ -131,6 +131,7 @@ from pyspark.pandas.utils import (
     name_like_string,
     same_anchor,
     scol_for,
+    unresolved_scol_for,
     validate_arguments_and_invoke_function,
     validate_axis,
     validate_bool_kwarg,
@@ -1433,6 +1434,8 @@ class DataFrame(Frame, Generic[T]):
              aggregate functions (list of strings).
              If a list is given, the aggregation is performed against
              all columns.
+             Each aggregate function is named by a Spark SQL function name,
+             optionally qualified with a catalog and a database.
 
         Returns
         -------
@@ -6964,6 +6967,8 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
         aggfunc : function (string), dict, default mean
             If dict is passed, the key is column to aggregate and value
             is function or list of functions.
+            A function is named by a Spark SQL function name, optionally
+            qualified with a catalog and a database.
         fill_value : scalar, default None
             Value to replace missing values with.
 
@@ -7083,34 +7088,20 @@ defaultdict(<class 'list'>, {'col..., 'col...})]
             if not isinstance(self._internal.spark_type_for(values), NumericType):
                 raise TypeError("values should be a numeric type.")
 
+        def agg_col(func_name: str, label: Label) -> PySparkColumn:
+            name = self._internal.spark_column_name_for(label)
+            return F.call_function(func_name, unresolved_scol_for(name)).alias(name)
+
         if isinstance(aggfunc, str):
             if isinstance(values, list):
-                agg_cols = [
-                    F.expr(
-                        "{1}(`{0}`) as `{0}`".format(
-                            self._internal.spark_column_name_for(value), aggfunc
-                        )
-                    )
-                    for value in values
-                ]
+                agg_cols = [agg_col(aggfunc, value) for value in values]
             else:
-                agg_cols = [
-                    F.expr(
-                        "{1}(`{0}`) as `{0}`".format(
-                            self._internal.spark_column_name_for(values), aggfunc
-                        )
-                    )
-                ]
+                agg_cols = [agg_col(aggfunc, values)]
         elif isinstance(aggfunc, dict):
             aggfunc = {
                 key if is_name_like_tuple(key) else (key,): value for key, value in aggfunc.items()
             }
-            agg_cols = [
-                F.expr(
-                    "{1}(`{0}`) as `{0}`".format(self._internal.spark_column_name_for(key), value)
-                )
-                for key, value in aggfunc.items()
-            ]
+            agg_cols = [agg_col(value, key) for key, value in aggfunc.items()]
             agg_columns = [key for key, _ in aggfunc.items()]
 
             if set(agg_columns) != set(values):
