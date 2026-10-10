@@ -385,6 +385,14 @@ class CatalystTranspiler(AbstractTranspiler):
                 "Python compares across types as unequal while Spark would coerce "
                 "or fail analysis, so the transpiler falls back to interpreted Python"
             )
+        if lc is not None and rc is not None and lc == rc and lc in ("map", "array"):
+            # MapType/ArrayType are not orderable; a lowered `=` would fail
+            # analysis, so fall back to interpreted Python (SPARK-55219).
+            raise UnsupportedOperationException(
+                f"`==`/`!=` operands are both `{lc}`; Spark's `=` does not "
+                "support ordering on MapType/ArrayType, so the transpiler falls "
+                "back to interpreted Python"
+            )
         left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
         left_null = left_col.isNull()
@@ -440,6 +448,14 @@ class CatalystTranspiler(AbstractTranspiler):
                 f"`{op_repr}` compares operands of different categories "
                 f"({lc} vs {rc}); Python would raise TypeError, so the "
                 "transpiler falls back to interpreted Python"
+            )
+        if lc == rc and lc in ("map", "array"):
+            # MapType/ArrayType are not orderable; a lowered `<`/`>` would fail
+            # analysis, so fall back to interpreted Python (SPARK-55219).
+            raise UnsupportedOperationException(
+                f"`{op_repr}` operands are both `{lc}`; Spark's ordering operators "
+                "do not support ordering on MapType/ArrayType, so the transpiler "
+                "falls back to interpreted Python"
             )
         left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
@@ -935,18 +951,39 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     ]
 
 
+def _annotation_base_name(annotation: Optional[ast.AST]) -> Optional[str]:
+    """The bare type name an annotation spells, peeling one subscript.
+
+    ``dict[str, str]`` and bare ``dict`` both come back ``"dict"``; a stringized
+    annotation (``def f(a: "int")``) is unwrapped to its text; an attribute
+    spelling (``typing.Dict[str, str]``) unwraps to the attribute name. ``None``
+    means the annotation is absent or not a simple name we recognise.
+    """
+    if annotation is None:
+        return None
+    if isinstance(annotation, ast.Subscript):
+        annotation = annotation.value
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr  # typing.Dict -> "Dict", typing.List -> "List"
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value  # stringized annotation, e.g. def f(a: "int")
+    return None
+
+
 def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
     """Map a parameter's type annotation to a category
-    (``"numeric"``/``"string"``/``"bool"``/``"binary"``), or ``None`` when it's
-    absent or unrecognised (the caller then tries both numeric and string)."""
-    name: Optional[str] = None
-    if isinstance(annotation, ast.Name):
-        name = annotation.id
-    elif isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-        name = annotation.value  # stringized annotation, e.g. def f(a: "int")
+    (``"numeric"``/``"string"``/``"bool"``/``"binary"``/``"map"``/``"array"``),
+    or ``None`` when it's absent or unrecognised (the caller then tries both
+    numeric and string)."""
+    name = _annotation_base_name(annotation)
     # str -> "string", int/float -> "numeric", bool -> "bool", bytes -> "binary"
-    # (matching the constant handling in ``_category``). complex and anything
-    # unrecognised return None so the caller tries both numeric and string.
+    # (matching the constant handling in ``_category``). dict/Dict/Mapping ->
+    # "map", list/List/Sequence -> "array": pinning them stops the untyped
+    # numeric/string blow-up and lets the JVM keep the option only against a
+    # matching MapType/ArrayType column (SPARK-55219). Anything unrecognised
+    # returns None so the caller tries both numeric and string.
     if name == "str":
         return "string"
     if name in ("int", "float"):
@@ -955,12 +992,16 @@ def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
         return "bool"
     if name == "bytes":
         return "binary"
+    if name in ("dict", "Dict", "Mapping"):
+        return "map"
+    if name in ("list", "List", "Sequence"):
+        return "array"
     return None
 
 
 def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[str]) -> List[dict]:
     """Per-variant maps ``{public_param_index -> category}`` where category is
-    one of ``"numeric"``/``"string"``/``"bool"``/``"binary"``.
+    one of ``"numeric"``/``"string"``/``"bool"``/``"binary"``/``"map"``/``"array"``.
 
     A typed param (``def f(a: str, b: int)``) is pinned to its category; an
     untyped param is tried as both numeric and string. To cap plan growth, when
