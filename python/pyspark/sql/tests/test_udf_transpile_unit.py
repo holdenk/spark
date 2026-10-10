@@ -1539,6 +1539,120 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertIsNotNone(converted)
         self.assertLessEqual(transpiler.category_calls, len(list(ast.walk(function_ast))))
 
+    def test_udf_transpile_variety_reports_own_categories(self):
+        # A (Column, list[str]) tuple labels the option with the categories the
+        # variety built, not the combo the caller asked about.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class BoolOnlyTranspiler(AbstractTranspiler):
+            variety = "bool_only_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                return (
+                    col("_udf_param_0").cast(returnType),
+                    ["bool"] * len(params),
+                )
+
+        with self._with_variety(BoolOnlyTranspiler):
+
+            def add(a: int, b: int):
+                return a + b
+
+            u = self._transpiled_udf(add, LongType())
+            # The combo's numeric guess (the only combo for two int-annotated
+            # params) must NOT label the option.
+            self.assertEqual([["bool", "bool"]], u._transpiled_input_categories)
+
+    def test_udf_transpile_variety_plain_column_falls_back_to_combo(self):
+        # A plain Column return (the existing contract) is labeled with the
+        # combo the caller asked about, not anything the variety invented.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class NumericOnlyTranspiler(AbstractTranspiler):
+            variety = "numeric_only_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                return col("_udf_param_0").cast(returnType)
+
+        with self._with_variety(NumericOnlyTranspiler):
+
+            def add(a: int, b: int):
+                return a + b
+
+            u = self._transpiled_udf(add, LongType())
+            # Numeric is the only combo for two int-annotated params.
+            self.assertEqual([["numeric", "numeric"]], u._transpiled_input_categories)
+
+    def test_udf_transpile_variety_tuple_with_none_column_falls_back(self):
+        # Declining is plain ``None``; a ``(None, categories)`` tuple is refused.
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class DeclineInTupleTranspiler(AbstractTranspiler):
+            variety = "decline_in_tuple_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                return (None, ["numeric"] * len(params))
+
+        with self._with_variety(DeclineInTupleTranspiler):
+
+            def add(a: int, b: int):
+                return a + b
+
+            _, reasons = self._fallback_reason(add, LongType())
+            self.assertIn("not a Column", reasons)
+
+    def test_udf_transpile_variety_malformed_return_falls_back(self):
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class ListReturningTranspiler(AbstractTranspiler):
+            variety = "list_returning_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                # A list, not a tuple: the documented shape is (Column, list[str]),
+                # and this is the natural slip.
+                return [col("_udf_param_0").cast(returnType), ["numeric"] * len(params)]
+
+        with self._with_variety(ListReturningTranspiler):
+
+            def add(a: int, b: int):
+                return a + b
+
+            _, reasons = self._fallback_reason(add, LongType())
+            self.assertIn("unsupported result", reasons)
+
+    def test_udf_transpile_variety_wrong_length_categories_falls_back(self):
+        # A wrong-length categories list is refused.
+        from pyspark.sql.functions import col
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        class WrongLengthTranspiler(AbstractTranspiler):
+            variety = "wrong_length_55213"
+
+            def _transpile_from_ast(
+                self, src, ast_info, function_ast, params, returnType, param_categories=None
+            ):
+                # One category short of the two public params.
+                return (col("_udf_param_0").cast(returnType), ["numeric"])
+
+        with self._with_variety(WrongLengthTranspiler):
+
+            def add(a: int, b: int):
+                return a + b
+
+            _, reasons = self._fallback_reason(add, LongType())
+            self.assertIn("input categories", reasons)
+
     # ------------------------------------------------------------------
     # Edge cases (SPARK-55206 follow-up). Helpers build a UDF with
     # transpilation on; `_vals` runs it and returns outputs (asserting it
@@ -1562,6 +1676,23 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
             warnings.simplefilter("always")
             u = UserDefinedFunction(func, return_type)
         return u, " ".join(str(w.message) for w in caught)
+
+    def _with_variety(self, variety_cls):
+        """A sql_conf with ``variety_cls`` as the only ``pyTranspilers`` entry.
+
+        Registration is undone on test completion (``addCleanup``, so a failing
+        test cannot leak the variety into a later one).
+        """
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        variety_cls.register()
+        self.addCleanup(AbstractTranspiler.varieties.pop, variety_cls.variety, None)
+        return self.sql_conf(
+            {
+                **_TRANSPILE_ON,
+                "spark.sql.experimental.optimizer.pyTranspilers": variety_cls.variety,
+            }
+        )
 
     def _fallback_reason(self, func, return_type=LongType()):
         """Assert ``func`` produced no options, and hand back the reason it reported."""
