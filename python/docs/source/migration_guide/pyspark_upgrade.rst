@@ -19,6 +19,10 @@
 Upgrading PySpark
 ==================
 
+Upgrading from PySpark 4.3 to 4.4
+---------------------------------
+* In Spark 4.4, in pandas API on Spark, ``GroupBy.agg`` and ``DataFrame.pivot_table`` pass the aggregate function name to Spark as a function name instead of formatting it into the aggregation expression. A value that is not a function name, such as one carrying an argument list, an alias, or other SQL syntax, now raises a parse error instead of being evaluated as part of the aggregation, and a non-string in a list of aggregations now raises ``ValueError``. Pass a Spark SQL function name, optionally qualified with a catalog and a database.
+
 Upgrading from PySpark 4.2 to 4.3
 ---------------------------------
 * In Spark 4.3, Python 3.10 support was dropped in PySpark.
