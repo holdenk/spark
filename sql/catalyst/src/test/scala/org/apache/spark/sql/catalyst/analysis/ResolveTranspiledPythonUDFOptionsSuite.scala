@@ -19,10 +19,12 @@ package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.spark.api.python.PythonEvalType
 import org.apache.spark.sql.catalyst.dsl.expressions._
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF}
+import org.apache.spark.sql.catalyst.expressions.{
+  Add, Alias, AttributeReference, Concat, Expression, Literal, PythonUDF, TranspiledPythonUDF}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Project}
-import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.{
+  ArrayType, DecimalType, DoubleType, FloatType, LongType, MapType, StringType}
 
 /**
  * Unit tests for [[ResolveTranspiledPythonUDFOptions]], which prunes a
@@ -85,11 +87,93 @@ class ResolveTranspiledPythonUDFOptionsSuite extends PlanTest {
     assert(pruned.transpiledOptions.isEmpty)
   }
 
+  test("keeps a map/array option only for a matching map/array column") {
+    // `def f(x: dict, y: int): return y + 1` (SPARK-55219). AttributeReference directly
+    // because the `$"a".map(...)` DSL collides with TreeNode.map.
+    val n = $"b".long
+    val opt = Add(n, Literal(1L))
+    val mapT = MapType(StringType, StringType)
+    val arrT = ArrayType(StringType)
+    Seq(("map", mapT, arrT), ("array", arrT, mapT)).foreach {
+      case (category, dt, otherDt) =>
+        def node(first: AttributeReference): TranspiledPythonUDF = TranspiledPythonUDF(
+          "udf", pyUDF(Seq(first, n)), List(opt), List(List(category, "numeric")))
+        val c = AttributeReference("a", dt)()
+        val pruned = prune(node(c), LocalRelation(c, n))
+        assert(pruned.transpiledOptions == List(opt))
+        assert(pruned.optionInputCategories.isEmpty)
+        Seq($"a".string, AttributeReference("a", otherDt)()).foreach { wrong =>
+          assert(prune(node(wrong), LocalRelation(wrong, n)).transpiledOptions.isEmpty)
+        }
+    }
+  }
+
   test("leaves options untouched when categories are empty (no restriction)") {
     val a = $"a".long
     val onlyOpt = Add(a, Literal(1L))
     val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)), List(onlyOpt), Nil)
     val pruned = prune(node, LocalRelation(a))
     assert(pruned.transpiledOptions == List(onlyOpt))
+  }
+
+  test("keeps the integer option for integral columns and drops float and string") {
+    val a = $"a".long
+    val intOpt = Add(a, Literal(1L))
+    val floatOpt = Add(a, Literal(1.0))
+    val stringOpt = Concat(Seq(a, a))
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)),
+      List(intOpt, floatOpt, stringOpt),
+      List(List("integer"), List("float"), List("string")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions == List(intOpt))
+    assert(pruned.optionInputCategories.isEmpty)
+  }
+
+  test("keeps the float option for fractional columns and drops integer and string") {
+    val a = AttributeReference("a", DoubleType)()
+    val intOpt = Add(a, Literal(1L))
+    val floatOpt = Add(a, Literal(1.0))
+    val stringOpt = Concat(Seq(a, a))
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)),
+      List(intOpt, floatOpt, stringOpt),
+      List(List("integer"), List("float"), List("string")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions == List(floatOpt))
+    assert(pruned.optionInputCategories.isEmpty)
+  }
+
+  test("integer does not match float columns; float does not match integer columns") {
+    val aLong = $"a".long
+    val aDouble = AttributeReference("a", DoubleType)()
+    val intOpt = Add(aLong, Literal(1L))
+    val floatOpt = Add(aLong, Literal(1.0))
+    // float column, integer-only option -> dropped
+    val intOnlyForDouble = TranspiledPythonUDF("udf", pyUDF(Seq(aDouble)),
+      List(intOpt), List(List("integer")))
+    assert(prune(intOnlyForDouble, LocalRelation(aDouble)).transpiledOptions.isEmpty)
+    // long column, float-only option -> dropped
+    val floatOnlyForLong = TranspiledPythonUDF("udf", pyUDF(Seq(aLong)),
+      List(floatOpt), List(List("float")))
+    assert(prune(floatOnlyForLong, LocalRelation(aLong)).transpiledOptions.isEmpty)
+  }
+
+  test("neither integer nor float matches decimal columns") {
+    val a = AttributeReference("a", DecimalType(10, 2))()
+    val intOpt = Add(a, Literal(1L))
+    val floatOpt = Add(a, Literal(1.0))
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)),
+      List(intOpt, floatOpt),
+      List(List("integer"), List("float")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions.isEmpty)
+  }
+
+  test("float matches FloatType columns") {
+    val a = AttributeReference("a", FloatType)()
+    val floatOpt = Add(a, Literal(1.0f))
+    val node = TranspiledPythonUDF("udf", pyUDF(Seq(a)),
+      List(floatOpt), List(List("float")))
+    val pruned = prune(node, LocalRelation(a))
+    assert(pruned.transpiledOptions == List(floatOpt))
   }
 }
