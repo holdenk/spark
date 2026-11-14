@@ -118,36 +118,42 @@ trait PredicateHelper extends AliasHelper with Logging {
    */
   def findExpressionAndTrackLineageDown(
       exp: Expression,
-      plan: LogicalPlan): Option[(Expression, LogicalPlan)] = {
-    if (exp.references.isEmpty) return None
+      plan: LogicalPlan): Option[(Expression, LogicalPlan)] =
+    findExpressionAndTrackAllLineagesDown(exp, plan).headOption
+
+  /**
+   * Like [[findExpressionAndTrackLineageDown]], but returns every lineage, not only the first one.
+   * It follows each branch of a union, and each child that has the references of exp. With
+   * `strict`, it returns no lineage at all if it cannot follow exp down one of those.
+   */
+  def findExpressionAndTrackAllLineagesDown(
+      exp: Expression,
+      plan: LogicalPlan,
+      strict: Boolean = false): Seq[(Expression, LogicalPlan)] = {
+    if (exp.references.isEmpty) return Nil
+
+    // The lineages of each expression in the plan it is paired with.
+    def lineages(pairs: Seq[(Expression, LogicalPlan)]): Seq[(Expression, LogicalPlan)] = {
+      val found = pairs.map { case (e, p) => findExpressionAndTrackAllLineagesDown(e, p, strict) }
+      if (strict && found.exists(_.isEmpty)) Nil else found.flatten
+    }
 
     plan match {
       case p: Project =>
         val aliases = getAliasMap(p)
-        findExpressionAndTrackLineageDown(replaceAlias(exp, aliases), p.child)
+        findExpressionAndTrackAllLineagesDown(replaceAlias(exp, aliases), p.child, strict)
       // we can unwrap only if there are row projections, and no aggregation operation
       case a: Aggregate =>
         val aliasMap = getAliasMap(a)
-        findExpressionAndTrackLineageDown(replaceAlias(exp, aliasMap), a.child)
+        findExpressionAndTrackAllLineagesDown(replaceAlias(exp, aliasMap), a.child, strict)
       case l: LeafNode if exp.references.subsetOf(l.outputSet) =>
-        Some((exp, l))
+        Seq((exp, l))
       case u: Union =>
         val index = u.output.indexWhere(_.semanticEquals(exp))
-        if (index > -1) {
-          u.children
-            .flatMap(child => findExpressionAndTrackLineageDown(child.output(index), child))
-            .headOption
-        } else {
-          None
-        }
+        if (index > -1) lineages(u.children.map(child => (child.output(index), child))) else Nil
       case other =>
-        other.children.flatMap {
-          child => if (exp.references.subsetOf(child.outputSet)) {
-            findExpressionAndTrackLineageDown(exp, child)
-          } else {
-            None
-          }
-        }.headOption
+        lineages(other.children.filter(child => exp.references.subsetOf(child.outputSet))
+          .map(child => (exp, child)))
     }
   }
 
@@ -1098,6 +1104,25 @@ object Equality {
     case EqualTo(l, r) => Some((l, r))
     case EqualNullSafe(l, r) => Some((l, r))
     case _ => None
+  }
+}
+
+/** Matches a `<`/`<=`/`>`/`>=` comparison; see `unapply` for the exact normalization. */
+object RangePredicate {
+  /**
+   * Normalizes `<`, `<=`, `>`, `>=` to `(low.dataType, low, high, strict)`, with
+   * `>` and `>=` reordered so the lower bound leads. Inclusivity stays on the
+   * original predicate, which execution evaluates as-is; a strict predicate
+   * also selects the exclusive point-index bound.
+   */
+  def unapply(expression: Expression): Option[(DataType, Expression, Expression, Boolean)] = {
+    expression match {
+      case LessThan(low, high) => Some((low.dataType, low, high, true))
+      case LessThanOrEqual(low, high) => Some((low.dataType, low, high, false))
+      case GreaterThan(high, low) => Some((low.dataType, low, high, true))
+      case GreaterThanOrEqual(high, low) => Some((low.dataType, low, high, false))
+      case _ => None
+    }
   }
 }
 
