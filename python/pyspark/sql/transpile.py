@@ -111,6 +111,7 @@ from pyspark.sql.functions import (
     coalesce,
     col,
     concat,
+    isnan,
     length,
     lit,
     pmod,
@@ -131,6 +132,27 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from pyspark.sql._typing import DataTypeOrString
 
+# Categories that represent numeric (non-string) scalar types.
+_NUMERIC_CATS = frozenset(("numeric", "integer", "float"))
+
+
+def _is_numeric_cat(cat: str) -> bool:
+    """True for any numeric sub-category (``"numeric"``, ``"integer"``, ``"float"``)."""
+    return cat in _NUMERIC_CATS
+
+
+def _wider_numeric(lc: str, rc: str) -> str:
+    """Return the wider of two numeric categories (numeric > float > integer)."""
+    if not (_is_numeric_cat(lc) and _is_numeric_cat(rc)):
+        raise UnsupportedOperationException(
+            f"_wider_numeric called with non-numeric categories: {lc!r}, {rc!r}"
+        )
+    if "numeric" in (lc, rc):
+        return "numeric"
+    if "float" in (lc, rc):
+        return "float"
+    return "integer"
+
 
 class AbstractTranspiler(object):
     """Base class for transpilers. All experimental."""
@@ -147,20 +169,44 @@ class AbstractTranspiler(object):
     def _transpile_from_ast(
         self,
         src: Optional[str],
-        ast_info: ast.AST,
-        function_ast: ast.FunctionDef,
+        ast_info: Optional[ast.AST],
+        function_ast: Optional[ast.FunctionDef],
         params: List[str],
         returnType: "DataTypeOrString",
         param_categories: Optional[dict] = None,
-    ) -> Optional[Column]:
-        """Lower ``function_ast`` to a :class:`Column`, or return ``None`` to decline.
+        held_code: Any = None,
+    ) -> Optional[Union[Column, Tuple[Column, List[str]]]]:
+        """Lower the UDF to a :class:`Column`, or return ``None`` to decline.
 
         The override point for ``spark.sql.experimental.optimizer.pyTranspilers``.
+
+        The caller hands over whatever it could extract: ``src`` / ``ast_info`` /
+        ``function_ast`` come from the source on disk and are ``None`` when no
+        trustworthy source exists -- a REPL- or exec-defined function, a
+        functools.wraps-decorated callable (whose visible source is the wrapped
+        function's, not the wrapper's), or a builtin. ``held_code`` is the code
+        object that actually runs when the UDF is called (``None`` for builtins
+        and slot wrappers). One of the two forms is always present; a transpiler
+        declines when the one it needs is not -- the built-in lowering works
+        from ``function_ast``, a numba-style variety from ``held_code``.
 
         ``params`` is the CALLER-FACING parameter list: a receiver already bound, as
         on a method or callable instance, has been removed, so ``params[i]`` is the
         name bound to placeholder ``_udf_param_i`` with no offsetting needed. It is
         also the list ``param_categories`` is keyed by.
+
+        A plain :class:`Column` return is labeled with the ``param_categories``
+        combo the caller passed in. A variety that works out its own input types
+        returns ``(Column, list[str])`` instead -- one category per public param
+        (``"integer"`` / ``"float"`` / ``"numeric"`` / ``"string"`` / ``"bool"`` /
+        ``"binary"`` / ``"timestamp"`` / ``"map"`` / ``"array"``) describing the option it
+        built, which the caller uses in place of the combo. The hook is called
+        once per ``param_categories`` combo; identical categories from one variety
+        are collapsed to a single option.
+
+        Decline with plain ``None``, not a tuple; a malformed return is refused
+        so the UDF falls back to interpreted Python rather than breaking at
+        call time.
         """
         pass
 
@@ -180,6 +226,9 @@ def _is_definitely_basic_type(node: ast.AST) -> bool:
         case ast.UnaryOp(operand=operand):
             return _is_definitely_basic_type(operand)
         case ast.Name():
+            return True
+        case ast.Call(func=ast.Name(id="len"), args=[_], keywords=[]):
+            # len() always returns an int: CPython raises if __len__ returns anything else.
             return True
         case _:
             return False
@@ -219,18 +268,59 @@ def _truthiness_col(cat: Optional[str], c: Column) -> Optional[Column]:
     Returns ``None`` for unsupported or unknown categories (caller falls back).
 
     Semantics (NULL-as-False throughout, matching Python's ``None`` is falsy):
-      "bool"    -> coalesce(c, False)
-      "string"  -> coalesce(length(c) > 0, False)  -- empty string is falsy
-      "numeric" -> coalesce(c != 0, False)           -- zero is falsy
-                   NaN != 0 is True in Spark so float NaN is truthy, matching Python.
+      "bool"                    -> coalesce(c, False)
+      "string"                  -> coalesce(length(c) > 0, False)  -- empty is falsy
+      "numeric"/"integer"/"float" -> coalesce(c != 0, False)        -- zero is falsy
+                                     NaN != 0 is True in Spark so float NaN is
+                                     truthy, matching Python.
     """
     if cat == "bool":
         return coalesce(c, lit(False))
     if cat == "string":
         return coalesce(length(c) > lit(0), lit(False))
-    if cat == "numeric":
+    if cat is not None and _is_numeric_cat(cat):
         return coalesce(c != lit(0), lit(False))
     return None
+
+
+def _null_narrowed(params: List[str], test_node: ast.AST) -> Tuple[frozenset, frozenset]:
+    """Return ``(body_nonnull, else_nonnull)`` — frozensets of parameter names
+    that are proven non-null in the true branch and the false branch
+    respectively of an ``if``/ternary with this test.
+
+    Recognised patterns (``p`` must be in ``params``):
+      ``p is not None``          → body: {p}
+      ``p is None``              → else: {p}
+      ``None is not p``          → body: {p}
+      ``None is p``              → else: {p}
+      ``A and B and …``          → body: union of each clause's body set
+    All other nodes yield empty sets (conservative; no narrowing assumed).
+    """
+    match test_node:
+        case (
+            ast.Compare(
+                left=ast.Name(id=name),
+                ops=[op],
+                comparators=[ast.Constant(value=None)],
+            )
+            | ast.Compare(
+                left=ast.Constant(value=None),
+                ops=[op],
+                comparators=[ast.Name(id=name)],
+            )
+        ) if name in params:
+            if isinstance(op, ast.IsNot):
+                return frozenset({name}), frozenset()
+            if isinstance(op, ast.Is):
+                return frozenset(), frozenset({name})
+        case ast.BoolOp(op=ast.And(), values=values):
+            # x is not None and y is not None and … → body: union, else: {}
+            body_nonnull: frozenset = frozenset()
+            for v in values:
+                bn, _ = _null_narrowed(params, v)
+                body_nonnull |= bn
+            return body_nonnull, frozenset()
+    return frozenset(), frozenset()
 
 
 class CatalystTranspiler(AbstractTranspiler):
@@ -241,6 +331,8 @@ class CatalystTranspiler(AbstractTranspiler):
     def __init__(self) -> None:
         self._param_categories: dict[int, str] = {}
         self._category_cache: dict[int, str] = {}
+        self._nonnull_params: frozenset = frozenset()
+        self._null_guard_emitted: bool = False
 
     # TODO (SPARK-55218): handle implicit-None return bodies like
     # ``def f(x): x + x`` -- no return statement means return None;
@@ -260,6 +352,24 @@ class CatalystTranspiler(AbstractTranspiler):
         if len(statements) == 0:
             return lit(None)
         return self._convert_chunk(params, statements[0])
+
+    def _is_nonnull_node(self, params: List[str], node: ast.AST) -> bool:
+        """Return True when ``node`` is statically known to produce a non-null value.
+
+        A non-None literal constant is always non-null. A parameter name is
+        non-null when proven so by an enclosing ``is not None`` guard recorded
+        in ``self._nonnull_params``. ``len(x)`` is non-null when ``x`` is non-null
+        because ``length`` of a non-null string always returns a non-null integer.
+        """
+        match node:
+            case ast.Constant(value=v):
+                return v is not None
+            case ast.Name(id=name) if name in params:
+                return name in self._nonnull_params
+            case ast.Call(func=ast.Name(id="len"), args=[arg], keywords=[]):
+                return self._is_nonnull_node(params, arg)
+            case _:
+                return False
 
     def _safe_category(self, params: List[str], node: Optional[ast.AST]) -> Optional[str]:
         """Best-effort input-type category for an if/else branch, or ``None`` when
@@ -286,6 +396,12 @@ class CatalystTranspiler(AbstractTranspiler):
             body_c = self._safe_category(params, node.body[0]) if node.body else None
             else_c = self._safe_category(params, node.orelse[0]) if node.orelse else None
             if body_c is not None and else_c is not None and body_c != else_c:
+                # Numeric sub-categories are mutually compatible; return the
+                # wider one. Truly mismatched families (e.g. numeric vs string)
+                # return None so the branch-compatibility check in
+                # _convert_if_like raises and the variant is dropped.
+                if _is_numeric_cat(body_c) and _is_numeric_cat(else_c):
+                    return _wider_numeric(body_c, else_c)
                 return None
             return body_c if body_c is not None else else_c
         if isinstance(node, ast.Constant) and node.value is None:
@@ -341,11 +457,15 @@ class CatalystTranspiler(AbstractTranspiler):
         body_cat = self._safe_category(params, body_node)
         else_cat = self._safe_category(params, else_node)
         if body_cat is not None and else_cat is not None and body_cat != else_cat:
-            raise UnsupportedOperationException(
-                f"if/else branches have incompatible categories ({body_cat} vs "
-                f"{else_cat}); the lowered CASE WHEN has no common type under ANSI, "
-                "so the transpiler falls back to interpreted Python"
-            )
+            # Numeric sub-categories (integer/float) are compatible: Spark widens
+            # to double in the CASE WHEN expression. Truly mismatched families
+            # (e.g. numeric vs string) are still refused.
+            if not (_is_numeric_cat(body_cat) and _is_numeric_cat(else_cat)):
+                raise UnsupportedOperationException(
+                    f"if/else branches have incompatible categories ({body_cat} vs "
+                    f"{else_cat}); the lowered CASE WHEN has no common type under ANSI, "
+                    "so the transpiler falls back to interpreted Python"
+                )
         return when(safe_test, body_col).otherwise(else_col)
 
     def _lower_eq(
@@ -355,7 +475,7 @@ class CatalystTranspiler(AbstractTranspiler):
         right_node: ast.AST,
         equal: bool,
     ) -> Column:
-        """Lower ``==`` / ``!=`` with Python's None-equality semantics.
+        """Lower ``==`` / ``!=`` with Python's None- and NaN-equality semantics.
 
         Unlike ordering operators, Python doesn't raise on ``None == x`` /
         ``None != x``: ``None == None`` is True, ``None == 0`` is False,
@@ -372,31 +492,56 @@ class CatalystTranspiler(AbstractTranspiler):
         where Python's ``==`` is simply False. Refuse those so the UDF falls
         back to interpreted Python. A ``None`` literal operand stays allowed
         (the four-branch NULL handling above reproduces Python exactly).
+        Numeric sub-categories (``"integer"`` vs ``"float"``) are treated as
+        compatible; Spark widens to double in the comparison.
 
-        One value-level difference remains (needs runtime values, so it is
-        documented, not guarded): Spark treats ``NaN = NaN`` as true, while
-        Python's ``nan == nan`` is False.
+        A NaN guard is added unless both operands are provably ``"integer"``:
+        ``NaN == NaN`` is ``False`` in Python (IEEE 754), but Spark's
+        ``EqualTo`` returns ``True``. ``"numeric"`` is an unknown sub-type
+        that may resolve to a float column, so it keeps the guard.
+
+        One value-level difference remains for ordering comparisons (tracked
+        separately): Spark orders NaN as greater than every value, whereas
+        Python's NaN comparisons are all False.
         """
         lc = self._safe_category(params, left_node)
         rc = self._safe_category(params, right_node)
         if lc is not None and rc is not None and lc != rc:
-            raise UnsupportedOperationException(
-                f"`==`/`!=` operands have incompatible categories ({lc} vs {rc}); "
-                "Python compares across types as unequal while Spark would coerce "
-                "or fail analysis, so the transpiler falls back to interpreted Python"
-            )
+            # Numeric sub-categories are mutually compatible for equality.
+            if not (_is_numeric_cat(lc) and _is_numeric_cat(rc)):
+                raise UnsupportedOperationException(
+                    f"`==`/`!=` operands have incompatible categories ({lc} vs {rc}); "
+                    "Python compares across types as unequal while Spark would coerce "
+                    "or fail analysis, so the transpiler falls back to interpreted Python"
+                )
         left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
         left_null = left_col.isNull()
         right_null = right_col.isNull()
+        # NaN guard: Python's `NaN == NaN` is False (IEEE 754 reflexivity fails),
+        # but Spark's EqualTo returns True. Emit only for numeric operands, and
+        # skip only when both are provably integral ("integer"); "numeric" is an
+        # unknown sub-type that may resolve to a float column, so it keeps the guard.
+        if (
+            lc is not None
+            and rc is not None
+            and _is_numeric_cat(lc)
+            and _is_numeric_cat(rc)
+            and not (lc == "integer" and rc == "integer")
+        ):
+            nan_result = lit(not equal)
+            nan_cmp = isnan(left_col) | isnan(right_col)
+            value_cmp: Column = when(nan_cmp, nan_result).otherwise(
+                left_col == right_col if equal else left_col != right_col
+            )
+        else:
+            value_cmp = left_col == right_col if equal else left_col != right_col
         if equal:
             both_null_val: Column = lit(True)
             one_null_val: Column = lit(False)
-            value_cmp = left_col == right_col
         else:
             both_null_val = lit(False)
             one_null_val = lit(True)
-            value_cmp = left_col != right_col
         return (
             when(left_null & right_null, both_null_val)
             .when(left_null | right_null, one_null_val)
@@ -435,7 +580,7 @@ class CatalystTranspiler(AbstractTranspiler):
         """
         lc = self._category(params, left_node)
         rc = self._category(params, right_node)
-        if lc != rc:
+        if lc != rc and not (_is_numeric_cat(lc) and _is_numeric_cat(rc)):
             raise UnsupportedOperationException(
                 f"`{op_repr}` compares operands of different categories "
                 f"({lc} vs {rc}); Python would raise TypeError, so the "
@@ -443,17 +588,23 @@ class CatalystTranspiler(AbstractTranspiler):
             )
         left_col = self._convert_chunk(params, left_node)
         right_col = self._convert_chunk(params, right_node)
+        if self._is_nonnull_node(params, left_node) and self._is_nonnull_node(params, right_node):
+            return op(left_col, right_col)
         null_guard = left_col.isNull() | right_col.isNull()
         err = lit(
             "Python UDF transpiler: cannot compare NULL with operator "
             f"`{op_repr}`; Python would raise TypeError here. Add an "
             "`is not None` guard or filter NULLs upstream."
         )
+        self._null_guard_emitted = True
         return when(null_guard, raise_error(err)).otherwise(op(left_col, right_col))
 
     def _category(self, params: List[str], node: ast.AST) -> str:
-        """Infer ``"numeric"`` or ``"string"`` for ``node`` under the current
+        """Infer the scalar category of ``node`` under the current
         ``self._param_categories`` assumption (set per input-type variant).
+
+        Returns one of ``"integer"``, ``"float"``, ``"numeric"`` (unknown
+        numeric sub-type), ``"string"``, ``"bool"``, or ``"binary"``.
 
         Drives operator selection (``+`` -> add vs concat, ``*`` -> multiply vs
         repeat) and raises ``UnsupportedOperationException`` when an operator's
@@ -471,18 +622,21 @@ class CatalystTranspiler(AbstractTranspiler):
     def _category_uncached(self, params: List[str], node: ast.AST) -> str:
         match node:
             case ast.Constant(value=v):
-                # bool subclasses int, so classify it first: int/float -> numeric,
-                # str -> string, bool -> bool, bytes -> binary. None/complex/
-                # Ellipsis have no usable Spark column type, so raise to drop this
-                # variant and fall back rather than emit an option that fails
-                # CheckAnalysis or silently diverges (e.g. `x + None` -> NULL where
-                # Python raises TypeError).
+                # bool subclasses int, so classify it first.
+                # int -> "integer", float -> "float", str -> "string",
+                # bool -> "bool", bytes -> "binary".
+                # None/complex/Ellipsis have no usable Spark column type, so
+                # raise to drop this variant and fall back rather than emit an
+                # option that fails CheckAnalysis or silently diverges (e.g.
+                # `x + None` -> NULL where Python raises TypeError).
                 if isinstance(v, bool):
                     return "bool"
                 if isinstance(v, bytes):
                     return "binary"
-                if isinstance(v, (int, float)):
-                    return "numeric"
+                if isinstance(v, float):
+                    return "float"
+                if isinstance(v, int):
+                    return "integer"
                 if isinstance(v, str):
                     return "string"
                 raise UnsupportedOperationException(
@@ -496,15 +650,25 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.BinOp(left=left, op=op, right=right):
                 lc = self._category(params, left)
                 rc = self._category(params, right)
-                if isinstance(op, ast.Add) and lc == rc:
-                    return lc  # str + str -> str, num + num -> num
+                if isinstance(op, ast.Add):
+                    if lc == rc:
+                        return lc  # str+str, integer+integer, float+float
+                    if _is_numeric_cat(lc) and _is_numeric_cat(rc):
+                        return _wider_numeric(lc, rc)  # integer+float -> float
                 if isinstance(op, ast.Mult):
-                    if {lc, rc} == {"numeric", "numeric"}:
-                        return "numeric"
-                    if {lc, rc} == {"numeric", "string"}:
-                        return "string"  # str * int / int * str -> repeat
-                if isinstance(op, (ast.Sub, ast.Mod)) and lc == rc == "numeric":
-                    return "numeric"
+                    if _is_numeric_cat(lc) and _is_numeric_cat(rc):
+                        return _wider_numeric(lc, rc)
+                    # repeat(str, n): second operand must be integral (not float).
+                    # Python raises TypeError for `str * float`, so we allow only
+                    # "integer" or the legacy "numeric" catch-all (which the JVM
+                    # will validate against the actual column type at query time).
+                    if lc == "string" and rc in ("integer", "numeric"):
+                        return "string"
+                    if rc == "string" and lc in ("integer", "numeric"):
+                        return "string"
+                if isinstance(op, (ast.Sub, ast.Mod)):
+                    if _is_numeric_cat(lc) and _is_numeric_cat(rc):
+                        return _wider_numeric(lc, rc)
                 raise UnsupportedOperationException(
                     f"operands of `{type(op).__name__}` are not type-compatible "
                     "for this input-type variant"
@@ -537,6 +701,11 @@ class CatalystTranspiler(AbstractTranspiler):
                 body_cat = branch_category(if_body)
                 else_cat = branch_category(if_orelse)
                 if body_cat is not None and else_cat is not None and body_cat != else_cat:
+                    # Numeric sub-categories (integer/float) are mutually
+                    # compatible: `1 if c else 1.0` is valid Python and Spark
+                    # widens to double in the CASE WHEN.
+                    if _is_numeric_cat(body_cat) and _is_numeric_cat(else_cat):
+                        return _wider_numeric(body_cat, else_cat)
                     raise UnsupportedOperationException(
                         f"ternary branches have mismatched categories ({body_cat} "
                         f"vs {else_cat}) and cannot drive operator selection"
@@ -591,7 +760,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 # of falling back, since the option is type-checked as a
                 # child of TranspiledPythonUDF before ConvertToCatalyst can
                 # drop it. Fail closed for every non-numeric category.
-                if self._category(params, operand) != "numeric":
+                if not _is_numeric_cat(self._category(params, operand)):
                     raise UnsupportedOperationException(
                         "unary `+`/`-` is only supported for numeric operands "
                         "(Python raises TypeError on strings, and Spark would "
@@ -653,21 +822,31 @@ class CatalystTranspiler(AbstractTranspiler):
             case ast.IfExp(test=test, body=body_expr, orelse=orelse_expr):
                 # Ternary `body if test else orelse` -- shares the
                 # NULL-as-falsy lowering with the if-statement case.
+                test_col = self._convert_chunk(params, test)
+                body_nonnull, else_nonnull = _null_narrowed(params, test)
+                saved_nonnull = self._nonnull_params
+                self._nonnull_params = saved_nonnull | body_nonnull
+                body_col = self._convert_chunk(params, body_expr)
+                self._nonnull_params = saved_nonnull | else_nonnull
+                else_col = self._convert_chunk(params, orelse_expr)
+                self._nonnull_params = saved_nonnull
                 return self._convert_if_like(
-                    params,
-                    self._convert_chunk(params, test),
-                    self._convert_chunk(params, body_expr),
-                    self._convert_chunk(params, orelse_expr),
-                    test,
-                    body_expr,
-                    orelse_expr,
+                    params, test_col, body_col, else_col, test, body_expr, orelse_expr
                 )
             case ast.If(test, success, orelse):
+                test_col = self._convert_chunk(params, test)
+                body_nonnull, else_nonnull = _null_narrowed(params, test)
+                saved_nonnull = self._nonnull_params
+                self._nonnull_params = saved_nonnull | body_nonnull
+                body_col = self._convert_branch(params, success, "body")
+                self._nonnull_params = saved_nonnull | else_nonnull
+                else_col = self._convert_branch(params, orelse, "else body")
+                self._nonnull_params = saved_nonnull
                 return self._convert_if_like(
                     params,
-                    self._convert_chunk(params, test),
-                    self._convert_branch(params, success, "body"),
-                    self._convert_branch(params, orelse, "else body"),
+                    test_col,
+                    body_col,
+                    else_col,
                     test,
                     success[0] if success else None,
                     orelse[0] if orelse else None,
@@ -754,20 +933,20 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Add():
                         if lc == rc == "string":
                             return concat(left_col, right_col)
-                        if lc == rc == "numeric":
+                        if _is_numeric_cat(lc) and _is_numeric_cat(rc):
                             return left_col.__add__(right_col)
                     case ast.Sub():
-                        if lc == rc == "numeric":
+                        if _is_numeric_cat(lc) and _is_numeric_cat(rc):
                             return left_col.__sub__(right_col)
                     case ast.Mult():
-                        if lc == "numeric" and rc == "numeric":
+                        if _is_numeric_cat(lc) and _is_numeric_cat(rc):
                             return left_col.__mul__(right_col)
-                        if lc == "string" and rc == "numeric":
+                        if lc == "string" and rc in ("integer", "numeric"):
                             return repeat(left_col, right_col.cast("int"))
-                        if lc == "numeric" and rc == "string":
+                        if lc in ("integer", "numeric") and rc == "string":
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
-                        if lc == rc == "numeric":
+                        if _is_numeric_cat(lc) and _is_numeric_cat(rc):
                             # Python's `%` takes the sign of the divisor; Spark's
                             # takes the dividend's. `sign(b) * pmod(sign(b) * a,
                             # abs(b))` reproduces Python for every non-zero divisor
@@ -829,11 +1008,14 @@ class CatalystTranspiler(AbstractTranspiler):
                         "types fall back to interpreted Python"
                     )
                 arg_col = self._convert_chunk(params, arg)
+                if self._is_nonnull_node(params, arg):
+                    return length(arg_col)
                 err = lit(
                     "Python UDF transpiler: cannot call len() on NULL; "
                     "Python would raise TypeError here. Add an "
                     "`is not None` guard or filter NULLs upstream."
                 )
+                self._null_guard_emitted = True
                 return when(arg_col.isNull(), raise_error(err)).otherwise(length(arg_col))
             case _:
                 raise UnsupportedOperationException(
@@ -844,14 +1026,16 @@ class CatalystTranspiler(AbstractTranspiler):
     def _transpile_from_ast(
         self,
         src: Optional[str],
-        ast_info: ast.AST,
-        function_ast: ast.FunctionDef,
+        ast_info: Optional[ast.AST],
+        function_ast: Optional[ast.FunctionDef],
         params: List[str],
         returnType: "DataTypeOrString",
         param_categories: Optional[dict] = None,
-    ) -> Optional[Column]:
-        # Short circuit on nothing to transpile.
-        if src == "" or ast_info is None:
+        held_code: Any = None,
+    ) -> Optional[Union[Column, Tuple[Column, List[str]]]]:
+        # Short circuit on nothing to transpile. This lowering works from the
+        # AST; ``held_code`` is for bytecode varieties.
+        if not src or ast_info is None or function_ast is None:
             return None
         # Per-variant input-type assumption ({public_param_index -> category}),
         # read by ``_category`` to choose str vs numeric operators.
@@ -859,7 +1043,20 @@ class CatalystTranspiler(AbstractTranspiler):
         # Category inference depends on the per-variant assumptions above. Cache
         # each AST node only for this lowering so recursive conversion stays linear.
         self._category_cache = {}
+        # Reset per-transpilation null-narrowing state.
+        self._nonnull_params = frozenset()
+        self._null_guard_emitted = False
         function_body = function_ast.body
+        # Normalize `if <test>: return y\nreturn body` (2-stmt early-return)
+        # into a single if/else so null narrowing can apply to the main body.
+        match function_body:
+            case [
+                ast.If(test=test, body=[ast.Return() as early_ret], orelse=[]) as if_node,
+                ast.Return() as main_ret,
+            ]:
+                synthesized = ast.If(test=test, body=[early_ret], orelse=[main_ret])
+                ast.fix_missing_locations(ast.copy_location(synthesized, if_node))
+                function_body = [synthesized]
         if len(function_body) != 1:
             raise UnsupportedOperationException(
                 "functions with more than one top-level statement are not "
@@ -895,7 +1092,7 @@ class CatalystTranspiler(AbstractTranspiler):
             cast_ok = (
                 body_cat is None
                 or (
-                    body_cat == "numeric"
+                    _is_numeric_cat(body_cat)
                     and isinstance(returnType, NumericType)
                     and not isinstance(returnType, DecimalType)
                 )
@@ -912,6 +1109,15 @@ class CatalystTranspiler(AbstractTranspiler):
                     "interpreted Python"
                 )
         converted = self._convert_chunk(params, function_body[0])
+        if self._null_guard_emitted:
+            warnings.warn(
+                "Python UDF transpiler: the transpiled UDF includes a NULL guard "
+                "that raises at runtime when a NULL input is encountered. Add an "
+                "`if x is not None` guard around comparisons, or filter NULLs "
+                "upstream, to avoid this.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Cast to the declared return type so the rewritten plan reports a
         # known data type to the optimizer's plan validator (otherwise it
         # sees an UnresolvedFunction tree and reports VOID, which fails
@@ -928,6 +1134,13 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
     if not configured_transpilers:
         return []
     transpiler_names = configured_transpilers.split(",")
+    unknown_names = [name for name in transpiler_names if name not in AbstractTranspiler.varieties]
+    if unknown_names:
+        warnings.warn(
+            f"Ignoring unknown transpilers {unknown_names} in "
+            "spark.sql.experimental.optimizer.pyTranspilers; registered transpilers are "
+            f"{sorted(AbstractTranspiler.varieties)}"
+        )
     return [
         AbstractTranspiler.varieties[name]()
         for name in transpiler_names
@@ -936,21 +1149,24 @@ def _get_transpilers(session: "SparkSession") -> List[AbstractTranspiler]:
 
 
 def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
-    """Map a parameter's type annotation to a category
-    (``"numeric"``/``"string"``/``"bool"``/``"binary"``), or ``None`` when it's
-    absent or unrecognised (the caller then tries both numeric and string)."""
+    """Map a parameter's type annotation to a category, or ``None`` when absent
+    or unrecognised (the caller then tries all numeric and string variants).
+
+    Returns one of ``"integer"``, ``"float"``, ``"string"``, ``"bool"``, or
+    ``"binary"`` (matching the constant handling in ``_category``). ``int``
+    maps to ``"integer"`` and ``float`` maps to ``"float"`` so the JVM can
+    select the variant whose NaN semantics match the bound column type."""
     name: Optional[str] = None
     if isinstance(annotation, ast.Name):
         name = annotation.id
     elif isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
         name = annotation.value  # stringized annotation, e.g. def f(a: "int")
-    # str -> "string", int/float -> "numeric", bool -> "bool", bytes -> "binary"
-    # (matching the constant handling in ``_category``). complex and anything
-    # unrecognised return None so the caller tries both numeric and string.
     if name == "str":
         return "string"
-    if name in ("int", "float"):
-        return "numeric"
+    if name == "int":
+        return "integer"
+    if name == "float":
+        return "float"
     if name == "bool":
         return "bool"
     if name == "bytes":
@@ -958,35 +1174,43 @@ def _annotation_category(annotation: Optional[ast.AST]) -> Optional[str]:
     return None
 
 
-def _param_category_combos(function_ast: ast.FunctionDef, public_params: List[str]) -> List[dict]:
-    """Per-variant maps ``{public_param_index -> category}`` where category is
-    one of ``"numeric"``/``"string"``/``"bool"``/``"binary"``.
+def _param_category_combos(
+    function_ast: Optional[ast.FunctionDef], public_params: List[str]
+) -> List[dict]:
+    """Per-variant maps ``{public_param_index -> category}``.
 
-    A typed param (``def f(a: str, b: int)``) is pinned to its category; an
-    untyped param is tried as both numeric and string. To cap plan growth, when
-    more than three params are untyped we collapse the untyped ones to the
-    all-numeric and all-string variants (encourage typing inputs to keep the
-    matrix small) while keeping every typed param pinned.
+    A typed param (``def f(a: str, b: int)``) is pinned to its category
+    (``"integer"``/``"float"``/``"string"``/``"bool"``/``"binary"``); an
+    untyped param is tried as ``"integer"``, ``"float"``, and ``"string"``
+    separately so the JVM can select the variant that matches the bound column
+    type and apply the right NaN semantics. To cap plan growth, when more than
+    three params are untyped we collapse the untyped ones to one variant per
+    base category (encourage typing inputs to keep the matrix small) while
+    keeping every typed param pinned. A ``None`` ``function_ast`` means no
+    trustworthy source, hence no annotations: every param is untyped.
     """
     n = len(public_params)
-    all_args = _positional_args(function_ast)
-    public_args = all_args[len(all_args) - n :]
     candidates: List[List[str]] = []
     untyped = 0
-    for arg in public_args:
-        cat = _annotation_category(arg.annotation)
-        if cat is None:
-            candidates.append(["numeric", "string"])
-            untyped += 1
-        else:
-            candidates.append([cat])
+    if function_ast is None:
+        candidates = [["integer", "float", "string"] for _ in range(n)]
+        untyped = n
+    else:
+        all_args = _positional_args(function_ast)
+        public_args = all_args[len(all_args) - n :]
+        for arg in public_args:
+            cat = _annotation_category(arg.annotation)
+            if cat is None:
+                candidates.append(["integer", "float", "string"])
+                untyped += 1
+            else:
+                candidates.append([cat])
     if untyped > 3:
-        # Cap the 2**untyped blow-up, but keep each typed param pinned to its
-        # category (a single-element ``candidates`` entry); only the untyped
-        # params collapse to the all-numeric / all-string pair.
+        # Cap the 3**untyped blow-up; collapse untyped params to one variant
+        # per base fill while keeping typed params pinned.
         return [
             {i: c[0] if len(c) == 1 else fill for i, c in enumerate(candidates)}
-            for fill in ("numeric", "string")
+            for fill in ("integer", "float", "string")
         ]
     return [{i: choice[i] for i in range(n)} for choice in itertools.product(*candidates)] or [{}]
 
@@ -1026,14 +1250,24 @@ def _call_impl(entry: Any) -> Any:
     return entry.__func__ if isinstance(entry, (staticmethod, classmethod)) else entry
 
 
+def _code_owner(func: Callable) -> Any:
+    """The function or method whose code runs when ``func`` is called.
+
+    A function or method runs its own ``__code__``; anything else runs its type's
+    ``__call__``. Its ``__defaults__`` / ``__kwdefaults__`` answer the default-
+    argument question when there is no AST to ask.
+    """
+    target = func if (inspect.isfunction(func) or inspect.ismethod(func)) else _call_dunder(func)
+    return _call_impl(target)
+
+
 def _held_code(func: Callable) -> Any:
     """The code object that runs when ``func`` is called, or ``None``.
 
-    A function or method runs its own ``__code__``; anything else runs its type's
-    ``__call__``. Used only to ask whether we are holding a lambda.
+    Used to ask whether we are holding a lambda, and handed to transpiler
+    varieties that work from bytecode.
     """
-    target = func if (inspect.isfunction(func) or inspect.ismethod(func)) else _call_dunder(func)
-    return getattr(_call_impl(target), "__code__", None)
+    return getattr(_code_owner(func), "__code__", None)
 
 
 _WARNINGS_LOCK = threading.Lock()
@@ -1205,6 +1439,62 @@ def _get_function_from_ast(body: ast.AST, held_code: Any) -> Tuple[Optional[ast.
     )
 
 
+# The input categories a variety may report; mirrors ``optionMatchesTypes`` on the JVM.
+_VARIETY_CATEGORIES = frozenset(
+    ("integer", "float", "numeric", "string", "bool", "binary", "timestamp", "map", "array")
+)
+
+
+def _variety_option(result: Any, combo: dict, num_params: int) -> Tuple[Column, List[str]]:
+    """Return the ``(column, categories)`` option for one ``_transpile_from_ast`` result.
+
+    A plain :class:`Column` is labeled with ``combo``; a ``(Column, list[str])``
+    tuple keeps the variety's own categories. Malformed returns raise.
+    """
+    if isinstance(result, Column):
+        return result, [combo.get(i, "numeric") for i in range(num_params)]
+    if isinstance(result, tuple):
+        # Guard the shape before unpacking so a wrong-arity tuple reports a
+        # clear reason instead of an opaque "too many values to unpack".
+        if len(result) != 2:
+            raise UnsupportedOperationException(
+                f"transpiler returned a {len(result)}-element tuple; "
+                "expected (Column, list[str]) or None"
+            )
+        column, categories = result
+        # Declining is plain None; a None Column would surface a raw JVM NPE.
+        if not isinstance(column, Column):
+            raise UnsupportedOperationException(
+                "transpiler returned a (Column, list[str]) tuple whose first "
+                "element is not a Column; return None to decline"
+            )
+        # A non-list categories (e.g. a string) has a len and is iterable, so
+        # it would otherwise slip through as bogus per-char categories.
+        if not isinstance(categories, list):
+            raise UnsupportedOperationException(
+                "transpiler returned categories that are not a list"
+            )
+        # The JVM drops the WHOLE option set on a length mismatch, so a
+        # wrong-length list would silently neuter every variety.
+        if len(categories) != num_params:
+            raise UnsupportedOperationException(
+                f"transpiler returned {len(categories)} input categories for "
+                f"{num_params} parameters"
+            )
+        # The JVM silently drops an option whose category it does not know.
+        bad = [c for c in categories if not isinstance(c, str) or c not in _VARIETY_CATEGORIES]
+        if bad:
+            raise UnsupportedOperationException(
+                f"transpiler returned unknown input categories {bad!r}; "
+                f"expected strings from {sorted(_VARIETY_CATEGORIES)}"
+            )
+        return column, list(categories)
+    raise UnsupportedOperationException(
+        f"transpiler returned an unsupported result of type {type(result).__name__}; "
+        "expected a Column, a (Column, list[str]) tuple, or None"
+    )
+
+
 def _transpile_func(
     session: "SparkSession",
     func: Callable[..., Any],
@@ -1221,9 +1511,10 @@ def _transpile_func(
     method or callable instance) -- needed so the caller can resolve named-argument
     invocations to positional order at call time, since the ``_udf_param_N``
     substitution in :class:`UserDefinedPythonFunction` is positional.
-    list of per-option input-type categories (``"numeric"`` / ``"string"`` per
-    public param) -- the JVM picks the option whose categories match the bound
-    column types, or falls back to the Python UDF when none match.
+    list of per-option input-type categories (one per public param, from the
+    vocabulary on ``AbstractTranspiler._transpile_from_ast``) -- the JVM picks the
+    option whose categories match the bound column types, or falls back to the
+    Python UDF when none match.
     list of the public parameter names Python forbids calling by keyword
     (positional-only) -- the caller must NOT resolve a kwarg matching one of these
     to a position, since Python itself rejects that call.
@@ -1256,54 +1547,84 @@ def _transpile_func(
                 [],
                 [],
             )
+        # Hand each transpiler whatever could be extracted: the AST from the
+        # source on disk when it is trustworthy, and the code object that
+        # actually runs (``held_code``) when there is one. A transpiler declines
+        # when the form it needs is missing -- the built-in lowering works from
+        # the AST, a numba-style variety from the bytecode -- so an extraction
+        # failure is recorded as a reason for the fallback warning, not refused
+        # outright. Only BOTH missing means there is nothing to lower from.
+        held_code = _held_code(func)
+        src = None
+        ast_info = None
+        function_ast = None
+        errors: List[str] = []
         # A functools.wraps-style decorator makes ``inspect.getsource`` return
         # the WRAPPED function's source (getsource follows ``__wrapped__``),
-        # while the UDF actually executes the wrapper. Transpiling would
-        # silently reproduce the wrong behavior, so refuse and fall back.
+        # while the UDF actually executes the wrapper -- the AST is a lie, but
+        # ``held_code`` is exactly what runs.
         # ``_call_impl`` first: a ``staticmethod`` / ``classmethod`` exposes a
-        # ``__wrapped__`` of its own, so asking the descriptor refuses every one of
-        # them for a wraps decorator that is not there.
+        # ``__wrapped__`` of its own, so asking the descriptor distrusts every
+        # one of them for a wraps decorator that is not there.
         if (
             getattr(func, "__wrapped__", None) is not None
             or getattr(_call_impl(_call_dunder(func)), "__wrapped__", None) is not None
         ):
+            errors.append(
+                "a functools.wraps decorator makes the visible source the wrapped "
+                "function's, not the wrapper's; only the bytecode is trustworthy"
+            )
+        else:
+            # Not ``ast``: that name would shadow the module for this function.
+            src, ast_info = _get_src_ast_from_func(func)
+            if ast_info is None:
+                errors.append("Error getting ast for function")
+            else:
+                # Get the lambda body and parameters
+                function_ast, extraction_error = _get_function_from_ast(ast_info, held_code)
+                if function_ast is None:
+                    errors.append(extraction_error)
+                    # Rejected source is not trustworthy either; hand varieties None.
+                    src, ast_info = None, None
+        if function_ast is None and held_code is None:
             return (
                 [],
-                [
-                    "decorated callables (functools.wraps) are not supported: "
-                    "the visible source is the wrapped function's, not the "
-                    "wrapper's, so transpilation would change behavior"
-                ],
+                errors + ["and no bytecode is available either, cannot transpile"],
                 [],
                 [],
                 [],
             )
-        # Not ``ast``: that name would shadow the module for this whole function.
-        src, ast_info = _get_src_ast_from_func(func)
-        if ast_info is None:
-            return ([], ["Error getting ast for function, cannot transpile"], [], [], [])
-        # Get the lambda body and parameters
-        function_ast, extraction_error = _get_function_from_ast(ast_info, _held_code(func))
-        if function_ast is None:
-            return ([], [extraction_error], [], [], [])
         # Default, variadic (``*args`` / ``**kwargs``) and keyword-only params
         # can't be represented by the positional ``_udf_param_N`` placeholder
         # scheme: a call site may omit a defaulted argument, leaving the
         # placeholder referencing a position the call never bound. A
         # positional-only param has no such gap -- it is always bound by
-        # position -- so it is not refused here; a DEFAULTED one still hits
-        # ``fn_args.defaults`` above.
-        fn_args = function_ast.args
-        if (
-            fn_args.defaults
-            or any(d is not None for d in fn_args.kw_defaults)
-            or fn_args.kwonlyargs
-            or fn_args.vararg is not None
-            or fn_args.kwarg is not None
-        ):
+        # position -- so it is not refused here; a DEFAULTED one still hits the
+        # check below. The check runs on the AST when there is one, on the code
+        # object otherwise: ``__defaults__`` / ``__kwdefaults__`` live on the
+        # function, the variadic and keyword-only counts on its code object.
+        if function_ast is not None:
+            fn_args = function_ast.args
+            unsupported_params = bool(
+                fn_args.defaults
+                or any(d is not None for d in fn_args.kw_defaults)
+                or fn_args.kwonlyargs
+                or fn_args.vararg is not None
+                or fn_args.kwarg is not None
+            )
+        else:
+            owner = _code_owner(func)
+            unsupported_params = bool(
+                getattr(owner, "__defaults__", None)
+                or getattr(owner, "__kwdefaults__", None)
+                or held_code.co_kwonlyargcount
+                or held_code.co_flags & (inspect.CO_VARARGS | inspect.CO_VARKEYWORDS)
+            )
+        if unsupported_params:
             return (
                 [],
-                [
+                errors
+                + [
                     "functions with default, variadic, or keyword-only "
                     "arguments are not supported by the transpiler"
                 ],
@@ -1311,7 +1632,10 @@ def _transpile_func(
                 [],
                 [],
             )
-        params = _get_parameter_list(function_ast)
+        if function_ast is not None:
+            params = _get_parameter_list(function_ast)
+        else:
+            params = list(held_code.co_varnames[: held_code.co_argcount])
         # Drop a receiver that is already bound, so what is left is what the call
         # site supplies. Decided by HOW ``func`` dispatches, not by the parameter's
         # name: a bound ``__call__(this, x)`` or ``@classmethod f(cls, x)`` has a
@@ -1365,11 +1689,13 @@ def _transpile_func(
         # Subset of ``public_params`` Python forbids calling by keyword. The
         # call-site kwargs-to-positional rewrite in ``udf.py`` must not "fix" a
         # keyword call to one of these, since Python itself would reject it.
-        posonly_names = {arg.arg for arg in function_ast.args.posonlyargs}
+        if function_ast is not None:
+            posonly_names = {arg.arg for arg in function_ast.args.posonlyargs}
+        else:
+            posonly_names = set(params[: held_code.co_posonlyargcount])
         positional_only_public_params = [p for p in public_params if p in posonly_names]
         transpiled: list[Column] = []
         input_categories: list[list[str]] = []
-        errors = []
         # One transpiled option per (backend x input-type variant). Untyped
         # params are tried as both numeric and string so the JVM can pick the
         # option matching the actual column types (or fall back if none match).
@@ -1377,24 +1703,32 @@ def _transpile_func(
         # Maybe multiple transpilers (think CUDA, etc.).
         transpilers = _get_transpilers(session)
         for transpiler in transpilers:
+            # A self-typing variety returns the same categories for every combo;
+            # one option per distinct category list is enough.
+            seen: set = set()
             for combo in combos:
                 try:
-                    transpiled_column = transpiler._transpile_from_ast(
-                        src, ast_info, function_ast, public_params, returnType, combo
+                    result = transpiler._transpile_from_ast(
+                        src, ast_info, function_ast, public_params, returnType, combo, held_code
                     )
-                    if transpiled_column is not None:
-                        transpiled.append(transpiled_column)
-                        input_categories.append(
-                            [combo.get(i, "numeric") for i in range(len(public_params))]
-                        )
+                    if result is not None:
+                        column, categories = _variety_option(result, combo, len(public_params))
+                        if tuple(categories) not in seen:
+                            seen.add(tuple(categories))
+                            transpiled.append(column)
+                            input_categories.append(categories)
                 except Exception as e:
                     errors.append(str(e))
         return (
             transpiled,
             errors,
-            public_params,
+            # Param names only matter alongside an option (the caller's kwargs
+            # rewrite is guarded on ``transpiled``); report none when no
+            # transpiler produced anything, so a fallen-back UDF carries no
+            # transpilation state.
+            public_params if transpiled else [],
             input_categories,
-            positional_only_public_params,
+            positional_only_public_params if transpiled else [],
         )
     except Exception as e:
         # Don't re-raise: an inability to transpile must never break a
