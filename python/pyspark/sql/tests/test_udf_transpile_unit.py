@@ -180,26 +180,79 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 "when both transpilePyUDFs and ANSI mode are enabled",
             )
 
-    def test_get_transpilers_warns_on_unknown_names(self):
-        import warnings
-
+    def test_get_transpilers_reports_unknown_names(self):
         for names, expected, unknown in [
-            ("catalyst", [CatalystTranspiler], None),
-            ("catalyst,catalist", [CatalystTranspiler], "catalist"),
-            ("catalist", [], "catalist"),
+            ("catalyst", [CatalystTranspiler], []),
+            ("catalyst,catalist", [CatalystTranspiler], ["catalist"]),
+            ("catalist", [], ["catalist"]),
+            ("catalyst,", [CatalystTranspiler], []),
+            ("catalyst,,catalyst", [CatalystTranspiler, CatalystTranspiler], []),
+            ("catalyst, ", [CatalystTranspiler], []),
+            (" catalyst", [], [" catalyst"]),
         ]:
             with self.subTest(names=names):
                 with self.sql_conf({"spark.sql.experimental.optimizer.pyTranspilers": names}):
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        transpilers = _get_transpilers(self.spark)
+                    transpilers, unknown_names = _get_transpilers(self.spark)
                 self.assertEqual([type(t) for t in transpilers], expected)
-                messages = [str(w.message) for w in caught if "pyTranspilers" in str(w.message)]
-                if unknown is None:
-                    self.assertEqual(messages, [])
-                else:
-                    self.assertEqual(len(messages), 1)
-                    self.assertIn(repr(unknown), messages[0])
+                self.assertEqual(unknown_names, unknown)
+
+    def test_udf_transpile_warns_on_unknown_names(self):
+        import warnings
+
+        from pyspark.sql.transpile import AbstractTranspiler
+
+        def plus_one(x):
+            return x + 1
+
+        expected = (
+            "Ignoring unknown transpilers ['catalist'] in "
+            "spark.sql.experimental.optimizer.pyTranspilers; registered transpilers are "
+            f"{sorted(AbstractTranspiler.varieties)}"
+        )
+        for names, lowered in [("catalyst,catalist", True), ("catalist", False)]:
+            with (
+                self.subTest(names=names),
+                self.sql_conf(
+                    dict(
+                        _TRANSPILE_ON,
+                        **{"spark.sql.experimental.optimizer.pyTranspilers": names},
+                    )
+                ),
+            ):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("default")
+                    pudf = UserDefinedFunction(plus_one, LongType())
+                self.assertEqual(bool(pudf.transpiled), lowered)
+                expected_warnings = (
+                    [expected] if lowered else [f"Unable to transpile UDF {plus_one}", expected]
+                )
+                self.assertEqual([str(w.message) for w in caught], expected_warnings)
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    warnings.filterwarnings("ignore", message="Unable to transpile UDF")
+                    with self.assertRaises(UserWarning) as raised:
+                        UserDefinedFunction(plus_one, LongType())
+                self.assertEqual(str(raised.exception), expected)
+
+                with warnings.catch_warnings(record=True):
+                    warnings.filterwarnings("error", message="Ignoring unknown transpilers")
+                    with self.assertRaises(UserWarning) as raised:
+                        UserDefinedFunction(plus_one, LongType())
+                self.assertEqual(str(raised.exception), expected)
+
+        for names in ("catalyst", "catalyst,", "catalyst,,catalyst", "catalyst, "):
+            with self.subTest(names=names):
+                with self.sql_conf(
+                    dict(
+                        _TRANSPILE_ON,
+                        **{"spark.sql.experimental.optimizer.pyTranspilers": names},
+                    )
+                ):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error")
+                        pudf = UserDefinedFunction(plus_one, LongType())
+                    self.assertTrue(pudf.transpiled)
 
     def test_udf_transpile_does_not_mask_char_varchar_ddl(self):
         # DDL CHAR/VARCHAR is parsed via ``returnType`` inside the optional
@@ -2496,15 +2549,16 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def test_udf_transpile_known_value_divergences(self):
         # Transpile but DIVERGE from Python (documented in transpile.py; pinned so
         # a future fix is noticed): unguarded arithmetic on NULL yields NULL
-        # (Python raises TypeError), and NaN > 0 is True (Python False; Spark
-        # orders NaN highest). Mixed str/numeric arithmetic is handled or falls
-        # back -- see test_udf_transpile_string_operands{,_fall_back}.
+        # (Python raises TypeError). NaN > 0 used to be pinned here as True; the
+        # ordering lowering now answers False as Python does. Mixed str/numeric
+        # arithmetic is handled or falls back -- see
+        # test_udf_transpile_string_operands{,_fall_back}.
         unguarded = lambda x: x + 1  # noqa: E731
         nan_gt = lambda x: (x > 0) if x is not None else None  # noqa: E731
         eq_strlit = lambda x: (x == "5") if x is not None else None  # noqa: E731
         self.assertEqual(self._vals(unguarded, LongType(), "a long", [(None,), (5,)]), [None, 6])
         self.assertEqual(
-            self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [True, True]
+            self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [False, True]
         )
         # `x == "5"` used to be pinned as a coercion divergence (int == "5" -> True).
         # The eq category gate now drops the numeric variant, so on a long column the
@@ -2912,57 +2966,57 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         self.assertEqual({c[0] for c in combos_u}, {"integer", "float", "string"})
 
     def test_udf_transpile_null_narrowing_skips_null_guard(self):
-        # When a parameter is guarded by `x is not None` in an
-        # if/ternary test, the transpiler should skip the raise_error null guard
-        # for ordering comparisons on that parameter within the guarded branch.
-        def if_guard_gt(x):
+        def statement_guard_gt(x):
+            if x is not None:
+                return x > 0
+            return None
+
+        def ternary_guard_gt(x):
             return (x > 0) if x is not None else None
 
-        def if_guard_and_lt(a, b):
+        def ternary_guard_and_lt(a, b):
             return (a < b) if a is not None and b is not None else None
 
-        def ternary_guard_ge(x):
-            return (x >= 0) if x is not None else None
+        def reversed_guard_gt(x):
+            return (x > 0) if None is not x else None
 
-        def is_none_ternary(x):
-            return None if x is None else x > 0
+        def reversed_none_guard(x):
+            return None if None is x else x > 0
 
-        cases_if = [
-            # if/else with `is not None` guard
-            ("if_guard_gt", if_guard_gt),
-            # if/else with `is not None` and-chain (two params)
-            ("if_guard_and_lt", if_guard_and_lt),
-            # ternary with `is not None` guard
-            ("ternary_guard_ge", ternary_guard_ge),
-            # `is None` guard: non-null in the else branch
-            ("is_none_ternary", is_none_ternary),
+        def elif_guard(x):
+            if x is None:
+                return None
+            elif x > 0:
+                return True
+            else:
+                return False
+
+        cases = [
+            ("statement_guard_gt", statement_guard_gt),
+            ("ternary_guard_gt", ternary_guard_gt),
+            ("ternary_guard_and_lt", ternary_guard_and_lt),
+            ("reversed_guard_gt", reversed_guard_gt),
+            ("reversed_none_guard", reversed_none_guard),
+            ("elif_guard", elif_guard),
         ]
         with self.sql_conf(_TRANSPILE_ON):
-            for name, func in cases_if:
+            for name, func in cases:
                 with self.subTest(func=name):
                     u, warnings_text = self._udf_and_warnings(func, BooleanType())
                     self.assertTrue(u.transpiled, f"{name} did not transpile: {warnings_text}")
+                    self.assertNotIn("NULL guard", warnings_text)
                     arity = func.__code__.co_argcount
                     if arity == 1:
                         df = self.spark.createDataFrame([(1,), (-1,), (None,)], "a long")
-                        plan = self._optimized_plan(df.select(u("a")))
-                        self.assertNotIn("raise_error", plan, f"{name}: plan had raise_error")
-                        self.assertEqual(
-                            [True, False, None],
-                            [r[0] for r in df.select(u("a")).collect()],
-                            name,
-                        )
+                        projected = df.select(u("a"))
                     else:
                         df = self.spark.createDataFrame(
                             [(1, 2), (2, 1), (None, 1)], "a long, b long"
                         )
-                        plan = self._optimized_plan(df.select(u("a", "b")))
-                        self.assertNotIn("raise_error", plan, f"{name}: plan had raise_error")
-                        self.assertEqual(
-                            [True, False, None],
-                            [r[0] for r in df.select(u("a", "b")).collect()],
-                            name,
-                        )
+                        projected = df.select(u("a", "b"))
+                    self.assertNotIn("raise_error", self._optimized_plan(projected), name)
+                    self.assertEqual(0, self._eval_python_count(projected), name)
+                    self.assertEqual([True, False, None], [r[0] for r in projected.collect()], name)
 
     def test_udf_transpile_early_return_null_guard(self):
         # A 2-statement early-return pattern
@@ -2998,14 +3052,12 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.subTest(func=name):
                     u, warnings_text = self._udf_and_warnings(func, rt)
                     self.assertTrue(u.transpiled, f"{name} did not transpile: {warnings_text}")
+                    self.assertNotIn("NULL guard", warnings_text)
                     df = self.spark.createDataFrame(rows, "a long")
-                    plan = self._optimized_plan(df.select(u("a")))
-                    self.assertNotIn("raise_error", plan, f"{name}: plan had raise_error")
-                    self.assertEqual(
-                        expected,
-                        [r[0] for r in df.select(u("a")).collect()],
-                        name,
-                    )
+                    projected = df.select(u("a"))
+                    self.assertNotIn("raise_error", self._optimized_plan(projected), name)
+                    self.assertEqual(0, self._eval_python_count(projected), name)
+                    self.assertEqual(expected, [r[0] for r in projected.collect()], name)
 
     def test_udf_transpile_null_guard_warning(self):
         # When the transpiler still emits a null guard (because
@@ -3020,7 +3072,7 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 warnings.simplefilter("always")
                 u = UserDefinedFunction(unguarded_gt, BooleanType())
             null_guard_warnings = [w for w in caught if "NULL guard" in str(w.message)]
-            self.assertTrue(u.transpiled, "unguarded_gt should transpile (under strict or loose)")
+            self.assertTrue(u.transpiled)
             self.assertTrue(null_guard_warnings, "Expected a UserWarning about NULL guard")
             self.assertIn("NULL guard", str(null_guard_warnings[0].message))
 
@@ -3044,14 +3096,539 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                 with self.subTest(func=name):
                     u, warnings_text = self._udf_and_warnings(func, BooleanType())
                     self.assertTrue(u.transpiled, f"{name} did not transpile: {warnings_text}")
+                    self.assertNotIn("NULL guard", warnings_text)
                     df = self.spark.createDataFrame([("hi",), ("hello",), (None,)], "a string")
-                    plan = self._optimized_plan(df.select(u("a")))
-                    self.assertNotIn("raise_error", plan, f"{name}: plan had raise_error")
+                    projected = df.select(u("a"))
+                    self.assertNotIn("raise_error", self._optimized_plan(projected), name)
+                    self.assertEqual(0, self._eval_python_count(projected), name)
                     self.assertEqual(
                         [False, True, None],
-                        [r[0] for r in df.select(u("a")).collect()],
+                        [r[0] for r in projected.collect()],
                         name,
                     )
+
+    def test_udf_transpile_narrowing_does_not_change_branches(self):
+        def wrong_branch(x):
+            return (x > 0) if x is None else None
+
+        with self.sql_conf(_TRANSPILE_ON):
+            u = self._transpiled_udf(wrong_branch, BooleanType())
+            df = self.spark.createDataFrame([(None,)], "a long")
+            projected = df.select(u("a"))
+            self.assertIn("raise_error", self._optimized_plan(projected))
+            self.assertEqual(0, self._eval_python_count(projected))
+            with self.assertRaises(Exception) as raised:
+                projected.collect()
+            self.assertIn("cannot compare NULL", str(raised.exception))
+
+    def test_udf_transpile_len_comparison_bool_and_if(self):
+        def len_gt(s):
+            return len(s) > 3
+
+        def len_eq(s):
+            return len(s) == 3
+
+        def len_if(s):
+            if len(s) > 3:
+                return True
+            else:
+                return False
+
+        with self.sql_conf(_TRANSPILE_ON):
+            for func in (len_gt, len_eq, len_if):
+                with self.subTest(func=func.__name__):
+                    expected = [False, False] if func is len_eq else [True, False]
+                    self.assertEqual(
+                        expected,
+                        self._vals(func, BooleanType(), "s string", [("hello",), ("hi",)]),
+                    )
+            self._fallback_reason(len_gt, LongType())
+
+    def test_udf_transpile_short_circuit_and_arithmetic_narrowing(self):
+        def and_guard(x):
+            return x is not None and x > 0
+
+        def or_guard(x):
+            return x is None or x > 0
+
+        def or_early_return(a, b):
+            if a is None or b is None:
+                return None
+            return a < b
+
+        def arithmetic_guard(x):
+            return (x + 1 > 0) if x is not None else None
+
+        with self.sql_conf(_TRANSPILE_ON):
+            for func in (and_guard, or_guard):
+                with self.subTest(func=func.__name__):
+                    self.assertEqual(
+                        [True, False, func(None)],
+                        self._vals(func, BooleanType(), "x long", [(1,), (-1,), (None,)]),
+                    )
+            self.assertEqual(
+                [True, False, None, None],
+                self._vals(
+                    or_early_return,
+                    BooleanType(),
+                    "a long, b long",
+                    [(1, 2), (2, 1), (None, 1), (1, None)],
+                ),
+            )
+            self.assertEqual(
+                [True, False, None],
+                self._vals(arithmetic_guard, BooleanType(), "x long", [(1,), (-2,), (None,)]),
+            )
+            for func, schema, rows in [
+                (and_guard, "x long", [(1,), (-1,), (None,)]),
+                (or_early_return, "a long, b long", [(1, 2), (None, 1)]),
+                (arithmetic_guard, "x long", [(1,), (None,)]),
+            ]:
+                u, warnings_text = self._udf_and_warnings(func, BooleanType())
+                self.assertNotIn("NULL guard", warnings_text)
+                df = self.spark.createDataFrame(rows, schema)
+                projected = df.select(u(*df.columns))
+                self.assertNotIn("raise_error", self._optimized_plan(projected))
+                self.assertEqual(0, self._eval_python_count(projected))
+
+    def test_udf_transpile_len_comparison_repeat_count(self):
+        def repeat_len_comparison(s):
+            return s + "*" * (len(s) > 1)
+
+        def reversed_repeat_len_comparison(s):
+            return (len(s) > 1) * "*" + s
+
+        # "h" has a False count, which must repeat zero times, not give NULL.
+        rows = [("h",), ("hi",), ("hello",)]
+        with self.sql_conf(_TRANSPILE_ON):
+            for func in (repeat_len_comparison, reversed_repeat_len_comparison):
+                with self.subTest(func=func.__name__):
+                    expected = (
+                        ["h", "*hi", "*hello"]
+                        if func is reversed_repeat_len_comparison
+                        else ["h", "hi*", "hello*"]
+                    )
+                    self.assertEqual(
+                        expected,
+                        self._vals(func, StringType(), "s string", rows),
+                    )
+
+    def test_udf_transpile_null_guard_warning_is_single_and_named(self):
+        import warnings
+
+        from pyspark.sql.transpile import _transpile_func
+
+        def unguarded_gt(x):
+            return x > 0
+
+        def unguarded_len(s):
+            return len(s)
+
+        with self.sql_conf(_TRANSPILE_ON):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                u = UserDefinedFunction(unguarded_gt, BooleanType())
+            messages = [str(w.message) for w in caught if "NULL guard" in str(w.message)]
+            self.assertEqual(len(messages), 1)
+            self.assertIn("unguarded_gt", messages[0])
+            self.assertIn("ordering comparisons", messages[0])
+            self.assertTrue(u.transpiled)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                result = _transpile_func(self.spark, unguarded_gt, BooleanType())
+            self.assertEqual(len(result[0]), len(u.transpiled))
+            self.assertEqual([str(c) for c in result[0]], [str(c) for c in u.transpiled])
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message=".*NULL guard")
+                with self.assertRaises(UserWarning) as raised:
+                    UserDefinedFunction(unguarded_gt, BooleanType())
+            self.assertIn("unguarded_gt", str(raised.exception))
+            self.assertIn("ordering comparisons", str(raised.exception))
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                u = UserDefinedFunction(unguarded_len, LongType())
+            messages = [str(w.message) for w in caught if "NULL guard" in str(w.message)]
+            self.assertEqual(len(messages), 1)
+            self.assertIn("unguarded_len", messages[0])
+            self.assertIn("len()", messages[0])
+            self.assertNotIn("ordering comparisons", messages[0])
+            self.assertTrue(u.transpiled)
+
+    def test_udf_transpile_narrowing_boundaries(self):
+        def early_return_with_elif(x):
+            if x is None:
+                return None
+            elif x > 0:
+                return 1
+            return 0
+
+        def before_guard(x):
+            return x > 0 and x is not None
+
+        def true_or_branch(x, y):
+            return (x > 0) if x is None or y is None else None
+
+        def repeat_ternary(s):
+            return s + "*" * (True if s is not None else None)
+
+        with self.sql_conf(_TRANSPILE_ON):
+            u, _ = self._fallback_reason(early_return_with_elif)
+            df = self.spark.createDataFrame([(None,), (2,), (-1,)], "x long")
+            projected = df.select(u("x"))
+            self.assertGreater(self._eval_python_count(projected), 0)
+            self.assertEqual([None, 1, 0], [r[0] for r in projected.collect()])
+
+            for func, schema, rows in [
+                (before_guard, "x long", [(None,)]),
+                (true_or_branch, "x long, y long", [(None, 1)]),
+            ]:
+                with self.subTest(func=func.__name__):
+                    u = self._transpiled_udf(func, BooleanType())
+                    df = self.spark.createDataFrame(rows, schema)
+                    projected = df.select(u(*df.columns))
+                    self.assertIn("raise_error", self._optimized_plan(projected))
+                    self.assertEqual(0, self._eval_python_count(projected))
+                    with self.assertRaises(Exception) as raised:
+                        projected.collect()
+                    self.assertIn("cannot compare NULL", str(raised.exception))
+
+            self._fallback_reason(repeat_ternary, StringType())
+
+    def test_len_boolean_repeat_counts_are_limited_to_len_comparisons(self):
+        def ordinary(s: str, x: int):
+            return s * (x > 0)
+
+        def conditional(s: str, flag: bool):
+            return s * ((len(s) > 1) if flag else (len(s) > 2))
+
+        def identity(s: str):
+            return s * (len(s) is not None)
+
+        def reversed_identity(s: str):
+            return (None is not len(s)) * s
+
+        with self.sql_conf(_TRANSPILE_ON):
+            self.assertEqual(UserDefinedFunction(ordinary, StringType()).transpiled, [])
+            pudf = self._transpiled_udf(conditional, StringType())
+            df = self.spark.createDataFrame(
+                [("ab", True), ("ab", False), ("abc", False)], "s string, flag boolean"
+            )
+            projected = df.select(pudf("s", "flag"))
+            self.assertEqual(0, self._eval_python_count(projected))
+            self.assertEqual([r[0] for r in projected.collect()], ["ab", "", "abc"])
+            for func in (identity, reversed_identity):
+                repeated = df.select(self._transpiled_udf(func, StringType())("s"))
+                self.assertEqual(0, self._eval_python_count(repeated))
+                self.assertEqual([r[0] for r in repeated.collect()], ["ab", "ab", "abc"])
+
+    def test_len_boolean_chain_with_later_guard_follows_python(self):
+        # The later operand keeps its raising NULL check, and Python never reaches it on
+        # this row: the first operand is false, so the answer is False, not an error.
+        def chain(s: str, x: int):
+            return len(s) > 3 and x > 0
+
+        def identity_chain(s: str, x: int):
+            return (len(s) is None) and x > 0
+
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([("ab", None)], "s string, x bigint")
+            for func in (chain, identity_chain):
+                with self.subTest(func=func.__name__):
+                    pudf = self._transpiled_udf(func, BooleanType())
+                    projected = df.select(pudf("s", "x"))
+                    self.assertEqual(0, self._eval_python_count(projected))
+                    self.assertIn("raise_error", self._optimized_plan(projected))
+                    self.assertEqual(projected.first()[0], False)
+
+    def test_negative_narrowing_sites_preserve_none_errors(self):
+        def true_if(x: int):
+            if x is None:
+                return x > 0
+            else:
+                return None
+
+        def false_and(x: int):
+            return x is None and x > 0
+
+        def false_or(x: int):
+            return x is not None or x > 0
+
+        def reversed_else(x: int):
+            return True if None is not x else x > 0
+
+        def early_wrong(x: int):
+            if x is not None:
+                return True
+            return x > 0
+
+        def mixed_and(x: str, y: str):
+            return True if x is not None and y is None else len(y) > 0
+
+        def mixed_or(x: str, y: str):
+            return len(x) > 0 if x is not None or y is None else False
+
+        def post_ternary(x: str):
+            return (0 if x is None else len(x)) + len(x)
+
+        def arithmetic(x: int, y: int):
+            return (x + y > 0) if x is not None else None
+
+        def and_none_test(x: int, y: int):
+            return None if x is None and y is None else x < y
+
+        def early_and_none(x: int, y: int):
+            if x is None and y is None:
+                return None
+            return x < y
+
+        with self.sql_conf(_TRANSPILE_ON):
+            cases = [
+                (true_if, "x bigint", [(None,)], "cannot compare NULL"),
+                (false_and, "x bigint", [(None,)], "cannot compare NULL"),
+                (false_or, "x bigint", [(None,)], "cannot compare NULL"),
+                (reversed_else, "x bigint", [(None,)], "cannot compare NULL"),
+                (early_wrong, "x bigint", [(None,)], "cannot compare NULL"),
+                (mixed_and, "x string, y string", [(None, None)], "len"),
+                (mixed_or, "x string, y string", [(None, None)], "len"),
+                (post_ternary, "x string", [(None,)], "len"),
+                (arithmetic, "x bigint, y bigint", [(1, None)], "cannot compare NULL"),
+                (and_none_test, "x bigint, y bigint", [(None, 1)], "cannot compare NULL"),
+                (early_and_none, "x bigint, y bigint", [(None, 1)], "cannot compare NULL"),
+            ]
+            for func, schema, rows, error in cases:
+                with self.subTest(func=func.__name__):
+                    return_type = LongType() if func is post_ternary else BooleanType()
+                    pudf = self._transpiled_udf(func, return_type)
+                    df = self.spark.createDataFrame(rows, schema)
+                    projected = df.select(pudf(*df.columns))
+                    self.assertEqual(0, self._eval_python_count(projected))
+                    self.assertIn("raise_error", self._optimized_plan(projected))
+                    with self.assertRaises(Exception) as raised:
+                        projected.collect()
+                    self.assertIn(error, str(raised.exception))
+
+    def test_udf_transpile_len_boolean_chain_guards(self):
+        def guarded_chain(s):
+            return s is not None and len(s) > 3 and len(s) < 10
+
+        def guarded_or_chain(s):
+            return s is None or len(s) < 3 or len(s) > 10
+
+        def unguarded_chain(x, s):
+            return x > 0 and len(s) > 3 and len(s) < 10
+
+        def guarded_gt(s):
+            return s is not None and len(s) > 3
+
+        def guarded_lt(s):
+            return s is not None and len(s) < 10
+
+        with self.sql_conf(_TRANSPILE_ON):
+            rows = [("hello",), ("hi",), ("this is long",), (None,)]
+            self.assertEqual(
+                [True, False, False, False],
+                self._vals(guarded_chain, BooleanType(), "s string", rows),
+            )
+            self.assertEqual(
+                [False, True, True, True],
+                self._vals(guarded_or_chain, BooleanType(), "s string", rows),
+            )
+            df = self.spark.createDataFrame(rows, "s string")
+
+        with self.sql_conf(_TRANSPILE_ON):
+            gt = self._transpiled_udf(guarded_gt, BooleanType())
+            lt = self._transpiled_udf(guarded_lt, BooleanType())
+            projected = df.select(gt("s"), lt("s"))
+            self.assertEqual(0, self._eval_python_count(projected))
+            self.assertEqual(
+                [(True, True), (False, True), (True, False), (False, False)],
+                [tuple(row) for row in projected.collect()],
+            )
+
+            u, warnings_text = self._udf_and_warnings(unguarded_chain, BooleanType())
+            self.assertTrue(u.transpiled, warnings_text)
+            self.assertIn("NULL guards for len() and ordering comparisons", warnings_text)
+            df = self.spark.createDataFrame([(0, None), (1, "hello")], "x long, s string")
+            projected = df.select(u("x", "s"))
+            self.assertEqual(0, self._eval_python_count(projected))
+            # (0, None): Python stops at `x > 0`. The NULL check of `len(s)` sits in both
+            # later operands, where a plain AND would have it computed up front.
+            self.assertEqual([False, True], [r[0] for r in projected.collect()])
+
+    def test_udf_transpile_short_circuit_keeps_later_raising_operands_lazy(self):
+        # Python does not evaluate an operand the earlier ones already decided, and a UDF
+        # may rely on that to stay clear of an error. AND / OR promise no such order: a
+        # subexpression repeated across their operands is computed up front, for every
+        # row. Each body below repeats one that can raise.
+        def and_len_twice(x, s):
+            return x > 0 and len(s) > 3 and len(s) < 10
+
+        def or_len_twice(x, s):
+            return x > 0 or len(s) > 3 or len(s) < 2
+
+        def and_mod_twice(x, y):
+            return y != 0 and x % y > 1 and x % y < 5
+
+        for func, schema, rows in [
+            (and_len_twice, "x long, s string", [(0, None), (1, "hello"), (1, "hi")]),
+            (or_len_twice, "x long, s string", [(1, None), (0, "hello"), (0, "hi")]),
+            (and_mod_twice, "x long, y long", [(7, 0), (7, 4), (7, 2)]),
+        ]:
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    [func(*row) for row in rows],
+                    self._vals(func, BooleanType(), schema, rows),
+                )
+
+    def test_udf_transpile_short_circuit_without_a_raise_stays_and_or(self):
+        # Operands that cannot raise need no particular order, so they keep the AND / OR
+        # the optimizer can split and push.
+        def both_set(a, b):
+            return a is not None and b is not None
+
+        def either_unset(a, b):
+            return a is None or b is None
+
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1, None), (3, 2)], "a long, b long")
+            for func, expected in [(both_set, [False, True]), (either_unset, [True, False])]:
+                with self.subTest(func=func.__name__):
+                    u = self._transpiled_udf(func, BooleanType())
+                    projected = df.select(u("a", "b"))
+                    self.assertEqual(0, self._eval_python_count(projected))
+                    self.assertNotIn("CASE WHEN", self._optimized_plan(projected))
+                    self.assertEqual(expected, [r[0] for r in projected.collect()])
+
+    def test_udf_transpile_short_circuit_under_loose_null_strictness(self):
+        # Loose mode drops the comparison's raise, so a NULL operand yields NULL. `len`
+        # keeps its check, which makes the chain conditional: a NULL first operand is
+        # falsy, as None is in Python, and the chain's answer is that operand.
+        def gt_and_len(x, s):
+            return x > 0 and len(s) > 3
+
+        def gt_or_len(x, s):
+            return x > 0 or len(s) > 3
+
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpileNullStrictness": "loose"}):
+            self.assertEqual(
+                [None, None, False, True],
+                self._vals(
+                    gt_and_len,
+                    BooleanType(),
+                    "x long, s string",
+                    [(None, None), (None, "hello"), (0, None), (1, "hello")],
+                ),
+            )
+            # A NULL first operand is falsy, so the `or` goes on to its second.
+            self.assertEqual(
+                [True, False, True],
+                self._vals(
+                    gt_or_len,
+                    BooleanType(),
+                    "x long, s string",
+                    [(None, "hello"), (0, "hi"), (1, None)],
+                ),
+            )
+
+    def test_udf_transpile_ordering_follows_python_on_nan(self):
+        # Python answers False to every ordering comparison with a NaN operand; Spark
+        # orders NaN above every other value and equal to itself.
+        def gt(x, y):
+            return x > y
+
+        def ge(x, y):
+            return x >= y
+
+        def lt(x, y):
+            return x < y
+
+        def le(x, y):
+            return x <= y
+
+        nan = float("nan")
+        rows = [(nan, 1.0), (1.0, nan), (nan, nan), (2.0, 1.0), (1.0, 2.0), (1.0, 1.0)]
+        for func in (gt, ge, lt, le):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    [func(x, y) for x, y in rows],
+                    self._vals(func, BooleanType(), "x double, y double", rows),
+                )
+
+    def test_udf_transpile_nan_comparison_in_control_flow(self):
+        def early_return_gt(x):
+            if x > 0:
+                return 1
+            return 0
+
+        def ternary_gt(x):
+            return 1 if x > 0 else 0
+
+        def len_and_gt(s, x):
+            return len(s) > 3 and x > 0.5
+
+        def gt_and_len(s, x):
+            return x > 0.5 and len(s) > 3
+
+        def gt_or_len(s, x):
+            return x > 0.5 or len(s) > 3
+
+        nan = float("nan")
+        for func in (early_return_gt, ternary_gt):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    [0, 1, 0],
+                    self._vals(func, LongType(), "a double", [(nan,), (2.0,), (-3.0,)]),
+                )
+        self.assertEqual(
+            [False, True, False],
+            self._vals(
+                len_and_gt,
+                BooleanType(),
+                "s string, x double",
+                [("hello", nan), ("hello", 1.0), ("hi", nan)],
+            ),
+        )
+        # NaN is not greater than 0.5, so the `and` never reaches `len(None)` ...
+        self.assertEqual(
+            [False, False, True],
+            self._vals(
+                gt_and_len,
+                BooleanType(),
+                "s string, x double",
+                [(None, nan), ("hello", nan), ("hello", 1.0)],
+            ),
+        )
+        # ... and the `or` does, where Spark's own ordering would have answered True.
+        with self.sql_conf(_TRANSPILE_ON):
+            u = self._transpiled_udf(gt_or_len, BooleanType())
+            df = self.spark.createDataFrame([(None, nan)], "s string, x double")
+            projected = df.select(u("s", "x"))
+            self.assertEqual(0, self._eval_python_count(projected))
+            with self.assertRaises(Exception) as raised:
+                projected.collect()
+            self.assertIn("cannot call len() on NULL", str(raised.exception))
+
+    def test_udf_transpile_nan_test_only_where_a_nan_is_possible(self):
+        # An integer cannot be NaN and neither can a length, so their comparisons keep
+        # the plain form; only a column that can hold a NaN pays for the test.
+        def gt(x, y):
+            return x > y
+
+        def len_gt(s):
+            return len(s) > 3
+
+        with self.sql_conf(_TRANSPILE_ON):
+            u = self._transpiled_udf(gt, BooleanType())
+            longs = self.spark.createDataFrame([(2, 1)], "x long, y long")
+            self.assertNotIn("isnan", self._optimized_plan(longs.select(u("x", "y"))).lower())
+            doubles = self.spark.createDataFrame([(2.0, 1.0)], "x double, y double")
+            self.assertIn("isnan", self._optimized_plan(doubles.select(u("x", "y"))).lower())
+            u = self._transpiled_udf(len_gt, BooleanType())
+            strings = self.spark.createDataFrame([("hello",)], "s string")
+            self.assertNotIn("isnan", self._optimized_plan(strings.select(u("s"))).lower())
 
 
 if __name__ == "__main__":

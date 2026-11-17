@@ -271,6 +271,11 @@ class UserDefinedFunction:
                 value = session.conf.get(key, default)
             return value is not None and value.lower() == "true"
 
+        # Filled in by the transpiler and warned about below, outside the handler:
+        # a warning raised in there (warnings-as-errors) would be taken for a failure
+        # to transpile and silently cost the UDF its lowered options.
+        unknown_transpilers: list[str] = []
+        guarded_constructs: list[str] = []
         try:
             transpile_enabled = (
                 deterministic
@@ -296,7 +301,7 @@ class UserDefinedFunction:
                 transpile_enabled = False
             if transpile_enabled and session:
                 # Import only if needed, also avoid circular import loops.
-                from pyspark.sql.transpile import _transpile_func
+                from pyspark.sql.transpile import AbstractTranspiler, _transpile_func
 
                 # ``self.returnType`` parses (and caches) the declared return
                 # type; the transpiler needs the parsed form to decide whether
@@ -308,6 +313,8 @@ class UserDefinedFunction:
                     self._transpiled_param_names,
                     self._transpiled_input_categories,
                     positional_only,
+                    unknown_transpilers,
+                    guarded_constructs,
                 ) = _transpile_func(session, func, self.returnType)
                 self._positional_only_param_names = frozenset(positional_only)
                 if not self.transpiled:
@@ -329,6 +336,22 @@ class UserDefinedFunction:
             self._transpiled_param_names = []
             self._transpiled_input_categories = []
             self._positional_only_param_names = frozenset()
+            guarded_constructs = []
+        if unknown_transpilers:
+            warnings.warn(
+                f"Ignoring unknown transpilers {unknown_transpilers} in "
+                "spark.sql.experimental.optimizer.pyTranspilers; registered transpilers are "
+                f"{sorted(AbstractTranspiler.varieties)}"
+            )
+        if guarded_constructs:
+            constructs = " and ".join(guarded_constructs)
+            warnings.warn(
+                f"Python UDF {func}: its transpiled form includes NULL guards for "
+                f"{constructs}. They raise when the transpiled form runs on NULL "
+                "input. Add `is not None` guards around these operations or filter "
+                "NULLs upstream.",
+                UserWarning,
+            )
 
     @staticmethod
     def _check_return_type(returnType: DataType, evalType: int) -> None:
