@@ -3472,16 +3472,62 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def and_mod_twice(x, y):
             return y != 0 and x % y > 1 and x % y < 5
 
+        # The repeat count is cast to int, which overflows past 2**31 - 1.
+        def and_repeat_twice(x: int, n: int, s: str, t: str):
+            return x > 0 and "a" * n == s and "a" * n != t
+
         for func, schema, rows in [
             (and_len_twice, "x long, s string", [(0, None), (1, "hello"), (1, "hi")]),
             (or_len_twice, "x long, s string", [(1, None), (0, "hello"), (0, "hi")]),
             (and_mod_twice, "x long, y long", [(7, 0), (7, 4), (7, 2)]),
+            (
+                and_repeat_twice,
+                "x long, n long, s string, t string",
+                [(0, 3000000000, "a", "b"), (1, 2, "aa", "b"), (1, 2, "ab", "b")],
+            ),
         ]:
             with self.subTest(func=func.__name__):
                 self.assertEqual(
                     [func(*row) for row in rows],
                     self._vals(func, BooleanType(), schema, rows),
                 )
+
+    def test_udf_transpile_short_circuit_returns_a_none_operand(self):
+        # `A and B` is `B if A else A` and `A or B` is `A if A else B`, so a None operand is
+        # either the answer or passed over. SQL disagrees on both: NULL AND false is false,
+        # and NULL OR false is NULL.
+        def none_and(x, y, s):
+            return (True if x > 0 else None) and y is not None and len(s) > 0
+
+        def none_and_plain(x, y):
+            return (True if x > 0 else None) and y is not None
+
+        def none_or(x, y):
+            return (None if x > 0 else False) or y is not None
+
+        for func, schema, rows, expected in [
+            (
+                none_and,
+                "x long, y long, s string",
+                [(-1, None, None), (1, None, None), (1, 2, "a"), (1, 2, ""), (-1, 2, "abc")],
+                [None, False, True, False, None],
+            ),
+            (
+                none_and_plain,
+                "x long, y long",
+                [(-1, None), (-1, 5), (1, None), (1, 5)],
+                [None, None, False, True],
+            ),
+            (
+                none_or,
+                "x long, y long",
+                [(1, None), (1, 5), (-1, None), (-1, 5)],
+                [False, True, False, True],
+            ),
+        ]:
+            with self.subTest(func=func.__name__):
+                self.assertEqual([func(*row) for row in rows], expected)
+                self.assertEqual(expected, self._vals(func, BooleanType(), schema, rows))
 
     def test_udf_transpile_short_circuit_without_a_raise_stays_and_or(self):
         # Operands that cannot raise need no particular order, so they keep the AND / OR

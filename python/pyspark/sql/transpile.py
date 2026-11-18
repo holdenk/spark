@@ -54,7 +54,9 @@ operand Python might skip could raise -- a NULL check, or arithmetic that can
 overflow or divide by zero -- that operand is lowered into a branch of a
 ``CASE WHEN`` rather than under ``AND`` / ``OR``, which do not promise an
 evaluation order: a subexpression repeated across their operands is computed up
-front, for every row. Operands that cannot raise still lower to ``AND`` / ``OR``.
+front, for every row. The same goes for what follows an operand that can be
+``None``, since ``None and b`` is ``None`` in Python where ``NULL AND false`` is
+``false``. Everything else still lowers to ``AND`` / ``OR``.
 
 A lambda is lowered only when its source names it directly and alone: bind it
 to a name (``f = lambda x: x + 1``, annotated if you like) and give it a line
@@ -117,7 +119,17 @@ import sys
 import textwrap
 import threading
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from pyspark.errors import UnsupportedOperationException
 from pyspark.sql.column import Column
@@ -310,6 +322,40 @@ def _is_literal_number(node: ast.AST) -> bool:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         node = node.operand
     return isinstance(node, ast.Constant)
+
+
+def _boolean_may_be_none(node: ast.AST) -> bool:
+    """Whether Python can evaluate boolean ``node`` to ``None``, as opposed to raising.
+
+    A comparison or a ``not`` gives a ``bool`` or raises; a ternary gives whatever its
+    arms give, and ``and`` / ``or`` return one of their operands. This is narrower
+    than "its column can be NULL": under ``transpileNullStrictness=loose`` a
+    comparison's column is NULL exactly where Python would have raised, and there is
+    no Python answer to preserve there.
+    """
+    match node:
+        case ast.Constant(value=value):
+            return value is None
+        case ast.Compare() | ast.UnaryOp(op=ast.Not()):
+            return False
+        case ast.BoolOp(values=values):
+            return any(_boolean_may_be_none(value) for value in values)
+        case ast.IfExp(body=body, orelse=orelse):
+            return _boolean_may_be_none(body) or _boolean_may_be_none(orelse)
+        case _:
+            return True
+
+
+class _Operand(NamedTuple):
+    """One lowered operand of an ``and`` / ``or`` chain, and what is known of it."""
+
+    column: Column
+    #: Evaluating it can raise at runtime.
+    may_raise: bool
+    #: Its column can be NULL.
+    may_be_null: bool
+    #: Python can evaluate it to ``None`` -- see ``_boolean_may_be_none``.
+    may_be_none: bool
 
 
 def _null_narrowed(params: List[str], test_node: ast.AST) -> Tuple[frozenset, frozenset]:
@@ -691,7 +737,8 @@ class CatalystTranspiler(AbstractTranspiler):
         Only ``_lower_short_circuit`` asks, to decide what an ``and`` returns when
         an earlier operand is not true. Every ``False`` is a proof and the
         catch-all is ``True``: a missed proof costs a repeated operand, a wrong
-        one turns a ``None`` result into ``False``.
+        one turns a NULL result into ``False``. Wider than
+        ``_boolean_may_be_none``, which leaves out the loose comparisons.
         """
         match node:
             case ast.Constant(value=value):
@@ -714,12 +761,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 return True
 
     @staticmethod
-    def _lower_short_circuit(
-        cols: List[Column],
-        may_raise: List[bool],
-        may_be_null: List[bool],
-        conjunction: bool,
-    ) -> Column:
+    def _lower_short_circuit(operands: List[_Operand], conjunction: bool) -> Column:
         """Combine the lowered operands of an ``and`` (``conjunction``) or ``or`` chain.
 
         Python evaluates an operand only when the ones before it left the result
@@ -731,29 +773,41 @@ class CatalystTranspiler(AbstractTranspiler):
         and len(s) < 10`` -- is computed up front for every row, and raises on
         rows Python never reaches.
 
-        So the operands are joined with ``&`` / ``|`` only up to the first later
-        one that may raise (``may_raise``). From there the rest of the chain sits
-        in a ``CASE WHEN`` branch, taken only when the operands before it leave
-        the result open -- the one place Catalyst evaluates lazily. The first
-        operand always runs, so it never needs this.
+        Nor do they agree with Python on an operand that is ``None``: Python's
+        ``None and b`` is ``None`` and ``None or b`` is ``b``, where SQL's ``NULL
+        AND false`` is ``false`` and ``NULL OR false`` is ``NULL``.
+
+        So the operands are joined with ``&`` / ``|`` only up to the first one
+        that may raise, or that follows one Python can evaluate to ``None``. From
+        there the rest of the chain sits in a ``CASE WHEN`` branch, taken only
+        when the operands before it leave the result open -- the one place
+        Catalyst evaluates lazily, and one that reads NULL as falsy the way
+        Python reads ``None``. The first operand always runs, so it is never
+        moved for what it may raise.
 
         ``A and B`` is ``B if A else A`` and ``A or B`` is ``A if A else B``, so
         they become ``CASE WHEN A THEN B ELSE A END`` and ``CASE WHEN A THEN true
-        ELSE B END``. Where ``A`` cannot be NULL (``may_be_null``) the ``ELSE A``
-        is simply ``false``, which spares repeating ``A``.
+        ELSE B END``. Where ``A`` cannot be NULL the ``ELSE A`` is simply
+        ``false``, which spares repeating ``A``.
         """
-        split = next((i for i in range(1, len(cols)) if may_raise[i]), len(cols))
-        result = cols[0]
-        for c in cols[1:split]:
-            result = result & c if conjunction else result | c
-        if split == len(cols):
-            return result
-        rest = CatalystTranspiler._lower_short_circuit(
-            cols[split:], may_raise[split:], may_be_null[split:], conjunction
+        split = next(
+            (
+                i
+                for i in range(1, len(operands))
+                if operands[i].may_raise or operands[i - 1].may_be_none
+            ),
+            len(operands),
         )
+        result = operands[0].column
+        for operand in operands[1:split]:
+            result = result & operand.column if conjunction else result | operand.column
+        if split == len(operands):
+            return result
+        rest = CatalystTranspiler._lower_short_circuit(operands[split:], conjunction)
         if not conjunction:
             return when(result, lit(True)).otherwise(rest)
-        return when(result, rest).otherwise(result if any(may_be_null[:split]) else lit(False))
+        falsy = result if any(o.may_be_null for o in operands[:split]) else lit(False)
+        return when(result, rest).otherwise(falsy)
 
     def _category(self, params: List[str], node: ast.AST) -> str:
         """Infer the scalar category of ``node`` under the current
@@ -983,9 +1037,7 @@ class CatalystTranspiler(AbstractTranspiler):
                 # Python reaches operand `i` only when every earlier one was truthy
                 # (`and`) or falsy (`or`), so each is lowered knowing what the ones
                 # before it proved: `x is not None and x > 0` needs no NULL check.
-                cols: List[Column] = []
-                may_raise: List[bool] = []
-                may_be_null: List[bool] = []
+                operands: List[_Operand] = []
                 saved_nonnull = self._nonnull_params
                 try:
                     for index, value in enumerate(values):
@@ -994,13 +1046,19 @@ class CatalystTranspiler(AbstractTranspiler):
                             narrowed = _null_narrowed(params, values[index - 1])
                             self._nonnull_params |= narrowed[0 if conjunction else 1]
                         raising_before = self._may_raise_count
-                        cols.append(self._convert_chunk(params, value))
-                        may_raise.append(self._may_raise_count > raising_before)
-                        # Asked here, while what the earlier operands proved still holds.
-                        may_be_null.append(self._boolean_may_be_null(params, value))
+                        column = self._convert_chunk(params, value)
+                        operands.append(
+                            _Operand(
+                                column,
+                                may_raise=self._may_raise_count > raising_before,
+                                # Asked here, while what the earlier operands proved holds.
+                                may_be_null=self._boolean_may_be_null(params, value),
+                                may_be_none=_boolean_may_be_none(value),
+                            )
+                        )
                 finally:
                     self._nonnull_params = saved_nonnull
-                return self._lower_short_circuit(cols, may_raise, may_be_null, conjunction)
+                return self._lower_short_circuit(operands, conjunction)
             case ast.IfExp(test=test, body=body_expr, orelse=orelse_expr):
                 # Ternary `body if test else orelse` -- shares the
                 # NULL-as-falsy lowering with the if-statement case.
@@ -1127,15 +1185,21 @@ class CatalystTranspiler(AbstractTranspiler):
                     case ast.Mult():
                         if _is_numeric_cat(lc) and _is_numeric_cat(rc):
                             return left_col.__mul__(right_col)
+                        # The count is cast to int, which overflows under ANSI for a
+                        # count past 2**31 - 1; a boolean count cannot.
                         if lc == "string" and (
                             rc in ("integer", "numeric")
                             or (rc == "bool" and _is_len_comparison_count(right))
                         ):
+                            if rc != "bool":
+                                self._may_raise_count += 1
                             return repeat(left_col, right_col.cast("int"))
                         if rc == "string" and (
                             lc in ("integer", "numeric")
                             or (lc == "bool" and _is_len_comparison_count(left))
                         ):
+                            if lc != "bool":
+                                self._may_raise_count += 1
                             return repeat(right_col, left_col.cast("int"))
                     case ast.Mod():
                         if _is_numeric_cat(lc) and _is_numeric_cat(rc):
