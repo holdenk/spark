@@ -633,7 +633,9 @@ class CatalystTranspiler(AbstractTranspiler):
         right_col = self._convert_chunk(params, right_node)
         compared = op(left_col, right_col)
         if _is_numeric_cat(lc) and _is_numeric_cat(rc) and not (lc == rc == "integer"):
-            compared = when(isnan(left_col) | isnan(right_col), lit(False)).otherwise(compared)
+            # Checked after the comparison, so both operands still run and NULL stays NULL.
+            not_nan = ~(isnan(left_col) | isnan(right_col))
+            compared = when(compared, not_nan).otherwise(compared)
         if self._is_nonnull_node(params, left_node) and self._is_nonnull_node(params, right_node):
             return compared
         if self._null_strictness == "loose":
@@ -886,12 +888,10 @@ class CatalystTranspiler(AbstractTranspiler):
                 if later_raises:
                     # AND / OR may evaluate a repeated subexpression up front (subexpression
                     # elimination) and raise on a row Python skips; CASE WHEN is lazy.
+                    # A NULL operand (loose mode) stays NULL.
                     result = cols[-1]
                     for c in reversed(cols[:-1]):
-                        if is_and:
-                            result = when(c, result).otherwise(lit(False))
-                        else:
-                            result = when(c, lit(True)).otherwise(result)
+                        result = when(c if is_and else ~c, result).otherwise(c)
                     return result
                 if isinstance(op, ast.And):
                     result = cols[0]

@@ -3107,6 +3107,10 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def le(x, y):
             return x <= y
 
+        # The NaN check must not hide an error in the other operand.
+        def gt_mod(x, y, z):
+            return x > (y % z) if x is not None and y is not None and z is not None else False
+
         nan = float("nan")
         rows = [(nan, 1.0), (1.0, nan), (nan, nan), (2.0, 1.0), (1.0, 2.0)]
         for func in (gt, le):
@@ -3115,6 +3119,33 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     [func(*r) for r in rows],
                     self._vals(func, BooleanType(), "x double, y double", rows),
                 )
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(nan, 7, 0)], "x double, y long, z long")
+            u = self._transpiled_udf(gt_mod, BooleanType())
+            with self.assertRaisesRegex(Exception, "REMAINDER_BY_ZERO"):
+                df.select(u("x", "y", "z")).collect()
+
+    def test_udf_transpile_loose_keeps_null(self):
+        # SPARK-61913: in loose mode a NULL operand stays NULL through the NaN guard and
+        # through an `and` / `or` whose later operand can raise.
+        def gt(x, y):
+            return x > y
+
+        def and_chain(x, y):
+            return x > 0 and y + 1 > 0
+
+        def or_chain(x, y):
+            return x > 0 or y + 1 > 0
+
+        nan = float("nan")
+        with self.sql_conf({"spark.sql.experimental.optimizer.transpileNullStrictness": "loose"}):
+            for func, schema, rows, expected in [
+                (gt, "x double, y double", [(nan, None), (nan, 1.0)], [None, False]),
+                (and_chain, "x long, y long", [(None, 1), (0, None)], [None, False]),
+                (or_chain, "x long, y long", [(None, -2), (1, None)], [None, True]),
+            ]:
+                with self.subTest(func=func.__name__):
+                    self.assertEqual(expected, self._vals(func, BooleanType(), schema, rows))
 
     def test_udf_transpile_and_or_skip_what_python_skips(self):
         # SPARK-61913: a subexpression repeated in later operands (len's NULL guard, the
