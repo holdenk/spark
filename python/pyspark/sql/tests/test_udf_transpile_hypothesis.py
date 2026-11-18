@@ -68,6 +68,7 @@ from pyspark.sql import Row
 from pyspark.sql.types import (
     BooleanType,
     LongType,
+    StringType,
     StructField,
     StructType,
 )
@@ -143,6 +144,25 @@ if _have_hypothesis:
 
     _bool_strategy = st.one_of(st.none(), st.booleans())
 
+    # Case mappings come from CPython's Unicode database on the interpreted
+    # side and from ICU on the transpiled side, and the two can ship different
+    # Unicode versions (e.g. U+019B gained an uppercase in Unicode 16). The
+    # ``upper`` / ``lower`` tests therefore draw from Basic Latin through Latin
+    # Extended-A, whose case mappings are long stable, plus the Greek sigmas
+    # for the context-sensitive final-sigma rule (SPARK-59816).
+    _case_str_strategy = st.one_of(
+        st.none(),
+        st.text(st.one_of(st.characters(max_codepoint=0x17F), st.sampled_from("Σσς"))),
+    )
+    _str_strategy = st.one_of(st.none(), st.text())
+    # Independent strings only match ``startswith`` / ``endswith`` by chance,
+    # so two of the three arms build ``p`` as a prefix or a suffix of ``s``.
+    _str_pair_strategy = st.one_of(
+        st.tuples(_str_strategy, _str_strategy),
+        st.tuples(st.text(), st.text()).map(lambda t: (t[0] + t[1], t[0])),
+        st.tuples(st.text(), st.text()).map(lambda t: (t[0] + t[1], t[1])),
+    )
+
     # 32-bit signed boundaries. Values round-trip through LongType, but the
     # int32 limits are where narrowing / off-by-one bugs in parameter-index
     # plumbing and boundary handling tend to hide, so we always seed them.
@@ -205,6 +225,39 @@ if _have_hypothesis:
         (_LONG_BOUND, 1),
         (1, -_LONG_BOUND),
     )
+    # NULL, empty, both cases, and the two full-mapping cases the unit test
+    # pins: sharp s (one char uppercases to two) and final sigma.
+    _STR_EDGES = (None, "", "abc", "ABC", "straße", "ΟΔΟΣ")
+    # NULL combinations plus empty, proper, and longer-than-receiver affixes.
+    _STR_PAIR_EDGES = (
+        (None, None),
+        (None, "a"),
+        ("a", None),
+        ("", ""),
+        ("abc", ""),
+        ("abc", "ab"),
+        ("abc", "bc"),
+        ("ab", "abc"),
+    )
+
+    # Triple edges for the chained-comparison tests, pulled from the
+    # single-value edges above. A chain short-circuits, so the NULL patterns
+    # -- which position holds the None -- are the point; the boundary orderings
+    # probe sign/overflow at the type's edges.
+    _LONG_TRIPLE_EDGES = (
+        # NULL position: which link's guard fires -- or is short-circuited past
+        # -- depends on where the None sits.
+        (None, None, None),
+        (None, 0, 1),
+        (0, None, 1),
+        (0, 1, None),
+        (1, 0, None),  # first link false -> None never reached
+        # Boundary orderings.
+        (0, 1, 7),
+        (7, 1, 0),
+        (_INT32_MIN, 0, _INT32_MAX),
+        (-_LONG_BOUND, 0, _LONG_BOUND),
+    )
 
     def _seed_examples(values, key="value"):
         """Stack one ``@example`` decorator per seed value."""
@@ -216,13 +269,19 @@ if _have_hypothesis:
 
         return wrapper
 
-    def _seed_pair_examples(pairs, keys=("x", "y")):
+    def _seed_tuple_examples(tuples, keys=("x", "y", "z")):
+        """Stack one ``@example`` decorator per seed tuple, zipped onto ``keys``."""
+
         def wrapper(method):
-            for v0, v1 in reversed(pairs):
-                method = example(**{keys[0]: v0, keys[1]: v1})(method)
+            for values in reversed(tuples):
+                method = example(**dict(zip(keys, values)))(method)
             return method
 
         return wrapper
+
+    def _seed_pair_examples(pairs, keys=("x", "y")):
+        """Two-argument ``_seed_tuple_examples``."""
+        return _seed_tuple_examples(pairs, keys)
 
 
 # ---- The UDF templates we exercise --------------------------------------
@@ -231,6 +290,11 @@ if _have_hypothesis:
 # (the transpiler reads source via inspection). They are deliberately written
 # the way a user would: idiomatic Python, including ``if x is not None``
 # guards and bare ``if x:`` truthiness checks.
+#
+# An annotation pins the input category, not nullability. These tests bind Long
+# columns, so typing comparison inputs removes unused float and string variants:
+# a three-parameter chain keeps one option instead of nine. Strategies still
+# generate None, and the two Spark jobs per example dominate the runtime.
 
 
 def plus_four(x):
@@ -341,6 +405,57 @@ def eq_pair(x, y):
 def neq_pair(x, y):
     # Sister of ``eq_pair`` for ast.Compare(NotEq).
     return x != y
+
+
+def chained_bounds(x: int) -> bool:
+    # Single-parameter chained comparison: ``ast.Compare`` with two ops, which
+    # Python evaluates as ``(0 < x) and (x < 10)`` with ``x`` evaluated once. No
+    # None guard, so a NULL input reaches the first link's raise guard, matching
+    # Python's TypeError; ``_run``'s "both raised" equivalence covers that.
+    return 0 < x < 10
+
+
+def chained_lt(x: int, y: int, z: int) -> bool:
+    # Three-column ordering chain. The interesting rows are the ones where an
+    # earlier link is False and a later operand is NULL: Python short-circuits
+    # and returns False without ever comparing against the NULL, so the
+    # transpiled form must not raise there either.
+    return x < y < z
+
+
+def chained_eq(x: int, y: int, z: int) -> bool:
+    # Equality never raises in Python, so every NULL pattern has a defined
+    # answer -- the strongest NULL probe of the chained lowering, with no "both
+    # raised" escape hatch to hide a divergence.
+    return x == y == z
+
+
+def mixed_chain(x: int, y: int, z: int) -> bool:
+    # Mixed operators in one chain (``ast.LtE`` then ``ast.Gt``), so the links
+    # disagree on direction and short-circuit on different rows again.
+    return x <= y > z
+
+
+def str_upper(s):
+    # Exercises str.upper (SPARK-59816). No None guard, so a NULL input runs
+    # through the transpiler's raise guard and Python's AttributeError.
+    return s.upper()
+
+
+def str_lower(s):
+    # Sister of ``str_upper`` for str.lower.
+    return s.lower()
+
+
+def str_startswith(s, p):
+    # Exercises str.startswith (SPARK-59816) with a column prefix, so a NULL
+    # on either side runs through the raise guard.
+    return s.startswith(p)
+
+
+def str_endswith(s, p):
+    # Sister of ``str_startswith`` for str.endswith.
+    return s.endswith(p)
 
 
 # A lambda captured at module scope so ``inspect.getsource`` can read
@@ -465,6 +580,9 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             ]
         )
         return self.spark.createDataFrame([Row(a=x, b=y)], schema=schema)
+
+    def _three_long_arg_df(self, x, y, z):
+        return self.spark.createDataFrame([(x, y, z)], "a long, b long, c long")
 
     if _have_hypothesis:
 
@@ -663,6 +781,84 @@ class UDFTranspileHypothesisTests(ReusedSQLTestCase):
             df = self._single_arg_df(value, LongType())
             transpiled, interpreted = self._run(lambda_plus_four, LongType(), df, "a")
             self.assertEqual(transpiled, interpreted, f"lambda_plus_four mismatch on {value!r}")
+
+        # ---- Chained comparisons ----------------------------------------
+        #
+        # Python's ``a OP b OP c`` short-circuits, so a NULL operand the second
+        # link would have touched must not raise. ``_run`` catches the dangerous
+        # direction: the transpiled form raising where interpreted Python does
+        # not. It tolerates the reverse, which test_udf_transpile_unit.py pins
+        # explicitly instead.
+
+        @_hyp_settings
+        @given(value=_long_strategy)
+        @_seed_examples(_LONG_EDGES)
+        def test_chained_bounds_matches_python(self, value):
+            df = self._single_arg_df(value, LongType())
+            transpiled, interpreted = self._run(chained_bounds, BooleanType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"chained_bounds mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy, z=_long_strategy)
+        @_seed_tuple_examples(_LONG_TRIPLE_EDGES)
+        def test_chained_lt_matches_python(self, x, y, z):
+            df = self._three_long_arg_df(x, y, z)
+            transpiled, interpreted = self._run(chained_lt, BooleanType(), df, "a", "b", "c")
+            self.assertEqual(
+                transpiled, interpreted, f"chained_lt mismatch on ({x!r}, {y!r}, {z!r})"
+            )
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy, z=_long_strategy)
+        @_seed_tuple_examples(_LONG_TRIPLE_EDGES)
+        def test_chained_eq_matches_python(self, x, y, z):
+            df = self._three_long_arg_df(x, y, z)
+            transpiled, interpreted = self._run(chained_eq, BooleanType(), df, "a", "b", "c")
+            self.assertEqual(
+                transpiled, interpreted, f"chained_eq mismatch on ({x!r}, {y!r}, {z!r})"
+            )
+
+        @_hyp_settings
+        @given(x=_long_strategy, y=_long_strategy, z=_long_strategy)
+        @_seed_tuple_examples(_LONG_TRIPLE_EDGES)
+        def test_mixed_chain_matches_python(self, x, y, z):
+            df = self._three_long_arg_df(x, y, z)
+            transpiled, interpreted = self._run(mixed_chain, BooleanType(), df, "a", "b", "c")
+            self.assertEqual(
+                transpiled, interpreted, f"mixed_chain mismatch on ({x!r}, {y!r}, {z!r})"
+            )
+
+        @_hyp_settings
+        @given(value=_case_str_strategy)
+        @_seed_examples(_STR_EDGES)
+        def test_str_upper_matches_python(self, value):
+            df = self._single_arg_df(value, StringType())
+            transpiled, interpreted = self._run(str_upper, StringType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"str_upper mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(value=_case_str_strategy)
+        @_seed_examples(_STR_EDGES)
+        def test_str_lower_matches_python(self, value):
+            df = self._single_arg_df(value, StringType())
+            transpiled, interpreted = self._run(str_lower, StringType(), df, "a")
+            self.assertEqual(transpiled, interpreted, f"str_lower mismatch on {value!r}")
+
+        @_hyp_settings
+        @given(pair=_str_pair_strategy)
+        @_seed_examples(_STR_PAIR_EDGES, key="pair")
+        def test_str_startswith_matches_python(self, pair):
+            df = self.spark.createDataFrame([pair], "a string, b string")
+            transpiled, interpreted = self._run(str_startswith, BooleanType(), df, "a", "b")
+            self.assertEqual(transpiled, interpreted, f"str_startswith mismatch on {pair!r}")
+
+        @_hyp_settings
+        @given(pair=_str_pair_strategy)
+        @_seed_examples(_STR_PAIR_EDGES, key="pair")
+        def test_str_endswith_matches_python(self, pair):
+            df = self.spark.createDataFrame([pair], "a string, b string")
+            transpiled, interpreted = self._run(str_endswith, BooleanType(), df, "a", "b")
+            self.assertEqual(transpiled, interpreted, f"str_endswith mismatch on {pair!r}")
 
 
 class UDFTranspileHypothesisGatingTests(unittest.TestCase):
