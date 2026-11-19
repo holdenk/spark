@@ -834,6 +834,8 @@ class CatalystTranspiler(AbstractTranspiler):
                 if isinstance(op, ast.USub):
                     # Handles both literal negative ints (USub on a Constant)
                     # and runtime negation of a column.
+                    if not isinstance(operand, ast.Constant):
+                        self._may_raise_count += 1  # negating the minimum integer overflows
                     return self._convert_chunk(params, operand).__neg__()
                 # `+x` -- identity, kept for symmetry with USub.
                 return self._convert_chunk(params, operand)
