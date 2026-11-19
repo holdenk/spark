@@ -888,10 +888,13 @@ class CatalystTranspiler(AbstractTranspiler):
                 if later_raises:
                     # AND / OR may evaluate a repeated subexpression up front (subexpression
                     # elimination) and raise on a row Python skips; CASE WHEN is lazy.
-                    # A NULL operand (loose mode) stays NULL.
+                    # A strict operand is never NULL, so a constant keeps it single-use; a
+                    # NULL operand (loose mode) stays NULL.
+                    loose = self._null_strictness == "loose"
                     result = cols[-1]
                     for c in reversed(cols[:-1]):
-                        result = when(c if is_and else ~c, result).otherwise(c)
+                        skipped = c if loose else lit(not is_and)
+                        result = when(c if is_and else ~c, result).otherwise(skipped)
                     return result
                 if isinstance(op, ast.And):
                     result = cols[0]
