@@ -1094,15 +1094,20 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def none_and(x):
             return None and (x > 0)
 
+        # Same for an operand that can be None without being the literal.
+        def maybe_none_and(x):
+            return (True if x > 0 else None) and (x < 10)
+
         long_schema = StructType([StructField("a", LongType(), nullable=True)])
         with self.sql_conf(_TRANSPILE_ON):
-            with _warnings.catch_warnings(record=True):
-                _warnings.simplefilter("always")
-                pudf = UserDefinedFunction(none_and, BooleanType())
-            self.assertEqual([], pudf.transpiled, "literal None in and/or must not transpile")
-            df = self.spark.createDataFrame([Row(a=-5)], schema=long_schema)
-            [result] = df.select(pudf("a")).collect()
-            self.assertIsNone(result[0])
+            for func in (none_and, maybe_none_and):
+                with _warnings.catch_warnings(record=True):
+                    _warnings.simplefilter("always")
+                    pudf = UserDefinedFunction(func, BooleanType())
+                self.assertEqual([], pudf.transpiled, "None in and/or must not transpile")
+                df = self.spark.createDataFrame([Row(a=-5)], schema=long_schema)
+                [result] = df.select(pudf("a")).collect()
+                self.assertIsNone(result[0])
 
     def test_udf_transpile_falls_back_for_uncastable_return_type(self):
         # The lowered expression is cast to the declared return type; a return
@@ -2496,15 +2501,15 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
     def test_udf_transpile_known_value_divergences(self):
         # Transpile but DIVERGE from Python (documented in transpile.py; pinned so
         # a future fix is noticed): unguarded arithmetic on NULL yields NULL
-        # (Python raises TypeError), and NaN > 0 is True (Python False; Spark
-        # orders NaN highest). Mixed str/numeric arithmetic is handled or falls
+        # (Python raises TypeError). NaN > 0 is False, as in Python (SPARK-61913).
+        # Mixed str/numeric arithmetic is handled or falls
         # back -- see test_udf_transpile_string_operands{,_fall_back}.
         unguarded = lambda x: x + 1  # noqa: E731
         nan_gt = lambda x: (x > 0) if x is not None else None  # noqa: E731
         eq_strlit = lambda x: (x == "5") if x is not None else None  # noqa: E731
         self.assertEqual(self._vals(unguarded, LongType(), "a long", [(None,), (5,)]), [None, 6])
         self.assertEqual(
-            self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [True, True]
+            self._vals(nan_gt, BooleanType(), "a double", [(float("nan"),), (1.0,)]), [False, True]
         )
         # `x == "5"` used to be pinned as a coercion divergence (int == "5" -> True).
         # The eq category gate now drops the numeric variant, so on a long column the
@@ -3093,6 +3098,78 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                         [r[0] for r in df.select(u("a")).collect()],
                         name,
                     )
+
+    def test_udf_transpile_ordering_matches_python_on_nan(self):
+        # SPARK-61913: every ordering comparison with NaN is False in Python.
+        def gt(x, y):
+            return x > y
+
+        def le(x, y):
+            return x <= y
+
+        nan = float("nan")
+        rows = [(nan, 1.0), (1.0, nan), (nan, nan), (2.0, 1.0), (1.0, 2.0)]
+        for func in (gt, le):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    [func(*r) for r in rows],
+                    self._vals(func, BooleanType(), "x double, y double", rows),
+                )
+
+    def test_udf_transpile_and_or_skip_what_python_skips(self):
+        # SPARK-61913: a subexpression repeated in later operands (len's NULL guard, the
+        # remainder) must not be evaluated up front on rows Python short-circuits.
+        def and_len(x, s):
+            return x > 0 and len(s) > 3 and len(s) < 10
+
+        def or_len(x, s):
+            return x > 0 or len(s) > 3 or len(s) < 2
+
+        def and_mod(x, y):
+            return y != 0 and x % y > 1 and x % y < 5
+
+        for func, schema, rows in [
+            (and_len, "x long, s string", [(0, None), (1, "hello")]),
+            (or_len, "x long, s string", [(1, None), (0, "hi")]),
+            (and_mod, "x long, y long", [(7, 0), (7, 4)]),
+        ]:
+            with self.subTest(func=func.__name__):
+                self.assertEqual(
+                    [func(*r) for r in rows], self._vals(func, BooleanType(), schema, rows)
+                )
+
+    def test_udf_transpile_null_narrowing_through_and_or(self):
+        # Earlier `and` / `or` operands narrow the later ones, so no NULL guard is left...
+        def and_guard(x):
+            return x is not None and x + 1 > 0
+
+        def or_guard(x):
+            return x is None or x > 0
+
+        # ...unless they prove nothing about the rows that get that far.
+        def wrong_way(x):
+            return x is None and x > 0
+
+        with self.sql_conf(_TRANSPILE_ON):
+            df = self.spark.createDataFrame([(1,), (-2,), (None,)], "x long")
+            for func in (and_guard, or_guard):
+                with self.subTest(func=func.__name__):
+                    projected = df.select(self._transpiled_udf(func, BooleanType())("x"))
+                    self.assertNotIn("raise_error", self._optimized_plan(projected))
+                    self.assertEqual(
+                        [func(1), func(-2), func(None)], [r[0] for r in projected.collect()]
+                    )
+            with self.assertRaisesRegex(Exception, "cannot compare NULL"):
+                df.select(self._transpiled_udf(wrong_way, BooleanType())("x")).collect()
+
+    def test_udf_transpile_bool_repeat_count(self):
+        # A bool repeats a string once or not at all, as in Python.
+        def starred(s):
+            return s + "*" * (len(s) > 1)
+
+        self.assertEqual(
+            ["h", "hi*"], self._vals(starred, StringType(), "s string", [("h",), ("hi",)])
+        )
 
 
 if __name__ == "__main__":
