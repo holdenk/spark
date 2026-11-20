@@ -1128,6 +1128,7 @@ class CatalystTranspiler(AbstractTranspiler):
                     "or filter NULLs upstream."
                 )
                 self._null_guard_emitted = True
+                self._may_raise_count += 1
                 return when(null_guard, raise_error(err)).otherwise(func(*cols))
             case _:
                 raise UnsupportedOperationException(

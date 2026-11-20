@@ -3148,8 +3148,9 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
                     self.assertEqual(expected, self._vals(func, BooleanType(), schema, rows))
 
     def test_udf_transpile_and_or_skip_what_python_skips(self):
-        # SPARK-61913: a subexpression repeated in later operands (len's NULL guard, the
-        # remainder) must not be evaluated up front on rows Python short-circuits.
+        # SPARK-61913: a subexpression repeated in later operands (a len or str-method
+        # NULL guard, the remainder) must not be evaluated up front on rows Python
+        # short-circuits.
         def and_len(x, s):
             return x > 0 and len(s) > 3 and len(s) < 10
 
@@ -3159,10 +3160,14 @@ class UDFTranspileUnitTests(ReusedSQLTestCase):
         def and_mod(x, y):
             return y != 0 and x % y > 1 and x % y < 5
 
+        def and_starts(x, s):
+            return x == 1 and (s.startswith("a") or x > 5) and (s.startswith("a") or x > 7)
+
         for func, schema, rows in [
             (and_len, "x long, s string", [(0, None), (1, "hello")]),
             (or_len, "x long, s string", [(1, None), (0, "hi")]),
             (and_mod, "x long, y long", [(7, 0), (7, 4)]),
+            (and_starts, "x long, s string", [(0, None), (1, "ab")]),
         ]:
             with self.subTest(func=func.__name__):
                 self.assertEqual(
