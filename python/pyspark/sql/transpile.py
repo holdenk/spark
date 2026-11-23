@@ -275,16 +275,16 @@ def _truthiness_col(cat: Optional[str], c: Column) -> Optional[Column]:
 
 
 def _null_narrowed(params: List[str], test_node: ast.AST) -> Tuple[frozenset, frozenset]:
-    """Return ``(body_nonnull, else_nonnull)`` — frozensets of parameter names
+    """Return ``(body_nonnull, else_nonnull)`` -- frozensets of parameter names
     that are proven non-null in the true branch and the false branch
     respectively of an ``if``/ternary with this test.
 
     Recognised patterns (``p`` must be in ``params``):
-      ``p is not None``          → body: {p}
-      ``p is None``              → else: {p}
-      ``None is not p``          → body: {p}
-      ``None is p``              → else: {p}
-      ``A and B and …``          → body: union of each clause's body set
+      ``p is not None``          -> body: {p}
+      ``p is None``              -> else: {p}
+      ``None is not p``          -> body: {p}
+      ``None is p``              -> else: {p}
+      ``A and B and ...``        -> body: union of each clause's body set
     All other nodes yield empty sets (conservative; no narrowing assumed).
     """
     match test_node:
@@ -305,7 +305,7 @@ def _null_narrowed(params: List[str], test_node: ast.AST) -> Tuple[frozenset, fr
             if isinstance(op, ast.Is):
                 return frozenset(), frozenset({name})
         case ast.BoolOp(op=ast.And(), values=values):
-            # x is not None and y is not None and … → body: union, else: {}
+            # x is not None and y is not None and ... -> body: union, else: {}
             body_nonnull: frozenset = frozenset()
             for v in values:
                 bn, _ = _null_narrowed(params, v)
@@ -571,9 +571,9 @@ class CatalystTranspiler(AbstractTranspiler):
         returns ``NULL``. To stay faithful to the source UDF we guard the
         comparison: if either operand is ``NULL`` we raise via
         ``raise_error``, otherwise we evaluate ``left op right`` as usual.
-        Callers that have already proven the operand non-null (``if x is
-        not None: x > 0``) take the otherwise branch, so they never trip
-        the raise.
+        When both operands are already proven non-null (``if x is not
+        None: x > 0``), the guard is omitted and only ``left op right``
+        is emitted.
 
         Python also forbids ordering across types (``1 < "a"`` -> TypeError),
         whereas Spark would coerce the operands and return a (wrong) boolean.
